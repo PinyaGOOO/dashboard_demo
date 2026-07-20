@@ -136,14 +136,6 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self.service.delete_stand(int(parts[2])); self._json({"ok": True})
             elif len(parts) == 4 and parts[:2] == ["api", "stands"] and parts[3] == "actions" and method == "POST":
                 body = self._body(); self._json(self.service.stand_action(int(parts[2]), str(body.get("action", "")), body))
-            elif parts == ["api", "sessions"] and method == "GET":
-                self._json(self.service.list_sessions())
-            elif parts == ["api", "sessions"] and method == "POST":
-                self._json(self.service.create_session(self._body()), HTTPStatus.CREATED)
-            elif len(parts) == 3 and parts[:2] == ["api", "sessions"] and method == "DELETE":
-                self._json(self.service.end_session(int(parts[2])))
-            elif len(parts) == 4 and parts[:2] == ["api", "sessions"] and parts[3] == "heartbeat" and method == "POST":
-                self._json(self.service.heartbeat(int(parts[2])))
             elif parts == ["api", "checks"] and method == "GET":
                 self._json(self.service.list_checks())
             elif parts == ["api", "checks", "run"] and method == "POST":

@@ -124,7 +124,7 @@ class DashboardService:
             defaults: dict[str, Any] = {
                 "description": "", "category": "Общий", "version": "1.0", "status": "draft",
                 "vm_count": 1, "template_vmid": 0, "clone_type": "linked", "storage": "",
-                "bridge": "vmbr0", "subnet": "", "estimated_minutes": 8,
+                "bridge": "", "subnet": "", "estimated_minutes": 8,
                 "tags": "[]", "deploy_script": "#!/usr/bin/env bash\nset -euo pipefail\n",
                 "autocheck_script": "#!/usr/bin/env bash\nset -euo pipefail\n", "checks_count": 0,
             }
@@ -165,26 +165,20 @@ class DashboardService:
         self.store.add_activity("script", "Сценарий удалён", blueprint["name"], "warning")
 
     def list_stands(self) -> list[dict[str, Any]]:
-        self._refresh_session_states()
         sql = """
         SELECT s.*, b.name AS blueprint_name, b.code AS blueprint_code, b.category AS blueprint_category,
-               (SELECT COUNT(*) FROM stand_vms v WHERE v.stand_id = s.id) AS actual_vm_count,
-               (SELECT COUNT(*) FROM sessions x WHERE x.stand_id = s.id AND x.status IN ('active','idle')) AS active_sessions
+               (SELECT COUNT(*) FROM stand_vms v WHERE v.stand_id = s.id) AS actual_vm_count
         FROM stands s LEFT JOIN blueprints b ON b.id = s.blueprint_id
         ORDER BY CASE s.status WHEN 'provisioning' THEN 0 WHEN 'error' THEN 1 WHEN 'running' THEN 2 ELSE 3 END,
                  s.updated_at DESC
         """
-        rows = self.store.query_all(sql)
-        for row in rows:
-            row["participants"] = row["active_sessions"]
-        return rows
+        return self.store.query_all(sql)
 
     def get_stand(self, stand_id: int) -> dict[str, Any]:
         stand = next((item for item in self.list_stands() if int(item["id"]) == stand_id), None)
         if not stand:
             raise NotFoundError("Стенд не найден")
         stand["vms"] = self.store.query_all("SELECT * FROM stand_vms WHERE stand_id = ? ORDER BY id", (stand_id,))
-        stand["sessions"] = self.store.query_all("SELECT * FROM sessions WHERE stand_id = ? ORDER BY last_seen DESC", (stand_id,))
         stand["checks"] = self.store.query_all("SELECT * FROM check_runs WHERE stand_id = ? ORDER BY started_at DESC LIMIT 10", (stand_id,))
         return stand
 
@@ -220,10 +214,6 @@ class DashboardService:
             raise ConflictError(f"Некоторые VM уже закреплены за другим стендом: {values}")
         name = str(payload.get("name", "")).strip() or pool_id
         owner = str(payload.get("owner", "Администратор")).strip() or "Администратор"
-        try:
-            max_participants = max(1, min(100, int(payload.get("max_participants", 12))))
-        except (TypeError, ValueError) as exc:
-            raise ValidationError("Вместимость должна быть числом") from exc
         statuses = {str(member.get("status", "stopped")) for member in members}
         status = "running" if "running" in statuses else "stopped"
         nodes = sorted({str(member.get("node", "")) for member in members if member.get("node")})
@@ -235,11 +225,11 @@ class DashboardService:
         with self.store.transaction() as connection:
             cursor = connection.execute(
                 """INSERT INTO stands
-                (name, blueprint_id, status, progress, node, pool_id, owner, participants,
-                 max_participants, vm_count, cpu, ram, disk, ip_range, check_status, origin,
+                (name, blueprint_id, status, progress, node, pool_id, owner,
+                 vm_count, cpu, ram, disk, ip_range, check_status, origin,
                  created_at, updated_at)
-                VALUES (?, ?, ?, 100, ?, ?, ?, 0, ?, ?, ?, ?, 0, '', 'idle', 'imported', ?, ?)""",
-                (name, blueprint_id, status, node_label, pool_id, owner, max_participants,
+                VALUES (?, ?, ?, 100, ?, ?, ?, ?, ?, ?, 0, '', 'idle', 'imported', ?, ?)""",
+                (name, blueprint_id, status, node_label, pool_id, owner,
                  len(members), cpu, ram, now, now),
             )
             stand_id = int(cursor.lastrowid)
@@ -270,11 +260,10 @@ class DashboardService:
         if existing:
             raise ConflictError("Pool ID уже используется")
         try:
-            max_participants = max(1, min(100, int(payload.get("max_participants", 12))))
             ttl_hours = max(1, min(720, int(payload.get("ttl_hours", 8))))
             vm_count = int(payload.get("vm_count", 1))
         except (TypeError, ValueError) as exc:
-            raise ValidationError("Количество VM, вместимость и срок жизни должны быть числами") from exc
+            raise ValidationError("Количество VM и срок жизни должны быть числами") from exc
         if not 1 <= vm_count <= 50:
             raise ValidationError("Количество VM должно быть от 1 до 50")
         subnet = str(payload.get("subnet", "")).strip()
@@ -288,18 +277,18 @@ class DashboardService:
             usable = network.num_addresses if network.prefixlen >= 31 else max(0, network.num_addresses - 2)
             if usable < vm_count:
                 raise ValidationError("В выбранной подсети недостаточно адресов для указанного количества VM")
-        bridge = str(payload.get("bridge", "vmbr0")).strip()
+        bridge = str(payload.get("bridge", "")).strip()
         if bridge and not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", bridge):
             raise ValidationError("Некорректное имя сетевого bridge")
         expires = (datetime.now(timezone.utc) + timedelta(hours=ttl_hours)).replace(microsecond=0).isoformat()
         now = utc_now()
         stand_id = self.store.execute(
             """INSERT INTO stands
-            (name, blueprint_id, status, progress, node, pool_id, owner, participants, max_participants,
+            (name, blueprint_id, status, progress, node, pool_id, owner,
              vm_count, cpu, ram, disk, ip_range, check_status, expires_at, created_at, updated_at)
-            VALUES (?, ?, 'provisioning', 4, ?, ?, ?, 0, ?, ?, 0, 0, 0, ?, 'idle', ?, ?, ?)""",
+            VALUES (?, ?, 'provisioning', 4, ?, ?, ?, ?, 0, 0, 0, ?, 'idle', ?, ?, ?)""",
             (name, blueprint_id, str(payload.get("node", "auto")), pool_id, str(payload.get("owner", "Администратор")),
-             max_participants, vm_count, subnet, expires, now, now),
+             vm_count, subnet, expires, now, now),
         )
         deployment = dict(blueprint)
         deployment.update({
@@ -323,15 +312,10 @@ class DashboardService:
 
     def update_stand(self, stand_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         stand = self.get_stand(stand_id)
-        allowed = {"name", "owner", "max_participants", "expires_at", "ip_range"}
+        allowed = {"name", "owner", "expires_at", "ip_range"}
         data = {key: payload[key] for key in allowed if key in payload}
         if "name" in data and not str(data["name"]).strip():
             raise ValidationError("Название стенда не может быть пустым")
-        if "max_participants" in data:
-            try:
-                data["max_participants"] = max(1, min(100, int(data["max_participants"])))
-            except (TypeError, ValueError) as exc:
-                raise ValidationError("Вместимость должна быть числом") from exc
         if not data:
             return stand
         data["updated_at"] = utc_now()
@@ -361,11 +345,14 @@ class DashboardService:
                 )
             primary_node = vms[0].get("node", "") if vms else ""
             self.store.execute(
-                "UPDATE stands SET status = 'running', progress = 100, node = ?, cpu = 4.8, ram = 8.2, updated_at = ? WHERE id = ?",
+                "UPDATE stands SET status = 'running', progress = 100, node = ?, cpu = 4.8, ram = 8.2, last_error = '', updated_at = ? WHERE id = ?",
                 (primary_node, utc_now(), stand_id),
             )
         except Exception as exc:
-            self.store.execute("UPDATE stands SET status = 'error', updated_at = ? WHERE id = ?", (utc_now(), stand_id))
+            self.store.execute(
+                "UPDATE stands SET status = 'error', last_error = ?, updated_at = ? WHERE id = ?",
+                (str(exc)[-1000:], utc_now(), stand_id),
+            )
             self.store.add_activity("deploy", "Ошибка развёртывания", f"Стенд #{stand_id}: {exc}", "error", "Система")
         finally:
             with self._job_lock:
@@ -433,7 +420,8 @@ class DashboardService:
             raise ConflictError("Нельзя удалить стенд во время автопроверки")
         vmids = [int(vm["vmid"]) for vm in stand["vms"] if vm.get("vmid") is not None]
         imported = str(stand.get("origin") or "deployed") == "imported"
-        if not imported:
+        resources_already_rolled_back = stand["status"] == "error" and not vmids
+        if not imported and not resources_already_rolled_back:
             self.gateway.delete_stand(stand, vmids)
         self.store.execute("DELETE FROM stands WHERE id = ?", (stand_id,))
         self.store.add_activity(
@@ -615,16 +603,13 @@ class DashboardService:
 
     def overview(self) -> dict[str, Any]:
         stands = self.list_stands()
-        sessions = self.list_sessions()
         running = [stand for stand in stands if stand["status"] == "running"]
-        active_sessions = [session for session in sessions if session["status"] in {"active", "idle"}]
         scores = [int(stand["check_score"]) for stand in stands if stand["check_score"] is not None]
         return {
             "active_stands": len(running), "total_stands": len(stands),
-            "active_sessions": len(active_sessions),
+            "total_vms": sum(int(stand.get("actual_vm_count") or 0) for stand in stands),
             "average_score": round(sum(scores) / max(len(scores), 1)),
             "attention": sum(1 for stand in stands if stand["status"] == "error" or stand["check_status"] in {"warning", "failed"}),
-            "available_slots": sum(max(0, int(stand["max_participants"]) - int(stand["participants"])) for stand in running),
         }
 
     def activity(self, limit: int = 30) -> list[dict[str, Any]]:
@@ -634,6 +619,6 @@ class DashboardService:
         return {
             "integration": self.integration(), "overview": self.overview(), "stands": self.list_stands(),
             "blueprints": self.list_blueprints(), "templates": self.list_templates(), "pools": self.list_pools(),
-            "sessions": self.list_sessions(), "checks": self.list_checks(),
+            "checks": self.list_checks(),
             "metrics": self.metrics(), "activity": self.activity(), "server_time": utc_now(),
         }

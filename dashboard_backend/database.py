@@ -64,7 +64,7 @@ class DashboardStore:
             template_vmid INTEGER NOT NULL DEFAULT 0,
             clone_type TEXT NOT NULL DEFAULT 'linked',
             storage TEXT NOT NULL DEFAULT '',
-            bridge TEXT NOT NULL DEFAULT 'vmbr0',
+            bridge TEXT NOT NULL DEFAULT '',
             subnet TEXT NOT NULL DEFAULT '',
             estimated_minutes INTEGER NOT NULL DEFAULT 8,
             tags TEXT NOT NULL DEFAULT '[]',
@@ -96,6 +96,7 @@ class DashboardStore:
             expires_at TEXT,
             password_updated_at TEXT,
             origin TEXT NOT NULL DEFAULT 'deployed',
+            last_error TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY (blueprint_id) REFERENCES blueprints(id) ON DELETE SET NULL
@@ -160,6 +161,8 @@ class DashboardStore:
             stand_columns = {row[1] for row in connection.execute("PRAGMA table_info(stands)")}
             if "origin" not in stand_columns:
                 connection.execute("ALTER TABLE stands ADD COLUMN origin TEXT NOT NULL DEFAULT 'deployed'")
+            if "last_error" not in stand_columns:
+                connection.execute("ALTER TABLE stands ADD COLUMN last_error TEXT NOT NULL DEFAULT ''")
 
     def _seed_if_empty(self) -> None:
         with self.connect() as connection:
@@ -276,24 +279,6 @@ printf '%s\\n' \"${results[@]}\"""",
                 vm_rows,
             )
 
-            people = [
-                (1, "Анна Лукина", "a.lukina", "10.50.1.24", "Chrome · Windows", "Участник", "active", iso_ago(hours=2, minutes=14), iso_ago(seconds=18), None),
-                (1, "Максим Чернов", "m.chernov", "10.50.1.31", "Edge · Windows", "Участник", "active", iso_ago(hours=1, minutes=48), iso_ago(seconds=42), None),
-                (1, "Олег Нестеров", "o.nesterov", "10.50.1.44", "Firefox · Linux", "Участник", "idle", iso_ago(hours=1, minutes=36), iso_ago(minutes=7), None),
-                (1, "Елена Барышева", "e.barysheva", "10.50.1.52", "Chrome · Windows", "Участник", "active", iso_ago(hours=1, minutes=22), iso_ago(seconds=12), None),
-                (1, "Влад Ким", "v.kim", "10.50.1.58", "Chrome · macOS", "Участник", "active", iso_ago(minutes=59), iso_ago(seconds=29), None),
-                (2, "Иван Борисов", "i.borisov", "10.50.2.11", "Edge · Windows", "Участник", "active", iso_ago(hours=2, minutes=3), iso_ago(seconds=9), None),
-                (2, "Софья Мельник", "s.melnik", "10.50.2.19", "Chrome · Windows", "Участник", "active", iso_ago(hours=1, minutes=45), iso_ago(seconds=56), None),
-                (2, "Артём Жуков", "a.zhukov", "10.50.2.27", "Firefox · Linux", "Эксперт", "idle", iso_ago(minutes=48), iso_ago(minutes=5), None),
-                (2, "Дарья Морозова", "d.morozova", "10.50.2.34", "Chrome · Windows", "Участник", "active", iso_ago(minutes=37), iso_ago(seconds=21), None),
-                (2, "Никита Орлов", "n.orlov", "10.50.2.41", "Edge · Windows", "Участник", "active", iso_ago(minutes=26), iso_ago(seconds=33), None),
-            ]
-            connection.executemany(
-                """INSERT INTO sessions
-                (stand_id, user_name, login, ip, device, role, status, started_at, last_seen, ended_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", people,
-            )
-
             check_details = json.dumps([
                 {"name": "Доступность узлов", "ok": True, "duration": 320},
                 {"name": "Маршрутизация и VLAN", "ok": True, "duration": 680},
@@ -314,7 +299,6 @@ printf '%s\\n' \"${results[@]}\"""",
             activity = [
                 ("deploy", "Развёртывание стенда", "Подготовка · 1-КБ: клонирование VM 4 из 5", "Система", "progress", iso_ago(minutes=2)),
                 ("check", "Автопроверка завершена", "ДЭ-24 · Группа 2-ИС — результат 94%", "А. Орлова", "success", iso_ago(minutes=18)),
-                ("session", "Новая сессия", "Никита Орлов вошёл в Тренировка · 3-СА", "Система", "info", iso_ago(minutes=26)),
                 ("password", "Пароль стенда обновлён", "Ротация учётных данных ДЭ-24 · Группа 2-ИС", "А. Орлова", "success", iso_ago(days=1)),
                 ("snapshot", "Создан снимок", "Контрольная точка before-exam для резервного стенда", "И. Волков", "info", iso_ago(days=1, hours=2)),
             ]

@@ -4,7 +4,7 @@
   const app = document.querySelector("#app");
   const modalRoot = document.querySelector("#modal-root");
   const toastRoot = document.querySelector("#toast-root");
-  const routes = ["overview", "stands", "blueprints", "checks", "sessions", "infrastructure"];
+  const routes = ["overview", "stands", "blueprints", "checks", "infrastructure"];
   const VKLVIKL_BOOTSTRAP_SCRIPT = `#!/usr/bin/env bash
 set -euo pipefail
 
@@ -38,7 +38,6 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     stands: "Стенды",
     blueprints: "Сценарии",
     checks: "Автопроверки",
-    sessions: "Сессии",
     infrastructure: "Инфраструктура",
   };
   const statusLabels = {
@@ -52,8 +51,6 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     route: getRoute(),
     standFilter: "all",
     standSearch: "",
-    sessionFilter: "active",
-    sessionSearch: "",
     selectedBlueprintId: null,
     editorDirty: false,
     loading: false,
@@ -252,14 +249,14 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     const historyTitle = integration.mode === "live" ? "Последние измерения нагрузки" : "Нагрузка кластера за 24 часа";
     const historySubtitle = integration.mode === "live" ? "История текущего процесса: весь кластер и вклад стендов" : "Весь кластер и вклад стендов демоэкзамена";
     app.innerHTML = `<section class="page">
-      ${pageHeader("Операционный обзор", "Состояние экзаменационных стендов, пользователей и кластера на одном экране.", `<button class="button button--primary" data-open-deploy>${icon("plus")}Развернуть стенд</button>`)}
+      ${pageHeader("Операционный обзор", "Состояние экзаменационных стендов и кластера на одном экране.", `<button class="button button--primary" data-open-deploy>${icon("plus")}Развернуть стенд</button>`)}
       <div class="mode-banner mode-banner--${integration.mode}">
         <div><span class="mode-banner__dot"></span><strong>${escapeHtml(integration.cluster)}</strong><span>${escapeHtml(modeLabel)}</span></div>
         <small>Обновлено ${relativeTime(metrics.updated_at)}</small>
       </div>
       <div class="metric-grid">
         ${metricCard("Активные стенды", `${overview.active_stands}<small> / ${overview.total_stands}</small>`, `<span class="metric-card__trend">●</span> ${active.filter(s => s.status === "provisioning").length ? "идёт развёртывание" : "все операции штатно"}`, "server")}
-        ${metricCard("Сейчас на стендах", overview.active_sessions, `${overview.available_slots} свободных мест`, "users", "blue")}
+        ${metricCard("Виртуальные машины", overview.total_vms, "учитываются в стендах", "server", "blue")}
         ${metricCard("Средний результат", `${overview.average_score}%`, `По ${stands.filter(stand => stand.check_score != null).length} последним результатам`, "check", "green")}
         ${metricCard("Нагрузка стендов", `${formatNumber(cluster.exam_cpu, 1)}%`, `${formatNumber(cluster.cpu, 1)}% CPU всего кластера`, "activity", "purple")}
       </div>
@@ -298,14 +295,14 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     return `<button class="overview-stand" data-stand-detail="${stand.id}" type="button">
       <span class="overview-stand__state overview-stand__state--${escapeHtml(stand.status)}">${icon("server")}</span>
       <span class="overview-stand__identity"><strong>${escapeHtml(stand.name)}</strong><small>${escapeHtml(stand.blueprint_code || "Без сценария")} · ${escapeHtml(stand.pool_id)}</small></span>
-      <span class="overview-stand__users">${icon("users")}<strong>${stand.participants}</strong> / ${stand.max_participants}</span>
+      <span class="overview-stand__users">${icon("server")}<strong>${stand.actual_vm_count || 0}</strong> VM</span>
       <span class="overview-stand__check">${stand.check_score == null ? "—" : `${stand.check_score}%`}<small>проверка</small></span>
       <span>${statusChip(stand.status)}</span>${icon("chevron", "overview-stand__arrow")}
     </button>`;
   }
 
   function activityItem(item) {
-    const icons = { deploy: "server", import: "plus", check: "check", session: "users", password: "lock", snapshot: "copy", power: "power", script: "code", delete: "trash", edit: "edit" };
+    const icons = { deploy: "server", import: "plus", check: "check", password: "lock", snapshot: "copy", power: "power", script: "code", delete: "trash", edit: "edit" };
     return `<div class="activity-item"><span class="activity-item__icon activity-item__icon--${escapeHtml(item.status)}">${icon(icons[item.kind] || "info")}</span>
       <div class="activity-item__copy"><strong>${escapeHtml(item.title)}</strong><p>${escapeHtml(item.detail)}</p></div><time class="activity-item__time" title="${escapeHtml(dateTime(item.created_at))}">${relativeTime(item.created_at)}</time></div>`;
   }
@@ -332,7 +329,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
       <div class="toolbar"><div class="toolbar__primary"><label class="search-field">${icon("search")}<input id="stand-search" type="search" value="${escapeHtml(state.standSearch)}" placeholder="Название, pool ID, владелец…"></label>
         <div class="filter-tabs" role="tablist">${[["all", "Все"], ["running", "Работают"], ["provisioning", "В процессе"], ["stopped", "Остановлены"], ["attention", "Требуют внимания"]].map(([key, label]) => `<button class="filter-tab ${state.standFilter === key ? "is-active" : ""}" data-stand-filter="${key}" type="button">${label}<span>${counts[key]}</span></button>`).join("")}</div></div>
         <div class="toolbar-actions"><button class="button" data-refresh>${icon("refresh")}Обновить</button></div></div>
-      ${stands.length ? `<div class="table-card"><div class="table-wrap"><table class="data-table stands-table"><thead><tr><th>Стенд</th><th>Состояние</th><th>Участники</th><th>Ресурсы</th><th>Автопроверка</th><th>Срок</th><th></th></tr></thead><tbody>
+      ${stands.length ? `<div class="table-card"><div class="table-wrap"><table class="data-table stands-table"><thead><tr><th>Стенд</th><th>Состояние</th><th>Ресурсы</th><th>Автопроверка</th><th>Срок</th><th></th></tr></thead><tbody>
         ${stands.map(standRow).join("")}</tbody></table></div></div>` : `<div class="card">${emptyState("server", "Стенды не найдены", state.standSearch ? "Измените запрос или сбросьте фильтры." : "Разверните стенд из готового сценария.", `<button class="button button--primary" data-open-deploy>${icon("plus")}Развернуть</button>`)}</div>`}
     </section>`;
     const search = document.querySelector("#stand-search");
@@ -354,7 +351,6 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     return `<tr class="clickable-row" data-stand-detail="${stand.id}">
       <td><div class="entity-cell"><span class="entity-icon">${icon("server")}</span><span><strong class="cell-title">${escapeHtml(stand.name)}</strong><small class="cell-subtitle mono">${escapeHtml(stand.pool_id)} · ${escapeHtml(stand.node || "авто")}${stand.origin === "imported" ? " · подключён" : ""}</small></span></div></td>
       <td>${statusChip(stand.status)}${stand.status === "provisioning" ? `<div class="inline-progress"><div class="progress"><div class="progress__bar progress__bar--blue" style="width:${clamp(stand.progress)}%"></div></div><small>${stand.progress}%</small></div>` : ""}</td>
-      <td><div class="occupancy"><strong>${stand.participants}</strong><span>/ ${stand.max_participants}</span><div class="avatar-stack">${Array.from({ length: Math.min(3, stand.participants) }, (_, index) => `<i style="--i:${index}">${["АЛ", "МЧ", "СМ"][index]}</i>`).join("")}</div></div></td>
       <td><div class="resource-pair">${resourceBar("CPU", stand.cpu)}${resourceBar("RAM", stand.ram, "blue")}</div></td>
       <td>${stand.check_status === "running" ? statusChip("checking", "Выполняется") : stand.check_score == null && stand.check_status === "failed" ? statusChip("failed", "Ошибка запуска") : stand.check_score == null ? `<span class="muted">Не запускалась</span>` : `<div class="score-cell"><strong class="score score--${stand.check_score >= 90 ? "good" : stand.check_score >= 70 ? "warn" : "bad"}">${stand.check_score}%</strong><small>${relativeTime(stand.last_check)}</small></div>`}</td>
       <td><div class="expiry"><strong>${hours == null ? "Без срока" : hours > 24 ? `${Math.ceil(hours / 24)} дн.` : `${hours} ч`}</strong><small>${dateTime(stand.expires_at)}</small></div></td>
@@ -434,51 +430,6 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     });
   }
 
-  function renderSessions() {
-    let sessions = state.data.sessions;
-    if (state.sessionFilter !== "all") {
-      sessions = sessions.filter(item => state.sessionFilter === "active" ? ["active", "idle"].includes(item.status) : item.status === state.sessionFilter);
-    }
-    if (state.sessionSearch) {
-      const needle = state.sessionSearch.toLocaleLowerCase("ru");
-      sessions = sessions.filter(item => [item.user_name, item.login, item.ip, item.stand_name].some(value => String(value || "").toLocaleLowerCase("ru").includes(needle)));
-    }
-    const all = state.data.sessions;
-    const active = all.filter(item => item.status === "active");
-    const idle = all.filter(item => item.status === "idle");
-    const avgMinutes = active.length ? Math.round(active.reduce((sum, item) => sum + Math.max(0, (Date.now() - new Date(item.started_at)) / 60000), 0) / active.length) : 0;
-    const uniqueStands = new Set([...active, ...idle].map(item => item.stand_id)).size;
-    app.innerHTML = `<section class="page">
-      ${pageHeader("Сессии пользователей", "Активность считается по персональным gateway-сессиям и heartbeat; состояние VM само по себе не считается присутствием человека.", `<button class="button button--primary" data-session-new>${icon("plus")}Добавить сессию</button>`)}
-      <div class="metric-grid session-metrics">
-        ${metricCard("Активны сейчас", active.length, `${idle.length} без активности более 2 минут`, "users", "green")}
-        ${metricCard("Занятые стенды", uniqueStands, `из ${state.data.overview.active_stands} работающих`, "server", "blue")}
-        ${metricCard("Средняя сессия", avgMinutes > 60 ? `${Math.floor(avgMinutes / 60)} ч ${avgMinutes % 60} мин` : `${avgMinutes} мин`, "за текущий день", "clock", "purple")}
-        ${metricCard("Свободные места", state.data.overview.available_slots, "по лимитам активных стендов", "activity")}
-      </div>
-      <div class="toolbar"><div class="toolbar__primary"><label class="search-field">${icon("search")}<input id="session-search" type="search" value="${escapeHtml(state.sessionSearch)}" placeholder="Пользователь, логин, IP или стенд…"></label>
-        <div class="filter-tabs">${[["active", "Сейчас"], ["idle", "Неактивны"], ["ended", "Завершены"], ["all", "Все"]].map(([key, label]) => `<button class="filter-tab ${state.sessionFilter === key ? "is-active" : ""}" data-session-filter="${key}" type="button">${label}</button>`).join("")}</div></div><div class="heartbeat-legend"><span></span>heartbeat каждые 30 секунд</div></div>
-      <div class="table-card"><div class="table-wrap"><table class="data-table sessions-table"><thead><tr><th>Пользователь</th><th>Стенд</th><th>Статус</th><th>Начало</th><th>Длительность</th><th>Последняя активность</th><th>Подключение</th><th></th></tr></thead><tbody>
-        ${sessions.map(sessionRow).join("") || `<tr><td colspan="8">${emptyState("users", "Сессии не найдены", "Измените фильтр или добавьте тестовую сессию.")}</td></tr>`}</tbody></table></div></div>
-      <div class="session-footnote">${icon("shield")}<span><strong>Как считается присутствие:</strong> активная сессия имеет heartbeat не старше 2 минут. Для прямых RDP/SSH-подключений потребуется агент наблюдения внутри гостевой ОС.</span></div>
-    </section>`;
-    const search = document.querySelector("#session-search");
-    search?.addEventListener("input", event => {
-      state.sessionSearch = event.target.value;
-      window.clearTimeout(search._timer);
-      search._timer = window.setTimeout(() => { renderSessions(); const restored = document.querySelector("#session-search"); restored?.focus(); }, 180);
-    });
-  }
-
-  function sessionRow(session) {
-    const initials = session.user_name.split(/\s+/).slice(0, 2).map(part => part[0]).join("").toLocaleUpperCase("ru");
-    return `<tr><td><div class="person-cell"><span class="person-avatar">${escapeHtml(initials)}</span><span><strong class="cell-title">${escapeHtml(session.user_name)}</strong><small class="cell-subtitle mono">${escapeHtml(session.login)}</small></span></div></td>
-      <td><strong class="cell-title">${escapeHtml(session.stand_name)}</strong><small class="cell-subtitle mono">${escapeHtml(session.pool_id)}</small></td><td>${statusChip(session.status)}</td>
-      <td>${dateTime(session.started_at)}</td><td><strong>${duration(session.started_at, session.ended_at)}</strong></td><td><span class="last-seen ${session.status === "active" ? "is-live" : ""}">${relativeTime(session.last_seen)}</span></td>
-      <td><span class="mono">${escapeHtml(session.ip || "—")}</span><small class="cell-subtitle">${escapeHtml(session.device)}</small></td>
-      <td class="cell-actions">${session.status !== "ended" ? `<button class="button button--danger button--small" data-end-session="${session.id}">Завершить</button>` : ""}</td></tr>`;
-  }
-
   function renderInfrastructure() {
     const { metrics, stands, integration } = state.data;
     const cluster = metrics.cluster;
@@ -514,7 +465,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
       link.classList.toggle("is-active", active);
       if (active) link.setAttribute("aria-current", "page"); else link.removeAttribute("aria-current");
     });
-    const renderers = { overview: renderOverview, stands: renderStands, blueprints: renderBlueprints, checks: renderChecks, sessions: renderSessions, infrastructure: renderInfrastructure };
+    const renderers = { overview: renderOverview, stands: renderStands, blueprints: renderBlueprints, checks: renderChecks, infrastructure: renderInfrastructure };
     renderers[state.route]();
     updateShell();
   }
@@ -525,8 +476,6 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     const countNode = document.querySelector("#nav-stands-count");
     countNode.textContent = count;
     countNode.hidden = count === 0;
-    const sessionNode = document.querySelector("#nav-session-indicator");
-    sessionNode.hidden = !state.data.sessions.some(item => item.status === "active");
     const integration = state.data.integration;
     const clusterState = document.querySelector("#cluster-state");
     clusterState.classList.toggle("is-error", !integration.connected);
@@ -630,7 +579,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     if (!blueprints.length) { toast("Сначала создайте сценарий для привязки pool", "warning"); return; }
     const poolOptions = pools.map(pool => `<option value="${escapeHtml(pool.pool_id)}">${escapeHtml(pool.pool_id)}${pool.vm_count == null ? "" : ` · ${pool.vm_count} VM`}${pool.comment ? ` · ${escapeHtml(pool.comment)}` : ""}</option>`).join("");
     const blueprintOptions = blueprints.map(item => `<option value="${item.id}">${escapeHtml(item.name)} · ${escapeHtml(item.code)}</option>`).join("");
-    const body = `<form id="pool-import-form"><div class="alert alert--info">${icon("info")} Pool и его VM не создаются заново. Дашборд только подключит их к мониторингу и выбранному сценарию.</div><div class="form-grid"><label class="field field--full"><span class="field-label">Существующий Proxmox pool</span><select class="input mono" name="pool_id" id="import-pool-select" required>${poolOptions}</select></label><label class="field"><span class="field-label">Название стенда</span><input class="input" name="name" id="import-pool-name" value="${escapeHtml(pools[0].pool_id)}" required></label><label class="field"><span class="field-label">Сценарий и автопроверка</span><select class="input" name="blueprint_id" required>${blueprintOptions}</select></label><label class="field"><span class="field-label">Ответственный</span><input class="input" name="owner" value="Администратор"></label><label class="field"><span class="field-label">Максимум участников</span><input class="input" name="max_participants" type="number" min="1" max="100" value="12"></label></div><div class="alert alert--warning">${icon("shield")} При удалении подключённого стенда из дашборда исходный pool и его VM останутся в Proxmox.</div></form>`;
+    const body = `<form id="pool-import-form"><div class="alert alert--info">${icon("info")} Pool и его VM не создаются заново. Дашборд только подключит их к мониторингу и выбранному сценарию.</div><div class="form-grid"><label class="field field--full"><span class="field-label">Существующий Proxmox pool</span><select class="input mono" name="pool_id" id="import-pool-select" required>${poolOptions}</select></label><label class="field"><span class="field-label">Название стенда</span><input class="input" name="name" id="import-pool-name" value="${escapeHtml(pools[0].pool_id)}" required></label><label class="field"><span class="field-label">Сценарий и автопроверка</span><select class="input" name="blueprint_id" required>${blueprintOptions}</select></label><label class="field field--full"><span class="field-label">Ответственный</span><input class="input" name="owner" value="Администратор"></label></div><div class="alert alert--warning">${icon("shield")} При удалении подключённого стенда из дашборда исходный pool и его VM останутся в Proxmox.</div></form>`;
     showModal({ title: "Добавить существующий pool", subtitle: "Подключение ресурсов без клонирования", body, footer: `<button class="button" data-close-modal type="button">Отмена</button><button class="button button--primary" type="submit" form="pool-import-form">${icon("plus")}Добавить pool</button>`, size: "wide" });
     const form = modalRoot.querySelector("#pool-import-form");
     const select = modalRoot.querySelector("#import-pool-select");
@@ -644,7 +593,6 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
       submit.disabled = true;
       const values = Object.fromEntries(new FormData(form).entries());
       values.blueprint_id = Number(values.blueprint_id);
-      values.max_participants = Number(values.max_participants);
       try {
         const stand = await api("/api/pools/import", { method: "POST", body: values });
         closeModal(); toast(`Pool ${stand.pool_id} добавлен`); await loadData();
@@ -659,25 +607,25 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     const model = {
       step: 1, blueprint_id: Number(preselectedId) || available[0].id,
       name: "", pool_id: `exam-${new Date().toISOString().slice(5, 10).replace("-", "")}-${String(Date.now()).slice(-3)}`,
-      node: "auto", vm_count: 1, subnet: "", bridge: "vmbr0",
-      max_participants: 12, ttl_hours: 8, owner: "Администратор",
+      node: "auto", vm_count: 1, subnet: "", bridge: "",
+      ttl_hours: 8, owner: "Администратор",
     };
     const draw = () => {
       const blueprint = available.find(item => item.id === Number(model.blueprint_id)) || available[0];
-      const steps = ["Сценарий", "VM и сеть", "Доступ", "Проверка"];
+      const steps = ["Сценарий", "VM и сеть", "Срок", "Проверка"];
       let body = `<div class="wizard-steps">${steps.map((label, index) => `<div class="wizard-step ${model.step === index + 1 ? "is-active" : model.step > index + 1 ? "is-done" : ""}"><span>${model.step > index + 1 ? icon("check") : index + 1}</span><small>${label}</small></div>`).join("")}</div>`;
       if (model.step === 1) {
         body += `<div class="wizard-section"><h3>Выберите сценарий</h3><p>Шаблон и проверочный код будут закреплены за новым стендом.</p><div class="scenario-picker">${available.map(item => `<button type="button" class="scenario-option ${item.id === Number(model.blueprint_id) ? "is-selected" : ""}" data-wizard-blueprint="${item.id}"><span>${icon(item.category === "Безопасность" ? "shield" : "server")}</span><div><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.code)} · шаблон VMID ${item.template_vmid}</small></div><i>${icon("check")}</i></button>`).join("")}</div>
           <div class="form-grid"><label class="field"><span class="field-label">Название стенда</span><input class="input" id="deploy-name" value="${escapeHtml(model.name)}" placeholder="Например, ДЭ-24 · Группа 4" required></label><label class="field"><span class="field-label">Pool ID</span><input class="input mono" id="deploy-pool" value="${escapeHtml(model.pool_id)}" pattern="[A-Za-z0-9_.-]+" required><small class="field-hint">Латиница, цифры, точка, дефис</small></label></div></div>`;
       } else if (model.step === 2) {
         body += `<div class="wizard-section"><h3>Параметры развёртывания</h3><p>Количество машин и сеть задаются отдельно для каждого стенда. Все VM создаются как linked clone.</p><div class="deploy-plan-card"><div class="deploy-plan-card__icon">${icon("server")}</div><div><strong>${escapeHtml(blueprint.name)}</strong><small>Шаблон VMID ${blueprint.template_vmid} · связанные клоны</small></div><span>Linked clone</span></div>
-          <div class="form-grid"><label class="field"><span class="field-label">Количество VM</span><input class="input" id="deploy-vm-count" type="number" min="1" max="50" value="${model.vm_count}"></label><label class="field"><span class="field-label">Подсеть IPv4</span><input class="input mono" id="deploy-subnet" value="${escapeHtml(model.subnet)}" placeholder="10.39.10.0/24"><small class="field-hint">VM_IP и STAND_SUBNET будут переданы bootstrap-скрипту</small></label><label class="field"><span class="field-label">Bridge</span><input class="input mono" id="deploy-bridge" value="${escapeHtml(model.bridge)}" placeholder="vmbr0"></label><label class="field"><span class="field-label">Максимум участников</span><input class="input" id="deploy-capacity" type="number" min="1" max="100" value="${model.max_participants}"></label><label class="field field--full"><span class="field-label">Политика размещения</span><select class="input" id="deploy-node"><option value="auto" ${model.node === "auto" ? "selected" : ""}>Автоматически по нагрузке</option>${state.data.metrics.nodes.filter(node => node.status === "online").map(node => `<option value="${escapeHtml(node.name)}" ${model.node === node.name ? "selected" : ""}>${escapeHtml(node.name)} · CPU ${formatNumber(node.cpu)}% · RAM ${formatNumber(node.ram)}%</option>`).join("")}</select></label></div>
+          <div class="form-grid"><label class="field"><span class="field-label">Количество VM</span><input class="input" id="deploy-vm-count" type="number" min="1" max="50" value="${model.vm_count}"></label><label class="field"><span class="field-label">Подсеть IPv4</span><input class="input mono" id="deploy-subnet" value="${escapeHtml(model.subnet)}" placeholder="10.39.10.0/24"><small class="field-hint">VM_IP и STAND_SUBNET будут переданы bootstrap-скрипту</small></label><label class="field field--full"><span class="field-label">Bridge Proxmox</span><input class="input mono" id="deploy-bridge" value="${escapeHtml(model.bridge)}" placeholder="Оставьте пустым — сеть сохранится из шаблона"><small class="field-hint">Указывайте bridge только если он существует на каждой выбранной ноде</small></label><label class="field field--full"><span class="field-label">Политика размещения</span><select class="input" id="deploy-node"><option value="auto" ${model.node === "auto" ? "selected" : ""}>Автоматически по нагрузке</option>${state.data.metrics.nodes.filter(node => node.status === "online").map(node => `<option value="${escapeHtml(node.name)}" ${model.node === node.name ? "selected" : ""}>${escapeHtml(node.name)} · CPU ${formatNumber(node.cpu)}% · RAM ${formatNumber(node.ram)}%</option>`).join("")}</select></label></div>
           <div class="capacity-preview"><div><span>Количество</span><strong>${model.vm_count} VM</strong></div><div><span>Сеть</span><strong class="mono">${escapeHtml(model.subnet || "DHCP")}</strong></div><div><span>Bridge</span><strong class="mono">${escapeHtml(model.bridge || "из шаблона")}</strong></div><div><span>Тип</span><strong>Linked clone</strong></div></div></div>`;
       } else if (model.step === 3) {
-        body += `<div class="wizard-section"><h3>Доступ и срок работы</h3><p>После истечения срока стенд будет помечен для остановки оператором.</p><div class="form-grid"><label class="field"><span class="field-label">Ответственный</span><input class="input" id="deploy-owner" value="${escapeHtml(model.owner)}"></label><label class="field"><span class="field-label">Срок работы</span><select class="input" id="deploy-ttl">${[[4, "4 часа"], [8, "8 часов"], [24, "1 день"], [72, "3 дня"], [168, "7 дней"]].map(([value, label]) => `<option value="${value}" ${Number(model.ttl_hours) === value ? "selected" : ""}>${label}</option>`).join("")}</select></label></div>
+        body += `<div class="wizard-section"><h3>Ответственный и срок работы</h3><p>После истечения срока стенд будет помечен для остановки оператором.</p><div class="form-grid"><label class="field"><span class="field-label">Ответственный</span><input class="input" id="deploy-owner" value="${escapeHtml(model.owner)}"></label><label class="field"><span class="field-label">Срок работы</span><select class="input" id="deploy-ttl">${[[4, "4 часа"], [8, "8 часов"], [24, "1 день"], [72, "3 дня"], [168, "7 дней"]].map(([value, label]) => `<option value="${value}" ${Number(model.ttl_hours) === value ? "selected" : ""}>${label}</option>`).join("")}</select></label></div>
           <div class="option-list"><label class="option-row"><span>${icon("lock")}</span><span><strong>Смена пароля после развёртывания</strong><small>Ротация с одноразовым показом доступна в карточке готового стенда</small></span><input type="checkbox" disabled></label><label class="option-row"><span>${icon("copy")}</span><span><strong>Начальный снимок вручную</strong><small>Создайте контрольную точку из карточки после проверки конфигурации</small></span><input type="checkbox" disabled></label><label class="option-row"><span>${icon("check")}</span><span><strong>Автопроверка после деплоя</strong><small>Запускается вручную после готовности стенда</small></span><input type="checkbox" disabled></label></div></div>`;
       } else {
-        body += `<div class="wizard-section"><div class="confirm-hero"><span>${icon("check")}</span><h3>План готов к запуску</h3><p>Проверьте параметры. Развёртывание продолжится в фоне.</p></div><dl class="review-list"><div><dt>Стенд</dt><dd><strong>${escapeHtml(model.name)}</strong><small class="mono">${escapeHtml(model.pool_id)}</small></dd></div><div><dt>Сценарий</dt><dd><strong>${escapeHtml(blueprint.name)}</strong><small>${escapeHtml(blueprint.code)} · VMID ${blueprint.template_vmid}</small></dd></div><div><dt>Топология</dt><dd><strong>${model.vm_count} VM · Linked clone</strong><small>${escapeHtml(model.node === "auto" ? "Автораспределение" : model.node)}</small></dd></div><div><dt>Сеть</dt><dd><strong class="mono">${escapeHtml(model.subnet || "DHCP")}</strong><small class="mono">${escapeHtml(model.bridge || "bridge из шаблона")}</small></dd></div><div><dt>Доступ</dt><dd><strong>${model.max_participants} участников</strong><small>${escapeHtml(model.owner)} · ${model.ttl_hours} ч</small></dd></div></dl>
+        body += `<div class="wizard-section"><div class="confirm-hero"><span>${icon("check")}</span><h3>План готов к запуску</h3><p>Проверьте параметры. Развёртывание продолжится в фоне.</p></div><dl class="review-list"><div><dt>Стенд</dt><dd><strong>${escapeHtml(model.name)}</strong><small class="mono">${escapeHtml(model.pool_id)}</small></dd></div><div><dt>Сценарий</dt><dd><strong>${escapeHtml(blueprint.name)}</strong><small>${escapeHtml(blueprint.code)} · VMID ${blueprint.template_vmid}</small></dd></div><div><dt>Топология</dt><dd><strong>${model.vm_count} VM · Linked clone</strong><small>${escapeHtml(model.node === "auto" ? "Автораспределение" : model.node)}</small></dd></div><div><dt>Сеть</dt><dd><strong class="mono">${escapeHtml(model.subnet || "DHCP")}</strong><small class="mono">${escapeHtml(model.bridge || "bridge из шаблона")}</small></dd></div><div><dt>Ответственный</dt><dd><strong>${escapeHtml(model.owner)}</strong><small>${model.ttl_hours} ч</small></dd></div></dl>
           <div class="alert alert--warning">${icon("alert")} В live-режиме будут созданы реальные VM и пул Proxmox. Операция появится в журнале аудита.</div></div>`;
       }
       const footer = `<button class="button" type="button" ${model.step === 1 ? "data-close-modal" : "data-wizard-back"}>${model.step === 1 ? "Отмена" : "Назад"}</button><button class="button button--primary" type="button" ${model.step === 4 ? "data-wizard-submit" : "data-wizard-next"}>${model.step === 4 ? `${icon("power")}Начать развёртывание` : `Продолжить ${icon("chevron")}`}</button>`;
@@ -709,7 +657,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
       if (validate && !/^[A-Za-z0-9_.-]+$/.test(pool.value.trim())) { pool.classList.add("is-invalid"); pool.focus(); toast("Pool ID содержит недопустимые символы", "warning"); return false; }
       model.name = name.value.trim(); model.pool_id = pool.value.trim();
     } else if (model.step === 2) {
-      const node = modalRoot.querySelector("#deploy-node"), capacity = modalRoot.querySelector("#deploy-capacity");
+      const node = modalRoot.querySelector("#deploy-node");
       const vmCount = modalRoot.querySelector("#deploy-vm-count"), subnet = modalRoot.querySelector("#deploy-subnet"), bridge = modalRoot.querySelector("#deploy-bridge");
       if (node) model.node = node.value;
       if (vmCount) {
@@ -732,13 +680,6 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
           bridge.classList.add("is-invalid"); bridge.focus(); toast("Некорректное имя bridge", "warning"); return false;
         }
         model.bridge = value;
-      }
-      if (capacity) {
-        const parsedCapacity = Number(capacity.value);
-        if (validate && (!Number.isInteger(parsedCapacity) || parsedCapacity < 1 || parsedCapacity > 100)) {
-          capacity.classList.add("is-invalid"); capacity.focus(); toast("Вместимость должна быть от 1 до 100", "warning"); return false;
-        }
-        model.max_participants = Number.isFinite(parsedCapacity) ? clamp(parsedCapacity, 1, 100) : 12;
       }
     } else if (model.step === 3) {
       const owner = modalRoot.querySelector("#deploy-owner"), ttl = modalRoot.querySelector("#deploy-ttl");
@@ -789,7 +730,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
   }
 
   async function openStandDetail(id) {
-    showModal({ title: "Загрузка стенда…", body: `<div class="detail-loading"><span class="spinner"></span><p>Получаем машины, сессии и проверки</p></div>`, size: "large" });
+    showModal({ title: "Загрузка стенда…", body: `<div class="detail-loading"><span class="spinner"></span><p>Получаем машины и проверки</p></div>`, size: "large" });
     const requestToken = activeModalToken;
     try {
       const stand = await api(`/api/stands/${id}`);
@@ -798,10 +739,10 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
       const body = `<div class="stand-detail">
         <div class="stand-detail__hero"><div class="stand-detail__icon">${icon("server")}</div><div><div class="stand-detail__title"><h3>${escapeHtml(stand.name)}</h3>${statusChip(stand.status)}</div><p class="mono">${escapeHtml(stand.pool_id)} · ${escapeHtml(stand.blueprint_name || "Без сценария")} · ${escapeHtml(stand.node)}</p></div><div class="stand-detail__score"><strong>${stand.check_score == null ? "—" : `${stand.check_score}%`}</strong><small>автопроверка</small></div></div>
         ${stand.status === "provisioning" ? `<div class="deploy-detail"><div><strong>Развёртывание выполняется</strong><span>${stand.progress}%</span></div><div class="progress"><div class="progress__bar progress__bar--blue" style="width:${stand.progress}%"></div></div><small>Мастер продолжает работу в фоне. Окно можно закрыть.</small></div>` : ""}
-        <div class="detail-stat-grid"><div><span>Машины</span><strong>${runCount} / ${stand.vm_count}</strong><small>запущено</small></div><div><span>Участники</span><strong>${stand.participants} / ${stand.max_participants}</strong><small>активных сессий</small></div><div><span>CPU</span><strong>${formatNumber(stand.cpu, 1)}%</strong><small>текущая оценка</small></div><div><span>RAM</span><strong>${formatNumber(stand.ram, 1)}%</strong><small>на ноде</small></div><div><span>Истекает</span><strong>${relativeTime(stand.expires_at)}</strong><small>${dateTime(stand.expires_at)}</small></div></div>
-        <div class="detail-actions"><button class="button" data-stand-action="${stand.status === "stopped" ? "start" : "stop"}" data-stand-id="${stand.id}">${icon("power")}${stand.status === "stopped" ? "Запустить" : "Остановить"}</button><button class="button" data-stand-action="restart" data-stand-id="${stand.id}" ${stand.status !== "running" ? "disabled" : ""}>${icon("refresh")}Перезапустить</button><button class="button" data-stand-action="snapshot" data-stand-id="${stand.id}">${icon("copy")}Снимок</button><button class="button" data-stand-action="password" data-stand-id="${stand.id}">${icon("lock")}Сменить пароль</button><button class="button" data-edit-stand="${stand.id}">${icon("edit")}Параметры</button><button class="button button--dark" data-stand-action="run_check" data-stand-id="${stand.id}" ${stand.status !== "running" ? "disabled" : ""}>${icon("check")}Автопроверка</button></div>
-        <div class="detail-columns"><section><div class="detail-section-title"><h4>Виртуальные машины</h4><span>${stand.vms.length}</span></div><div class="vm-list">${stand.vms.map(vm => `<div class="vm-row"><span class="vm-state vm-state--${escapeHtml(vm.status)}"></span><div><strong>${escapeHtml(vm.name)}</strong><small class="mono">VMID ${vm.vmid} · ${escapeHtml(vm.ip || "IP не назначен")}</small></div><span>${escapeHtml(vm.node)}</span>${statusChip(vm.status)}</div>`).join("") || `<p class="muted-block">Машины ещё не созданы</p>`}</div></section>
-          <section><div class="detail-section-title"><h4>Активные сессии</h4><span>${stand.sessions.filter(item => item.status !== "ended").length}</span></div><div class="mini-session-list">${stand.sessions.filter(item => item.status !== "ended").slice(0, 5).map(session => `<div><span class="person-avatar">${escapeHtml(session.user_name.split(" ").map(part => part[0]).slice(0, 2).join(""))}</span><span><strong>${escapeHtml(session.user_name)}</strong><small>${relativeTime(session.last_seen)} · ${escapeHtml(session.ip)}</small></span>${statusChip(session.status)}</div>`).join("") || `<p class="muted-block">Никто не подключён</p>`}</div></section></div>
+        ${stand.status === "error" && stand.last_error ? `<div class="alert alert--error">${icon("alert")}<div><strong>Причина ошибки развёртывания</strong><br><span class="mono">${escapeHtml(stand.last_error)}</span></div></div>` : ""}
+        <div class="detail-stat-grid"><div><span>Машины</span><strong>${runCount} / ${stand.vm_count}</strong><small>запущено</small></div><div><span>CPU</span><strong>${formatNumber(stand.cpu, 1)}%</strong><small>текущая оценка</small></div><div><span>RAM</span><strong>${formatNumber(stand.ram, 1)}%</strong><small>на ноде</small></div><div><span>Истекает</span><strong>${relativeTime(stand.expires_at)}</strong><small>${dateTime(stand.expires_at)}</small></div></div>
+        <div class="detail-actions"><button class="button" data-stand-action="${stand.status === "stopped" ? "start" : "stop"}" data-stand-id="${stand.id}" ${!["running", "stopped"].includes(stand.status) || !stand.vms.length ? "disabled" : ""}>${icon("power")}${stand.status === "stopped" ? "Запустить" : "Остановить"}</button><button class="button" data-stand-action="restart" data-stand-id="${stand.id}" ${stand.status !== "running" ? "disabled" : ""}>${icon("refresh")}Перезапустить</button><button class="button" data-stand-action="snapshot" data-stand-id="${stand.id}" ${!stand.vms.length ? "disabled" : ""}>${icon("copy")}Снимок</button><button class="button" data-stand-action="password" data-stand-id="${stand.id}" ${stand.status !== "running" ? "disabled" : ""}>${icon("lock")}Сменить пароль</button><button class="button" data-edit-stand="${stand.id}">${icon("edit")}Параметры</button><button class="button button--dark" data-stand-action="run_check" data-stand-id="${stand.id}" ${stand.status !== "running" ? "disabled" : ""}>${icon("check")}Автопроверка</button></div>
+        <div class="detail-columns detail-columns--single"><section><div class="detail-section-title"><h4>Виртуальные машины</h4><span>${stand.vms.length}</span></div><div class="vm-list">${stand.vms.map(vm => `<div class="vm-row"><span class="vm-state vm-state--${escapeHtml(vm.status)}"></span><div><strong>${escapeHtml(vm.name)}</strong><small class="mono">VMID ${vm.vmid} · ${escapeHtml(vm.ip || "IP не назначен")}</small></div><span>${escapeHtml(vm.node)}</span>${statusChip(vm.status)}</div>`).join("") || `<p class="muted-block">Машины ещё не созданы</p>`}</div></section></div>
         <div class="detail-meta"><span>${icon("activity")} Создан ${dateTime(stand.created_at)}</span><span>${icon("lock")} Пароль менялся ${relativeTime(stand.password_updated_at)}</span><span>${icon("users")} Ответственный: ${escapeHtml(stand.owner)}</span></div>
       </div>`;
       const footer = `<button class="button button--danger" data-delete-stand="${stand.id}" type="button">${icon("trash")}Удалить стенд</button><button class="button" data-close-modal type="button">Закрыть</button>`;
@@ -831,7 +772,6 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     const body = `<form id="stand-edit-form" class="form-grid">
       <label class="field field--full"><span class="field-label">Название стенда</span><input class="input" name="name" value="${escapeHtml(stand.name)}" required></label>
       <label class="field"><span class="field-label">Ответственный</span><input class="input" name="owner" value="${escapeHtml(stand.owner)}"></label>
-      <label class="field"><span class="field-label">Максимум участников</span><input class="input" type="number" name="max_participants" min="1" max="100" value="${stand.max_participants}"></label>
       <label class="field"><span class="field-label">Работает до</span><input class="input" type="datetime-local" name="expires_at" value="${localExpiry}"></label>
       <label class="field"><span class="field-label">Диапазон адресов</span><input class="input mono" name="ip_range" value="${escapeHtml(stand.ip_range)}"></label>
       <div class="field field--full"><div class="alert alert--info">${icon("info")} Изменение метаданных не перенастраивает сеть уже созданных VM.</div></div>
@@ -840,7 +780,6 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     modalRoot.querySelector("#stand-edit-form").addEventListener("submit", async event => {
       event.preventDefault();
       const values = Object.fromEntries(new FormData(event.currentTarget).entries());
-      values.max_participants = Number(values.max_participants);
       values.expires_at = values.expires_at ? new Date(values.expires_at).toISOString() : null;
       try {
         await api(`/api/stands/${id}`, { method: "PATCH", body: values });
@@ -851,7 +790,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
 
   function openPasswordModal(id) {
     const stand = state.data.stands.find(item => item.id === Number(id));
-    const body = `<form id="password-form"><div class="credential-intro"><span>${icon("lock")}</span><div><h3>Ротация на всех VM</h3><p>Новый пароль будет установлен через QEMU Guest Agent и показан только один раз.</p></div></div><div class="form-grid"><label class="field"><span class="field-label">Пользователь</span><input class="input mono" name="username" value="root" required></label><label class="field"><span class="field-label">Режим</span><select class="input" id="password-mode"><option value="generate">Сгенерировать безопасный</option><option value="custom">Задать вручную</option></select></label><label class="field field--full" id="custom-password-field" hidden><span class="field-label">Новый пароль</span><input class="input mono" type="password" name="password" minlength="10" autocomplete="new-password"><small class="field-hint">Минимум 10 символов</small></label></div><div class="alert alert--warning">${icon("alert")} Активные SSH-сессии не завершатся, но новые подключения потребуют новый пароль.</div></form>`;
+    const body = `<form id="password-form"><div class="credential-intro"><span>${icon("lock")}</span><div><h3>Ротация на всех VM</h3><p>Новый пароль будет установлен через QEMU Guest Agent и показан только один раз.</p></div></div><div class="form-grid"><label class="field"><span class="field-label">Пользователь</span><input class="input mono" name="username" value="root" required></label><label class="field"><span class="field-label">Режим</span><select class="input" id="password-mode"><option value="generate">Сгенерировать безопасный</option><option value="custom">Задать вручную</option></select></label><label class="field field--full" id="custom-password-field" hidden><span class="field-label">Новый пароль</span><input class="input mono" type="password" name="password" minlength="10" autocomplete="new-password"><small class="field-hint">Минимум 10 символов</small></label></div><div class="alert alert--warning">${icon("alert")} Новый пароль потребуется при следующей авторизации в веб-интерфейсе гостевой системы.</div></form>`;
     const footer = `<button class="button" data-close-modal type="button">Отмена</button><button class="button button--primary" type="submit" form="password-form">${icon("lock")}Сменить пароль</button>`;
     showModal({ title: "Сменить пароль стенда", subtitle: stand?.name || `Стенд #${id}`, body, footer });
     const mode = modalRoot.querySelector("#password-mode");
@@ -875,19 +814,6 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
   function showCredentialResult(credential, standName) {
     const body = `<div class="credential-result"><div class="credential-result__success">${icon("check")}</div><h3>Пароль успешно обновлён</h3><p>Скопируйте данные сейчас. После закрытия окна пароль больше не будет доступен.</p><div class="credential-box"><div><span>Пользователь</span><strong class="mono">${escapeHtml(credential.username)}</strong></div><div><span>Новый пароль</span><strong class="mono" id="one-time-password">••••••••••••••••</strong><button type="button" data-reveal-password data-value="${escapeHtml(credential.password)}">${icon("eye")}Показать</button></div></div><button class="button button--large" type="button" data-copy-credential data-user="${escapeHtml(credential.username)}" data-password="${escapeHtml(credential.password)}">${icon("copy")}Скопировать доступ</button><div class="one-time-note">${icon("shield")} Одноразовое раскрытие · событие записано в аудит</div></div>`;
     showModal({ title: "Новые учётные данные", subtitle: standName, body, footer: `<button class="button button--primary" data-close-modal type="button">Готово</button>` });
-  }
-
-  function openSessionModal() {
-    const stands = state.data.stands.filter(item => item.status === "running" && item.participants < item.max_participants);
-    if (!stands.length) { toast("Нет работающих стендов со свободными местами", "warning"); return; }
-    const body = `<form id="session-form" class="form-grid"><label class="field field--full"><span class="field-label">Стенд</span><select class="input" name="stand_id">${stands.map(stand => `<option value="${stand.id}">${escapeHtml(stand.name)} · ${stand.max_participants - stand.participants} мест</option>`).join("")}</select></label><label class="field"><span class="field-label">Имя участника</span><input class="input" name="user_name" required placeholder="Иван Петров"></label><label class="field"><span class="field-label">Логин</span><input class="input mono" name="login" required placeholder="i.petrov"></label><label class="field"><span class="field-label">IP клиента</span><input class="input mono" name="ip" value="10.50.1."></label><label class="field"><span class="field-label">Роль</span><select class="input" name="role"><option>Участник</option><option>Эксперт</option><option>Наблюдатель</option></select></label></form>`;
-    showModal({ title: "Добавить сессию", subtitle: "Ручная регистрация доступа через gateway", body, footer: `<button class="button" data-close-modal type="button">Отмена</button><button class="button button--primary" type="submit" form="session-form">${icon("plus")}Добавить</button>` });
-    modalRoot.querySelector("#session-form").addEventListener("submit", async event => {
-      event.preventDefault();
-      const submit = modalRoot.querySelector('button[type="submit"]'); submit.disabled = true;
-      try { await api("/api/sessions", { method: "POST", body: Object.fromEntries(new FormData(event.currentTarget).entries()) }); closeModal(); toast("Сессия зарегистрирована"); await loadData(); }
-      catch (error) { submit.disabled = false; toast(error.message, "error"); }
-    });
   }
 
   function openRunCheckModal() {
@@ -933,7 +859,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
   async function confirmDeleteStand(id) {
     const stand = state.data.stands.find(item => item.id === Number(id));
     const imported = stand?.origin === "imported";
-    const body = `<div class="danger-confirm"><span>${icon(imported ? "info" : "trash")}</span><h3>${imported ? "Отключить pool от дашборда?" : "Удалить стенд безвозвратно?"}</h3><p>${imported ? `Pool <strong class="mono">${escapeHtml(stand?.pool_id)}</strong> и его ${stand?.vm_count || 0} VM останутся в Proxmox. Удалится только связь с дашбордом, сессии и история проверок.` : `Будут удалены пул <strong class="mono">${escapeHtml(stand?.pool_id)}</strong>, ${stand?.vm_count || 0} VM, их диски и история сессий.`}</p><label class="field"><span class="field-label">Введите название стенда для подтверждения</span><input class="input" id="delete-confirm-name" autocomplete="off" placeholder="${escapeHtml(stand?.name)}"></label></div>`;
+    const body = `<div class="danger-confirm"><span>${icon(imported ? "info" : "trash")}</span><h3>${imported ? "Отключить pool от дашборда?" : "Удалить стенд безвозвратно?"}</h3><p>${imported ? `Pool <strong class="mono">${escapeHtml(stand?.pool_id)}</strong> и его ${stand?.vm_count || 0} VM останутся в Proxmox. Удалится только связь с дашбордом и история проверок.` : `Будут удалены пул <strong class="mono">${escapeHtml(stand?.pool_id)}</strong>, ${stand?.vm_count || 0} VM, их диски и история проверок.`}</p><label class="field"><span class="field-label">Введите название стенда для подтверждения</span><input class="input" id="delete-confirm-name" autocomplete="off" placeholder="${escapeHtml(stand?.name)}"></label></div>`;
     showModal({ title: imported ? "Отключение pool" : "Удаление стенда", subtitle: imported ? "Ресурсы Proxmox сохранятся" : "Необратимая операция", body, footer: `<button class="button" data-close-modal type="button">Отмена</button><button class="button ${imported ? "" : "button--danger"}" id="delete-stand-confirm" type="button" disabled>${icon(imported ? "info" : "trash")}${imported ? "Отключить" : "Удалить навсегда"}</button>` });
     const input = modalRoot.querySelector("#delete-confirm-name"), button = modalRoot.querySelector("#delete-stand-confirm");
     input.addEventListener("input", () => { button.disabled = input.value !== stand?.name; });
@@ -993,7 +919,6 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     else if (target.matches("[data-open-deploy]")) openDeployWizard(target.dataset.openDeploy || null);
     else if (target.matches("[data-refresh]")) loadData();
     else if (target.dataset.standFilter) { state.standFilter = target.dataset.standFilter; renderStands(); }
-    else if (target.dataset.sessionFilter) { state.sessionFilter = target.dataset.sessionFilter; renderSessions(); }
     else if (target.dataset.standDetail) openStandDetail(Number(target.dataset.standDetail));
     else if (target.dataset.blueprintNew !== undefined) openBlueprintEditor();
     else if (target.dataset.blueprintEdit) openBlueprintEditor(Number(target.dataset.blueprintEdit));
@@ -1015,11 +940,6 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     }
     else if (target.dataset.editStand) openStandEditor(Number(target.dataset.editStand));
     else if (target.dataset.deleteStand) confirmDeleteStand(Number(target.dataset.deleteStand));
-    else if (target.matches("[data-session-new]")) openSessionModal();
-    else if (target.dataset.endSession) {
-      if (!window.confirm("Завершить пользовательскую сессию?")) return;
-      try { await api(`/api/sessions/${target.dataset.endSession}`, { method: "DELETE" }); toast("Сессия завершена", "warning"); await loadData(); } catch (error) { toast(error.message, "error"); }
-    }
     else if (target.matches("[data-reveal-password]")) { document.querySelector("#one-time-password").textContent = target.dataset.value; target.remove(); }
     else if (target.matches("[data-copy-credential]")) { await copyText(`${target.dataset.user}\n${target.dataset.password}`); toast("Учётные данные скопированы"); }
     else if (target.matches("[data-close-modal]")) closeModal();
