@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 import secrets
@@ -66,6 +67,9 @@ class DashboardService:
             "cluster": info.cluster, "message": info.message,
         }
 
+    def list_templates(self) -> list[dict[str, Any]]:
+        return self.gateway.list_templates()
+
     def list_blueprints(self) -> list[dict[str, Any]]:
         return self.store.query_all("SELECT * FROM blueprints ORDER BY status = 'draft', updated_at DESC")
 
@@ -77,8 +81,7 @@ class DashboardService:
 
     def save_blueprint(self, payload: dict[str, Any], blueprint_id: int | None = None) -> dict[str, Any]:
         fields = {
-            "code", "name", "description", "category", "version", "status", "vm_count",
-            "template_vmid", "clone_type", "storage", "bridge", "subnet", "estimated_minutes",
+            "code", "name", "description", "category", "version", "status", "template_vmid",
             "tags", "deploy_script", "autocheck_script", "checks_count",
         }
         data = {key: payload[key] for key in fields if key in payload}
@@ -88,22 +91,16 @@ class DashboardService:
             raise ValidationError("Название сценария не может быть пустым")
         if "code" in data and not str(data["code"]).strip():
             raise ValidationError("Код сценария не может быть пустым")
-        for field in ("vm_count", "template_vmid", "estimated_minutes", "checks_count"):
+        for field in ("template_vmid", "checks_count"):
             if field in data:
                 try:
                     data[field] = int(data[field])
                 except (TypeError, ValueError) as exc:
                     raise ValidationError(f"Поле {field} должно быть числом") from exc
-        if "vm_count" in data and not 1 <= data["vm_count"] <= 50:
-            raise ValidationError("Количество VM должно быть от 1 до 50")
         if "template_vmid" in data and data["template_vmid"] < 0:
             raise ValidationError("VMID шаблона не может быть отрицательным")
-        if "estimated_minutes" in data and not 1 <= data["estimated_minutes"] <= 1440:
-            raise ValidationError("Оценка времени должна быть от 1 до 1440 минут")
         if "checks_count" in data and not 0 <= data["checks_count"] <= 1000:
             raise ValidationError("Количество проверок должно быть от 0 до 1000")
-        if "clone_type" in data and data["clone_type"] not in {"full", "linked"}:
-            raise ValidationError("Тип клонирования: full или linked")
         if "status" in data and data["status"] not in {"active", "draft", "archived"}:
             raise ValidationError("Неизвестный статус сценария")
         if "tags" in data:
@@ -114,7 +111,7 @@ class DashboardService:
         if blueprint_id is None:
             defaults: dict[str, Any] = {
                 "description": "", "category": "Общий", "version": "1.0", "status": "draft",
-                "vm_count": 1, "template_vmid": 0, "clone_type": "full", "storage": "",
+                "vm_count": 1, "template_vmid": 0, "clone_type": "linked", "storage": "",
                 "bridge": "vmbr0", "subnet": "", "estimated_minutes": 8,
                 "tags": "[]", "deploy_script": "#!/usr/bin/env bash\nset -euo pipefail\n",
                 "autocheck_script": "#!/usr/bin/env bash\nset -euo pipefail\n", "checks_count": 0,
@@ -204,8 +201,25 @@ class DashboardService:
         try:
             max_participants = max(1, min(100, int(payload.get("max_participants", 12))))
             ttl_hours = max(1, min(720, int(payload.get("ttl_hours", 8))))
+            vm_count = int(payload.get("vm_count", 1))
         except (TypeError, ValueError) as exc:
-            raise ValidationError("Вместимость и срок жизни должны быть числами") from exc
+            raise ValidationError("Количество VM, вместимость и срок жизни должны быть числами") from exc
+        if not 1 <= vm_count <= 50:
+            raise ValidationError("Количество VM должно быть от 1 до 50")
+        subnet = str(payload.get("subnet", "")).strip()
+        if subnet:
+            try:
+                network = ipaddress.ip_network(subnet, strict=False)
+            except ValueError as exc:
+                raise ValidationError("Подсеть должна быть в формате IPv4 CIDR, например 10.39.10.0/24") from exc
+            if network.version != 4:
+                raise ValidationError("Для развёртывания поддерживается только IPv4-подсеть")
+            usable = network.num_addresses if network.prefixlen >= 31 else max(0, network.num_addresses - 2)
+            if usable < vm_count:
+                raise ValidationError("В выбранной подсети недостаточно адресов для указанного количества VM")
+        bridge = str(payload.get("bridge", "vmbr0")).strip()
+        if bridge and not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", bridge):
+            raise ValidationError("Некорректное имя сетевого bridge")
         expires = (datetime.now(timezone.utc) + timedelta(hours=ttl_hours)).replace(microsecond=0).isoformat()
         now = utc_now()
         stand_id = self.store.execute(
@@ -214,12 +228,20 @@ class DashboardService:
              vm_count, cpu, ram, disk, ip_range, check_status, expires_at, created_at, updated_at)
             VALUES (?, ?, 'provisioning', 4, ?, ?, ?, 0, ?, ?, 0, 0, 0, ?, 'idle', ?, ?, ?)""",
             (name, blueprint_id, str(payload.get("node", "auto")), pool_id, str(payload.get("owner", "Администратор")),
-             max_participants, int(blueprint["vm_count"]), str(blueprint.get("subnet", "")), expires, now, now),
+             max_participants, vm_count, subnet, expires, now, now),
         )
-        self.store.add_activity("deploy", "Развёртывание запущено", f"{name} · {blueprint['name']}", "progress")
+        deployment = dict(blueprint)
+        deployment.update({
+            "vm_count": vm_count,
+            "subnet": subnet,
+            "bridge": bridge,
+            "clone_type": "linked",
+            "storage": "",
+        })
+        self.store.add_activity("deploy", "Развёртывание запущено", f"{name} · {blueprint['name']} · {vm_count} VM", "progress")
         thread = threading.Thread(
             target=self._deploy_job,
-            args=(stand_id, dict(blueprint)),
+            args=(stand_id, deployment),
             name=f"deploy-{stand_id}",
             daemon=True,
         )
@@ -533,6 +555,7 @@ class DashboardService:
     def bootstrap(self) -> dict[str, Any]:
         return {
             "integration": self.integration(), "overview": self.overview(), "stands": self.list_stands(),
-            "blueprints": self.list_blueprints(), "sessions": self.list_sessions(), "checks": self.list_checks(),
+            "blueprints": self.list_blueprints(), "templates": self.list_templates(),
+            "sessions": self.list_sessions(), "checks": self.list_checks(),
             "metrics": self.metrics(), "activity": self.activity(), "server_time": utc_now(),
         }

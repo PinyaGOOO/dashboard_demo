@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 import os
@@ -34,6 +35,13 @@ class DemoProxmoxGateway:
 
     def integration_info(self) -> IntegrationInfo:
         return IntegrationInfo("demo", True, "demo-cluster.local", "DEMO-PVE", "Демонстрационные данные")
+
+    def list_templates(self) -> list[dict[str, Any]]:
+        return [
+            {"vmid": 9001, "name": "debian-12-network", "node": "pve-01"},
+            {"vmid": 9002, "name": "windows-server-2022", "node": "pve-02"},
+            {"vmid": 9003, "name": "debian-12-security", "node": "pve-03"},
+        ]
 
     def cluster_metrics(self, tracked_vmids: list[int] | None = None) -> dict[str, Any]:
         phase = time.time() / 24
@@ -103,11 +111,20 @@ class DemoProxmoxGateway:
 
     @staticmethod
     def _ip_for(subnet: str, index: int) -> str:
-        parts = str(subnet).split("/")[0].split(".")
-        if len(parts) == 4:
-            parts[-1] = str(39 + index)
-            return ".".join(parts)
-        return ""
+        try:
+            network = ipaddress.ip_network(str(subnet), strict=False)
+        except ValueError:
+            return ""
+        if network.version != 4:
+            return ""
+        if network.prefixlen >= 31:
+            offset = index - 1
+        else:
+            preferred = 39 + index
+            offset = preferred if preferred < network.num_addresses - 1 else index
+        candidate = int(network.network_address) + offset
+        last_usable = int(network.broadcast_address) if network.prefixlen >= 31 else int(network.broadcast_address) - 1
+        return str(ipaddress.ip_address(candidate)) if candidate <= last_usable else ""
 
     def power_action(self, vmids: list[int], action: str) -> None:
         time.sleep(0.25)
@@ -182,6 +199,18 @@ class LiveProxmoxGateway:
             return IntegrationInfo("live", True, endpoint, os.environ.get("PROXMOX_CLUSTER_NAME", "Proxmox VE"), f"{len(nodes)} нод")
         except Exception as exc:
             return IntegrationInfo("live", False, endpoint, "Proxmox VE", str(exc))
+
+    def list_templates(self) -> list[dict[str, Any]]:
+        templates: list[dict[str, Any]] = []
+        for resource in self.client.cluster.resources.get(type="vm"):
+            if resource.get("type") != "qemu" or int(resource.get("template") or 0) != 1:
+                continue
+            templates.append({
+                "vmid": int(resource["vmid"]),
+                "name": str(resource.get("name") or f"template-{resource['vmid']}"),
+                "node": str(resource.get("node") or ""),
+            })
+        return sorted(templates, key=lambda item: (item["name"].lower(), item["vmid"]))
 
     def _wait_task(self, node: str, upid: str, timeout: int = 1800) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
@@ -343,11 +372,9 @@ class LiveProxmoxGateway:
                 created.append((target_node, new_vmid))
                 name = f"{pool_id}-{index}"
                 params: dict[str, Any] = {
-                    "newid": new_vmid, "name": name, "full": 1 if blueprint.get("clone_type") == "full" else 0,
+                    "newid": new_vmid, "name": name, "full": 0,
                     "target": target_node, "pool": pool_id,
                 }
-                if params["full"] and blueprint.get("storage"):
-                    params["storage"] = blueprint["storage"]
                 upid = self.client.nodes(template_node).qemu(template_vmid).clone.post(**params)
                 self._wait_task(template_node, upid)
                 config: dict[str, Any] = {"agent": "1"}
@@ -360,6 +387,7 @@ class LiveProxmoxGateway:
                 self.client.nodes(target_node).qemu(new_vmid).config.put(**config)
                 upid = self.client.nodes(target_node).qemu(new_vmid).status.start.post()
                 self._wait_task(target_node, upid)
+                vm_ip = DemoProxmoxGateway._ip_for(str(blueprint.get("subnet", "")), index)
                 deploy_script = str(blueprint.get("deploy_script", ""))
                 if deploy_script.strip():
                     result = self._guest_script(
@@ -372,6 +400,9 @@ class LiveProxmoxGateway:
                             "STAND_POOL": str(pool_id),
                             "VM_INDEX": str(index),
                             "VMID": str(new_vmid),
+                            "VM_IP": vm_ip,
+                            "STAND_SUBNET": str(blueprint.get("subnet", "")),
+                            "VM_BRIDGE": str(blueprint.get("bridge", "")),
                         },
                         timeout=900,
                     )
@@ -380,7 +411,7 @@ class LiveProxmoxGateway:
                         raise RuntimeError(f"Скрипт развёртывания VM {new_vmid}: {detail[-500:]}")
                 deployed.append({
                     "vmid": new_vmid, "name": name, "node": target_node,
-                    "ip": DemoProxmoxGateway._ip_for(str(blueprint.get("subnet", "")), index), "status": "running",
+                    "ip": vm_ip, "status": "running",
                 })
                 progress(12 + round(index / vm_count * 78), f"VM {index} из {vm_count} настроена")
             progress(100, "Стенд готов")

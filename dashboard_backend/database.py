@@ -62,7 +62,7 @@ class DashboardStore:
             status TEXT NOT NULL DEFAULT 'active',
             vm_count INTEGER NOT NULL DEFAULT 1,
             template_vmid INTEGER NOT NULL DEFAULT 0,
-            clone_type TEXT NOT NULL DEFAULT 'full',
+            clone_type TEXT NOT NULL DEFAULT 'linked',
             storage TEXT NOT NULL DEFAULT '',
             bridge TEXT NOT NULL DEFAULT 'vmbr0',
             subnet TEXT NOT NULL DEFAULT '',
