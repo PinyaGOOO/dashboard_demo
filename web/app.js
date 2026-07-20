@@ -5,6 +5,34 @@
   const modalRoot = document.querySelector("#modal-root");
   const toastRoot = document.querySelector("#toast-root");
   const routes = ["overview", "stands", "blueprints", "checks", "sessions", "infrastructure"];
+  const VKLVIKL_BOOTSTRAP_SCRIPT = `#!/usr/bin/env bash
+set -euo pipefail
+
+# Сетевой bootstrap из исходного vklvikl.py.
+# VM_IP и STAND_SUBNET передаются дашбордом для каждой созданной VM.
+if [[ -z "\${VM_IP:-}" ]]; then
+  echo "VM_IP не задан — настройка статического адреса пропущена"
+  exit 0
+fi
+
+GUEST_INTERFACE="\${GUEST_INTERFACE:-vmbr0}"
+INTERFACES_FILE="\${INTERFACES_FILE:-/etc/network/interfaces}"
+PREFIX="\${STAND_SUBNET##*/}"
+[[ -n "\${STAND_SUBNET:-}" && "\${PREFIX}" != "\${STAND_SUBNET}" ]] || PREFIX=16
+VM_GATEWAY="\${VM_GATEWAY:-10.39.1.1}"
+
+sed -i "/^iface \${GUEST_INTERFACE} inet static/,/^[^ \\t]/ s|^\\([ \\t]*address[ \\t]\\+\\).*|\\1\${VM_IP}/\${PREFIX}|" "\${INTERFACES_FILE}"
+sed -i "/^iface \${GUEST_INTERFACE} inet static/,/^[^ \\t]/ s|^\\([ \\t]*gateway[ \\t]\\+\\).*|\\1\${VM_GATEWAY}|" "\${INTERFACES_FILE}"
+
+HOSTNAME="$(tr -d '\\n' < /etc/hostname)"
+sed -i '/^127\\.0\\.1\\.1/d' /etc/hosts
+printf '127.0.1.1 %s\\n' "\${HOSTNAME}" >> /etc/hosts
+sed -i "/^[0-9]\\+\\.[0-9]\\+\\.[0-9]\\+\\.[0-9]\\+.*\${HOSTNAME}/d" /etc/hosts
+printf '%s %s.example.local %s\\n' "\${VM_IP}" "\${HOSTNAME}" "\${HOSTNAME}" >> /etc/hosts
+
+ifdown "\${GUEST_INTERFACE}" 2>/dev/null || true
+ifup "\${GUEST_INTERFACE}" 2>/dev/null || true
+echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GUEST_INTERFACE}"`;
   const routeTitles = {
     overview: "Обзор",
     stands: "Стенды",
@@ -187,16 +215,29 @@
     const exam = history.map((item, index) => point(item, index, "exam"));
     const toPath = points => points.map(([x, y], index) => `${index ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
     const areaPath = `${toPath(exam)} L${exam.at(-1)[0].toFixed(1)},${(top + innerH).toFixed(1)} L${exam[0][0].toFixed(1)},${(top + innerH).toFixed(1)} Z`;
-    const grid = [0, 25, 50, 75, 100].map(value => {
+    const ticks = [0, 25, 50, 75, 100];
+    const grid = ticks.map(value => {
       const y = top + innerH - value / maxValue * innerH;
-      return `<line x1="${left}" y1="${y}" x2="${width - right}" y2="${y}" stroke="#e8ebee" stroke-width="1"/><text x="${left - 8}" y="${y + 3}" text-anchor="end" fill="#9299a3" font-size="9">${value}%</text>`;
+      return `<line x1="${left}" y1="${y}" x2="${width - right}" y2="${y}" stroke="#e8ebee" stroke-width="1" vector-effect="non-scaling-stroke"/>`;
     }).join("");
-    const labels = history.map((item, index) => index % 4 === 0 || index === history.length - 1
-      ? `<text x="${point(item, index, "total")[0]}" y="${height - 8}" text-anchor="middle" fill="#9299a3" font-size="9">${escapeHtml(item.time)}</text>` : "").join("");
-    return `<div class="chart" style="height:${height}px"><svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-label="График нагрузки кластера">
+    const yLabels = ticks.map(value => {
+      const y = top + innerH - value / maxValue * innerH;
+      return `<span class="chart__axis-label chart__axis-label--y" style="top:${(y / height * 100).toFixed(3)}%">${value}%</span>`;
+    }).join("");
+    const maxXLabels = window.innerWidth < 700 ? 3 : 6;
+    const labelStep = Math.max(1, Math.ceil((history.length - 1) / Math.max(maxXLabels - 1, 1)));
+    const labelIndexes = [];
+    for (let index = 0; index < history.length; index += labelStep) labelIndexes.push(index);
+    if (labelIndexes.at(-1) !== history.length - 1) labelIndexes.push(history.length - 1);
+    const xLabels = labelIndexes.map((index, position) => {
+      const x = point(history[index], index, "total")[0];
+      const edgeClass = position === 0 ? " is-first" : position === labelIndexes.length - 1 ? " is-last" : "";
+      return `<span class="chart__axis-label chart__axis-label--x${edgeClass}" style="left:${(x / width * 100).toFixed(3)}%">${escapeHtml(history[index].time)}</span>`;
+    }).join("");
+    return `<div class="chart" style="height:${height}px" role="img" aria-label="График нагрузки кластера"><svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true" focusable="false">
       <defs><linearGradient id="examArea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ed6c23" stop-opacity=".20"/><stop offset="1" stop-color="#ed6c23" stop-opacity="0"/></linearGradient></defs>
-      ${grid}<path d="${areaPath}" fill="url(#examArea)"/><path d="${toPath(total)}" fill="none" stroke="#9099a6" stroke-width="2" vector-effect="non-scaling-stroke"/><path d="${toPath(exam)}" fill="none" stroke="#ed6c23" stroke-width="2.5" vector-effect="non-scaling-stroke"/>${labels}
-    </svg></div>`;
+      ${grid}<path d="${areaPath}" fill="url(#examArea)"/><path d="${toPath(total)}" fill="none" stroke="#9099a6" stroke-width="2" vector-effect="non-scaling-stroke"/><path d="${toPath(exam)}" fill="none" stroke="#ed6c23" stroke-width="2.5" vector-effect="non-scaling-stroke"/>
+    </svg>${yLabels}${xLabels}</div>`;
   }
 
   function emptyState(iconName, title, text, action = "") {
@@ -264,7 +305,7 @@
   }
 
   function activityItem(item) {
-    const icons = { deploy: "server", check: "check", session: "users", password: "lock", snapshot: "copy", power: "power", script: "code", delete: "trash", edit: "edit" };
+    const icons = { deploy: "server", import: "plus", check: "check", session: "users", password: "lock", snapshot: "copy", power: "power", script: "code", delete: "trash", edit: "edit" };
     return `<div class="activity-item"><span class="activity-item__icon activity-item__icon--${escapeHtml(item.status)}">${icon(icons[item.kind] || "info")}</span>
       <div class="activity-item__copy"><strong>${escapeHtml(item.title)}</strong><p>${escapeHtml(item.detail)}</p></div><time class="activity-item__time" title="${escapeHtml(dateTime(item.created_at))}">${relativeTime(item.created_at)}</time></div>`;
   }
@@ -287,7 +328,7 @@
       attention: state.data.stands.filter(item => item.status === "error" || ["warning", "failed"].includes(item.check_status)).length,
     };
     app.innerHTML = `<section class="page">
-      ${pageHeader("Стенды", "Управляйте жизненным циклом пулов, машинами, доступами и сроком работы.", `<button class="button button--primary" data-open-deploy>${icon("plus")}Развернуть стенд</button>`)}
+      ${pageHeader("Стенды", "Управляйте жизненным циклом пулов, машинами, доступами и сроком работы.", `<button class="button" data-import-pool>${icon("plus")}Добавить существующий pool</button><button class="button button--primary" data-open-deploy>${icon("plus")}Развернуть стенд</button>`)}
       <div class="toolbar"><div class="toolbar__primary"><label class="search-field">${icon("search")}<input id="stand-search" type="search" value="${escapeHtml(state.standSearch)}" placeholder="Название, pool ID, владелец…"></label>
         <div class="filter-tabs" role="tablist">${[["all", "Все"], ["running", "Работают"], ["provisioning", "В процессе"], ["stopped", "Остановлены"], ["attention", "Требуют внимания"]].map(([key, label]) => `<button class="filter-tab ${state.standFilter === key ? "is-active" : ""}" data-stand-filter="${key}" type="button">${label}<span>${counts[key]}</span></button>`).join("")}</div></div>
         <div class="toolbar-actions"><button class="button" data-refresh>${icon("refresh")}Обновить</button></div></div>
@@ -311,7 +352,7 @@
     const expires = parseDate(stand.expires_at);
     const hours = expires ? Math.max(0, Math.round((expires - new Date()) / 36e5)) : null;
     return `<tr class="clickable-row" data-stand-detail="${stand.id}">
-      <td><div class="entity-cell"><span class="entity-icon">${icon("server")}</span><span><strong class="cell-title">${escapeHtml(stand.name)}</strong><small class="cell-subtitle mono">${escapeHtml(stand.pool_id)} · ${escapeHtml(stand.node || "авто")}</small></span></div></td>
+      <td><div class="entity-cell"><span class="entity-icon">${icon("server")}</span><span><strong class="cell-title">${escapeHtml(stand.name)}</strong><small class="cell-subtitle mono">${escapeHtml(stand.pool_id)} · ${escapeHtml(stand.node || "авто")}${stand.origin === "imported" ? " · подключён" : ""}</small></span></div></td>
       <td>${statusChip(stand.status)}${stand.status === "provisioning" ? `<div class="inline-progress"><div class="progress"><div class="progress__bar progress__bar--blue" style="width:${clamp(stand.progress)}%"></div></div><small>${stand.progress}%</small></div>` : ""}</td>
       <td><div class="occupancy"><strong>${stand.participants}</strong><span>/ ${stand.max_participants}</span><div class="avatar-stack">${Array.from({ length: Math.min(3, stand.participants) }, (_, index) => `<i style="--i:${index}">${["АЛ", "МЧ", "СМ"][index]}</i>`).join("")}</div></div></td>
       <td><div class="resource-pair">${resourceBar("CPU", stand.cpu)}${resourceBar("RAM", stand.ram, "blue")}</div></td>
@@ -505,10 +546,7 @@
       const data = await api("/api/bootstrap");
       state.data = data;
       state.lastUpdated = new Date();
-      const focused = document.activeElement;
-      const editing = focused && ["INPUT", "TEXTAREA", "SELECT"].includes(focused.tagName);
-      const preserveDirtyEditor = state.route === "checks" && state.editorDirty;
-      if (!preserveDirtyEditor && (!silent || !editing)) render(); else updateShell();
+      if (silent) updateShell(); else render();
     } catch (error) {
       if (!state.data) {
         app.innerHTML = `<section class="page"><div class="load-error">${icon("alert")}<h2>Не удалось загрузить дашборд</h2><p>${escapeHtml(error.message)}</p><button class="button button--primary" data-refresh>${icon("refresh")}Повторить</button></div></section>`;
@@ -582,6 +620,35 @@
         finish(null);
         toast("Локальный административный токен удалён", "warning");
       });
+    });
+  }
+
+  function openImportPoolModal() {
+    const pools = (state.data.pools || []).filter(pool => !pool.imported);
+    const blueprints = state.data.blueprints.filter(item => item.status !== "archived");
+    if (!pools.length) { toast("Нет свободных Proxmox pools для добавления", "warning"); return; }
+    if (!blueprints.length) { toast("Сначала создайте сценарий для привязки pool", "warning"); return; }
+    const poolOptions = pools.map(pool => `<option value="${escapeHtml(pool.pool_id)}">${escapeHtml(pool.pool_id)}${pool.vm_count == null ? "" : ` · ${pool.vm_count} VM`}${pool.comment ? ` · ${escapeHtml(pool.comment)}` : ""}</option>`).join("");
+    const blueprintOptions = blueprints.map(item => `<option value="${item.id}">${escapeHtml(item.name)} · ${escapeHtml(item.code)}</option>`).join("");
+    const body = `<form id="pool-import-form"><div class="alert alert--info">${icon("info")} Pool и его VM не создаются заново. Дашборд только подключит их к мониторингу и выбранному сценарию.</div><div class="form-grid"><label class="field field--full"><span class="field-label">Существующий Proxmox pool</span><select class="input mono" name="pool_id" id="import-pool-select" required>${poolOptions}</select></label><label class="field"><span class="field-label">Название стенда</span><input class="input" name="name" id="import-pool-name" value="${escapeHtml(pools[0].pool_id)}" required></label><label class="field"><span class="field-label">Сценарий и автопроверка</span><select class="input" name="blueprint_id" required>${blueprintOptions}</select></label><label class="field"><span class="field-label">Ответственный</span><input class="input" name="owner" value="Администратор"></label><label class="field"><span class="field-label">Максимум участников</span><input class="input" name="max_participants" type="number" min="1" max="100" value="12"></label></div><div class="alert alert--warning">${icon("shield")} При удалении подключённого стенда из дашборда исходный pool и его VM останутся в Proxmox.</div></form>`;
+    showModal({ title: "Добавить существующий pool", subtitle: "Подключение ресурсов без клонирования", body, footer: `<button class="button" data-close-modal type="button">Отмена</button><button class="button button--primary" type="submit" form="pool-import-form">${icon("plus")}Добавить pool</button>`, size: "wide" });
+    const form = modalRoot.querySelector("#pool-import-form");
+    const select = modalRoot.querySelector("#import-pool-select");
+    const nameInput = modalRoot.querySelector("#import-pool-name");
+    let nameTouched = false;
+    nameInput.addEventListener("input", () => { nameTouched = true; });
+    select.addEventListener("change", () => { if (!nameTouched) nameInput.value = select.value; });
+    form.addEventListener("submit", async event => {
+      event.preventDefault();
+      const submit = modalRoot.querySelector('button[type="submit"]');
+      submit.disabled = true;
+      const values = Object.fromEntries(new FormData(form).entries());
+      values.blueprint_id = Number(values.blueprint_id);
+      values.max_participants = Number(values.max_participants);
+      try {
+        const stand = await api("/api/pools/import", { method: "POST", body: values });
+        closeModal(); toast(`Pool ${stand.pool_id} добавлен`); await loadData();
+      } catch (error) { submit.disabled = false; toast(error.message, "error"); }
     });
   }
 
@@ -685,7 +752,7 @@
     const original = id ? state.data.blueprints.find(item => item.id === Number(id)) : null;
     const blueprint = original || {
       code: "NEW-01", name: "", description: "", category: "Общий", version: "1.0", status: "draft",
-      template_vmid: 0, tags: [], deploy_script: "#!/usr/bin/env bash\nset -euo pipefail\n\n# Подготовка гостевой VM\n",
+      template_vmid: 0, tags: [], deploy_script: VKLVIKL_BOOTSTRAP_SCRIPT,
     };
     const templates = state.data.templates || [];
     const knownTemplate = templates.some(item => Number(item.vmid) === Number(blueprint.template_vmid));
@@ -696,10 +763,19 @@
       <label class="field"><span class="field-label">Категория</span><select class="input" name="category">${["Сети", "Системы", "Безопасность", "Базы данных", "Общий"].map(value => `<option ${blueprint.category === value ? "selected" : ""}>${value}</option>`).join("")}</select></label><label class="field"><span class="field-label">Статус</span><select class="input" name="status"><option value="draft" ${blueprint.status === "draft" ? "selected" : ""}>Черновик</option><option value="active" ${blueprint.status === "active" ? "selected" : ""}>Опубликован</option><option value="archived" ${blueprint.status === "archived" ? "selected" : ""}>Архив</option></select></label>
       <label class="field"><span class="field-label">Версия</span><input class="input" name="version" value="${escapeHtml(blueprint.version)}"></label><label class="field"><span class="field-label">Теги через запятую</span><input class="input" name="tags" value="${escapeHtml((blueprint.tags || []).join(", "))}"></label></div></div>
       <div class="form-section"><h3>Шаблон Proxmox</h3><p>Количество VM, подсеть и bridge оператор укажет при развёртывании стенда. Используются только связанные клоны.</p><div class="form-grid"><label class="field field--full"><span class="field-label">QEMU-шаблон</span><select class="input mono" name="template_vmid" required>${templateOptions}</select><small class="field-hint">Показываются VM, отмеченные в Proxmox как Template</small></label></div></div>
-      <div class="form-section"><h3>Bootstrap-скрипт</h3><p>Скрипт запускается через QEMU Guest Agent внутри каждой созданной VM.</p><div class="editor-shell editor-shell--compact"><div class="editor-toolbar"><div class="editor-file">${icon("terminal")}deploy.sh</div><span class="editor-safety">guest only</span></div><textarea class="code-editor" name="deploy_script" spellcheck="false">${escapeHtml(blueprint.deploy_script)}</textarea></div></div></form>`;
+      <div class="form-section"><h3>Bootstrap-скрипт</h3><p>Скрипт запускается через QEMU Guest Agent внутри каждой созданной VM.</p><div class="editor-shell editor-shell--compact"><div class="editor-toolbar"><div class="editor-file">${icon("terminal")}deploy.sh</div><div class="editor-actions"><button class="editor-template-button" type="button" data-use-vklvikl-bootstrap>Вставить из vklvikl</button><span class="editor-safety">guest only</span></div></div><textarea class="code-editor" name="deploy_script" spellcheck="false">${escapeHtml(blueprint.deploy_script)}</textarea></div><small class="field-hint">Исходный скрипт рассчитан на Linux с интерфейсом vmbr0 и gateway 10.39.1.1; значения можно изменить через GUEST_INTERFACE и VM_GATEWAY.</small></div></form>`;
     const footer = `<button class="button" data-close-modal type="button">Отмена</button><button class="button button--primary" type="submit" form="blueprint-form">${icon("check")}${original ? "Сохранить изменения" : "Создать сценарий"}</button>`;
     showModal({ title: original ? "Редактировать сценарий" : "Новый сценарий", subtitle: original ? `${original.code} · версия ${original.version}` : "Новый сценарий создаётся как черновик", body, footer, size: "large" });
     const form = modalRoot.querySelector("#blueprint-form");
+    modalRoot.querySelector("[data-use-vklvikl-bootstrap]").addEventListener("click", () => {
+      const editor = form.elements.deploy_script;
+      const placeholder = "#!/usr/bin/env bash\nset -euo pipefail\n\n# Подготовка гостевой VM";
+      const hasCustomCode = editor.value.trim() && editor.value.trim() !== placeholder;
+      if (hasCustomCode && editor.value !== VKLVIKL_BOOTSTRAP_SCRIPT && !window.confirm("Заменить текущий bootstrap код скриптом из vklvikl?")) return;
+      editor.value = VKLVIKL_BOOTSTRAP_SCRIPT;
+      editor.focus();
+      toast("Bootstrap из vklvikl вставлен. Сохраните сценарий");
+    });
     form.addEventListener("submit", async event => {
       event.preventDefault();
       const submit = modalRoot.querySelector("button[type=submit]"); submit.disabled = true;
@@ -856,13 +932,14 @@
 
   async function confirmDeleteStand(id) {
     const stand = state.data.stands.find(item => item.id === Number(id));
-    const body = `<div class="danger-confirm"><span>${icon("trash")}</span><h3>Удалить стенд безвозвратно?</h3><p>Будут удалены пул <strong class="mono">${escapeHtml(stand?.pool_id)}</strong>, ${stand?.vm_count || 0} VM, их диски и история сессий.</p><label class="field"><span class="field-label">Введите название стенда для подтверждения</span><input class="input" id="delete-confirm-name" autocomplete="off" placeholder="${escapeHtml(stand?.name)}"></label></div>`;
-    showModal({ title: "Удаление стенда", subtitle: "Необратимая операция", body, footer: `<button class="button" data-close-modal type="button">Отмена</button><button class="button button--danger" id="delete-stand-confirm" type="button" disabled>${icon("trash")}Удалить навсегда</button>` });
+    const imported = stand?.origin === "imported";
+    const body = `<div class="danger-confirm"><span>${icon(imported ? "info" : "trash")}</span><h3>${imported ? "Отключить pool от дашборда?" : "Удалить стенд безвозвратно?"}</h3><p>${imported ? `Pool <strong class="mono">${escapeHtml(stand?.pool_id)}</strong> и его ${stand?.vm_count || 0} VM останутся в Proxmox. Удалится только связь с дашбордом, сессии и история проверок.` : `Будут удалены пул <strong class="mono">${escapeHtml(stand?.pool_id)}</strong>, ${stand?.vm_count || 0} VM, их диски и история сессий.`}</p><label class="field"><span class="field-label">Введите название стенда для подтверждения</span><input class="input" id="delete-confirm-name" autocomplete="off" placeholder="${escapeHtml(stand?.name)}"></label></div>`;
+    showModal({ title: imported ? "Отключение pool" : "Удаление стенда", subtitle: imported ? "Ресурсы Proxmox сохранятся" : "Необратимая операция", body, footer: `<button class="button" data-close-modal type="button">Отмена</button><button class="button ${imported ? "" : "button--danger"}" id="delete-stand-confirm" type="button" disabled>${icon(imported ? "info" : "trash")}${imported ? "Отключить" : "Удалить навсегда"}</button>` });
     const input = modalRoot.querySelector("#delete-confirm-name"), button = modalRoot.querySelector("#delete-stand-confirm");
     input.addEventListener("input", () => { button.disabled = input.value !== stand?.name; });
     button.addEventListener("click", async () => {
       button.disabled = true;
-      try { await api(`/api/stands/${id}`, { method: "DELETE" }); closeModal(); toast("Стенд удалён", "warning"); await loadData(); }
+      try { await api(`/api/stands/${id}`, { method: "DELETE" }); closeModal(); toast(imported ? "Pool отключён; ресурсы Proxmox сохранены" : "Стенд удалён", imported ? "info" : "warning"); await loadData(); }
       catch (error) { button.disabled = false; toast(error.message, "error"); }
     });
   }
@@ -912,6 +989,7 @@
     if (!target) return;
     if (target.matches(".nav-link[data-route], .brand[data-route]")) { event.preventDefault(); navigate(target.dataset.route); }
     else if (target.dataset.navigate) navigate(target.dataset.navigate);
+    else if (target.dataset.importPool !== undefined) openImportPoolModal();
     else if (target.matches("[data-open-deploy]")) openDeployWizard(target.dataset.openDeploy || null);
     else if (target.matches("[data-refresh]")) loadData();
     else if (target.dataset.standFilter) { state.standFilter = target.dataset.standFilter; renderStands(); }
@@ -981,5 +1059,5 @@
   window.addEventListener("beforeunload", event => { if (state.editorDirty) { event.preventDefault(); event.returnValue = ""; } });
 
   loadData();
-  window.setInterval(() => loadData({ silent: true }), 7000);
+  window.setInterval(() => { if (!document.hidden) loadData({ silent: true }); }, 30000);
 })();

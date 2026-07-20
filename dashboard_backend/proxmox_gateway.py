@@ -43,6 +43,26 @@ class DemoProxmoxGateway:
             {"vmid": 9003, "name": "debian-12-security", "node": "pve-03"},
         ]
 
+    def list_pools(self) -> list[dict[str, Any]]:
+        return [
+            {"pool_id": "existing-network-lab", "comment": "Существующий учебный пул", "vm_count": 2},
+            {"pool_id": "reserve-demo", "comment": "Резервные машины", "vm_count": 1},
+        ]
+
+    def pool_members(self, pool_id: str) -> list[dict[str, Any]]:
+        pools = {
+            "existing-network-lab": [
+                {"vmid": 3101, "name": "legacy-router-1", "node": "pve-01", "status": "running", "cpu": 4.2, "ram": 18.0, "ip": ""},
+                {"vmid": 3102, "name": "legacy-router-2", "node": "pve-02", "status": "running", "cpu": 3.1, "ram": 16.0, "ip": ""},
+            ],
+            "reserve-demo": [
+                {"vmid": 3201, "name": "reserve-1", "node": "pve-03", "status": "stopped", "cpu": 0.0, "ram": 0.0, "ip": ""},
+            ],
+        }
+        if pool_id not in pools:
+            raise RuntimeError(f"Пул Proxmox {pool_id} не найден")
+        return pools[pool_id]
+
     def cluster_metrics(self, tracked_vmids: list[int] | None = None) -> dict[str, Any]:
         phase = time.time() / 24
         nodes_seed = [
@@ -211,6 +231,40 @@ class LiveProxmoxGateway:
                 "node": str(resource.get("node") or ""),
             })
         return sorted(templates, key=lambda item: (item["name"].lower(), item["vmid"]))
+
+    def list_pools(self) -> list[dict[str, Any]]:
+        pools: list[dict[str, Any]] = []
+        for pool in self.client.pools.get():
+            pool_id = str(pool.get("poolid") or "").strip()
+            if not pool_id:
+                continue
+            pools.append({
+                "pool_id": pool_id,
+                "comment": str(pool.get("comment") or ""),
+                "vm_count": None,
+            })
+        return sorted(pools, key=lambda item: item["pool_id"].lower())
+
+    def pool_members(self, pool_id: str) -> list[dict[str, Any]]:
+        try:
+            pool = self.client.pools(pool_id).get()
+        except Exception as exc:
+            raise RuntimeError(f"Пул Proxmox {pool_id} не найден") from exc
+        members: list[dict[str, Any]] = []
+        for member in pool.get("members", []):
+            if member.get("type") != "qemu" or member.get("vmid") is None or int(member.get("template") or 0) == 1:
+                continue
+            maxmem = max(float(member.get("maxmem") or 0), 1)
+            members.append({
+                "vmid": int(member["vmid"]),
+                "name": str(member.get("name") or f"vm-{member['vmid']}"),
+                "node": str(member.get("node") or ""),
+                "status": str(member.get("status") or "stopped"),
+                "cpu": round(float(member.get("cpu") or 0) * 100, 1),
+                "ram": round(float(member.get("mem") or 0) / maxmem * 100, 1),
+                "ip": "",
+            })
+        return sorted(members, key=lambda item: item["vmid"])
 
     def _wait_task(self, node: str, upid: str, timeout: int = 1800) -> dict[str, Any]:
         deadline = time.monotonic() + timeout

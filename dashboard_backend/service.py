@@ -70,6 +70,18 @@ class DashboardService:
     def list_templates(self) -> list[dict[str, Any]]:
         return self.gateway.list_templates()
 
+    def list_pools(self) -> list[dict[str, Any]]:
+        imported = {
+            str(row["pool_id"]): int(row["id"])
+            for row in self.store.query_all("SELECT id, pool_id FROM stands WHERE pool_id != ''")
+        }
+        pools = self.gateway.list_pools()
+        for pool in pools:
+            stand_id = imported.get(str(pool["pool_id"]))
+            pool["imported"] = stand_id is not None
+            pool["stand_id"] = stand_id
+        return pools
+
     def list_blueprints(self) -> list[dict[str, Any]]:
         return self.store.query_all("SELECT * FROM blueprints ORDER BY status = 'draft', updated_at DESC")
 
@@ -182,6 +194,65 @@ class DashboardService:
         if not value:
             value = f"exam-{int(time.time())}"
         return value[:48]
+
+    def import_pool(self, payload: dict[str, Any]) -> dict[str, Any]:
+        pool_id = str(payload.get("pool_id", "")).strip()
+        if not pool_id or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", pool_id):
+            raise ValidationError("Выберите существующий Proxmox pool")
+        if self.store.query_one("SELECT id FROM stands WHERE pool_id = ?", (pool_id,)):
+            raise ConflictError("Этот pool уже добавлен в дашборд")
+        try:
+            blueprint_id = int(payload.get("blueprint_id"))
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("Выберите сценарий для импортируемого pool") from exc
+        blueprint = self.get_blueprint(blueprint_id)
+        members = self.gateway.pool_members(pool_id)
+        if not members:
+            raise ConflictError("В выбранном pool нет QEMU VM, доступных для добавления")
+        vmids = [int(member["vmid"]) for member in members]
+        placeholders = ",".join("?" for _ in vmids)
+        tracked = self.store.query_all(
+            f"SELECT vmid FROM stand_vms WHERE vmid IN ({placeholders})",
+            tuple(vmids),
+        )
+        if tracked:
+            values = ", ".join(str(row["vmid"]) for row in tracked)
+            raise ConflictError(f"Некоторые VM уже закреплены за другим стендом: {values}")
+        name = str(payload.get("name", "")).strip() or pool_id
+        owner = str(payload.get("owner", "Администратор")).strip() or "Администратор"
+        try:
+            max_participants = max(1, min(100, int(payload.get("max_participants", 12))))
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("Вместимость должна быть числом") from exc
+        statuses = {str(member.get("status", "stopped")) for member in members}
+        status = "running" if "running" in statuses else "stopped"
+        nodes = sorted({str(member.get("node", "")) for member in members if member.get("node")})
+        node_label = ", ".join(nodes)
+        cpu = round(sum(float(member.get("cpu") or 0) for member in members), 1)
+        ram_values = [float(member.get("ram") or 0) for member in members]
+        ram = round(sum(ram_values) / max(len(ram_values), 1), 1)
+        now = utc_now()
+        with self.store.transaction() as connection:
+            cursor = connection.execute(
+                """INSERT INTO stands
+                (name, blueprint_id, status, progress, node, pool_id, owner, participants,
+                 max_participants, vm_count, cpu, ram, disk, ip_range, check_status, origin,
+                 created_at, updated_at)
+                VALUES (?, ?, ?, 100, ?, ?, ?, 0, ?, ?, ?, ?, 0, '', 'idle', 'imported', ?, ?)""",
+                (name, blueprint_id, status, node_label, pool_id, owner, max_participants,
+                 len(members), cpu, ram, now, now),
+            )
+            stand_id = int(cursor.lastrowid)
+            for member in members:
+                connection.execute(
+                    """INSERT INTO stand_vms (stand_id, vmid, name, node, ip, status, cpu, ram)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (stand_id, member["vmid"], member["name"], member.get("node", ""),
+                     member.get("ip", ""), member.get("status", "stopped"),
+                     member.get("cpu", 0), member.get("ram", 0)),
+                )
+        self.store.add_activity("import", "Существующий pool добавлен", f"{pool_id} · {len(members)} VM · {blueprint['name']}", "success")
+        return self.get_stand(stand_id)
 
     def create_stand(self, payload: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -361,9 +432,16 @@ class DashboardService:
         if stand["check_status"] == "running":
             raise ConflictError("Нельзя удалить стенд во время автопроверки")
         vmids = [int(vm["vmid"]) for vm in stand["vms"] if vm.get("vmid") is not None]
-        self.gateway.delete_stand(stand, vmids)
+        imported = str(stand.get("origin") or "deployed") == "imported"
+        if not imported:
+            self.gateway.delete_stand(stand, vmids)
         self.store.execute("DELETE FROM stands WHERE id = ?", (stand_id,))
-        self.store.add_activity("delete", "Стенд удалён", stand["name"], "warning")
+        self.store.add_activity(
+            "import" if imported else "delete",
+            "Pool отключён от дашборда" if imported else "Стенд удалён",
+            stand["name"],
+            "info" if imported else "warning",
+        )
 
     def list_sessions(self) -> list[dict[str, Any]]:
         self._refresh_session_states()
@@ -555,7 +633,7 @@ class DashboardService:
     def bootstrap(self) -> dict[str, Any]:
         return {
             "integration": self.integration(), "overview": self.overview(), "stands": self.list_stands(),
-            "blueprints": self.list_blueprints(), "templates": self.list_templates(),
+            "blueprints": self.list_blueprints(), "templates": self.list_templates(), "pools": self.list_pools(),
             "sessions": self.list_sessions(), "checks": self.list_checks(),
             "metrics": self.metrics(), "activity": self.activity(), "server_time": utc_now(),
         }

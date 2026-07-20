@@ -124,6 +124,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self._json(self.service.list_stands())
             elif parts == ["api", "stands"] and method == "POST":
                 self._json(self.service.create_stand(self._body()), HTTPStatus.ACCEPTED)
+            elif parts == ["api", "pools"] and method == "GET":
+                self._json(self.service.list_pools())
+            elif parts == ["api", "pools", "import"] and method == "POST":
+                self._json(self.service.import_pool(self._body()), HTTPStatus.CREATED)
             elif len(parts) == 3 and parts[:2] == ["api", "stands"] and method == "GET":
                 self._json(self.service.get_stand(int(parts[2])))
             elif len(parts) == 3 and parts[:2] == ["api", "stands"] and method == "PATCH":

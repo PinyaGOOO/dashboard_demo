@@ -95,6 +95,7 @@ class DashboardStore:
             last_check TEXT,
             expires_at TEXT,
             password_updated_at TEXT,
+            origin TEXT NOT NULL DEFAULT 'deployed',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY (blueprint_id) REFERENCES blueprints(id) ON DELETE SET NULL
@@ -156,6 +157,9 @@ class DashboardStore:
         """
         with self.connect() as connection:
             connection.executescript(schema)
+            stand_columns = {row[1] for row in connection.execute("PRAGMA table_info(stands)")}
+            if "origin" not in stand_columns:
+                connection.execute("ALTER TABLE stands ADD COLUMN origin TEXT NOT NULL DEFAULT 'deployed'")
 
     def _seed_if_empty(self) -> None:
         with self.connect() as connection:
