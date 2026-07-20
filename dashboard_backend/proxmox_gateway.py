@@ -232,6 +232,10 @@ class LiveProxmoxGateway:
         self._metrics_cache_key: frozenset[int] | None = None
         self._metrics_cache_at = 0.0
         self._metrics_cache_value: dict[str, Any] | None = None
+        # PVE's nextid endpoint only reports a free ID; it does not reserve it.
+        # Keep allocation and clone submission indivisible between concurrent
+        # dashboard deployment threads.
+        self._clone_submit_lock = threading.Lock()
 
     def integration_info(self) -> IntegrationInfo:
         endpoint = self.host if self.port == 443 else f"{self.host}:{self.port}"
@@ -369,6 +373,192 @@ class LiveProxmoxGateway:
         return [node["node"] for node in online]
 
     @staticmethod
+    def _enabled_flag(value: Any, default: bool = True) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value.strip().lower() not in {"", "0", "false", "no", "off"}
+        return bool(value)
+
+    @staticmethod
+    def _template_volume_refs(config: dict[str, Any]) -> dict[str, set[str]]:
+        """Return storage IDs and attached volume IDs required by a template.
+
+        A linked-clone volume such as
+        ``NAS1:283/base-283-disk-0.qcow2/300/vm-300-disk-0.qcow2`` is a valid
+        compound PVE volume ID.  It can only be used on another node when the
+        template's base volume is genuinely visible there.
+        """
+        refs: dict[str, set[str]] = {}
+        disk_key = re.compile(r"^(?:ide|sata|scsi|virtio)\d+$|^(?:efidisk|tpmstate)\d+$")
+        for key, raw_value in config.items():
+            if not disk_key.fullmatch(str(key)):
+                continue
+            value = str(raw_value or "").strip()
+            volume_id = value.split(",", 1)[0].strip()
+            if not volume_id or volume_id in {"none", "cdrom"} or ":" not in volume_id:
+                continue
+            storage_id = volume_id.split(":", 1)[0].strip()
+            if storage_id:
+                refs.setdefault(storage_id, set()).add(volume_id)
+        return refs
+
+    def _node_has_template_volumes(
+        self,
+        node: str,
+        template_vmid: int,
+        required: dict[str, set[str]],
+    ) -> bool:
+        """Conservatively prove that every template storage is usable on node."""
+        try:
+            node_storages = {
+                str(item.get("storage") or ""): item
+                for item in self.client.nodes(node).storage.get()
+                if item.get("storage")
+            }
+            for storage_id, volume_ids in required.items():
+                state = node_storages.get(storage_id)
+                if not state:
+                    return False
+                if not self._enabled_flag(state.get("enabled"), True):
+                    return False
+                if not self._enabled_flag(state.get("active"), True):
+                    return False
+
+                # A shared flag alone does not mount or synchronise a storage.
+                # Verify that the target node can enumerate the actual backing
+                # volumes of the template before putting a linked clone there.
+                expected_iso_ids = {
+                    volume_id
+                    for volume_id in volume_ids
+                    if (
+                        volume_id.split(":", 1)[-1].lower().startswith("iso/")
+                        or volume_id.split(":", 1)[-1].lower().endswith(".iso")
+                    )
+                }
+                expected_vm_ids = set(volume_ids) - expected_iso_ids
+                if expected_vm_ids:
+                    visible = self.client.nodes(node).storage(storage_id).content.get(
+                        vmid=template_vmid,
+                    )
+                    visible_ids = {
+                        str(item.get("volid") or "")
+                        for item in visible
+                        if item.get("volid")
+                    }
+                    if not expected_vm_ids.issubset(visible_ids):
+                        return False
+                if expected_iso_ids:
+                    visible_iso = self.client.nodes(node).storage(storage_id).content.get(
+                        content="iso",
+                    )
+                    visible_iso_ids = {
+                        str(item.get("volid") or "")
+                        for item in visible_iso
+                        if item.get("volid")
+                    }
+                    if not expected_iso_ids.issubset(visible_iso_ids):
+                        return False
+            return True
+        except Exception:
+            # Missing audit permission, an old endpoint or a transient storage
+            # error must never make cross-node linked clones look safe.
+            return False
+
+    def _linked_clone_nodes(
+        self,
+        template_node: str,
+        template_vmid: int,
+        ranked_nodes: list[str],
+    ) -> tuple[list[str], list[str], list[str]]:
+        """Return verified target nodes and storage IDs for a linked clone.
+
+        Local storage, missing storage metadata, or an inconclusive content
+        check intentionally falls back to the template node.  True shared
+        storage still permits load-aware distribution across the cluster.
+        """
+        config = self.client.nodes(template_node).qemu(template_vmid).config.get()
+        required = self._template_volume_refs(config)
+        storage_ids = sorted(required)
+        linked_disk_storages = sorted(
+            storage_id
+            for storage_id, volume_ids in required.items()
+            if any("base-" in volume_id for volume_id in volume_ids)
+        )
+        if not required:
+            return [template_node], storage_ids, linked_disk_storages
+
+        try:
+            definitions = {
+                str(item.get("storage") or ""): item
+                for item in self.client.storage.get()
+                if item.get("storage")
+            }
+        except Exception:
+            return [template_node], storage_ids, linked_disk_storages
+
+        for storage_id in storage_ids:
+            definition = definitions.get(storage_id)
+            if not definition or not self._enabled_flag(definition.get("shared"), False):
+                return [template_node], storage_ids, linked_disk_storages
+
+        candidates: list[str] = []
+        for node in ranked_nodes:
+            if node == template_node:
+                candidates.append(node)
+                continue
+            if self._node_has_template_volumes(node, template_vmid, required):
+                candidates.append(node)
+        if template_node not in candidates:
+            candidates.append(template_node)
+        return candidates, storage_ids, linked_disk_storages
+
+    def _wait_linked_clone_visible(
+        self,
+        node: str,
+        template_node: str,
+        vmid: int,
+        storage_ids: list[str],
+        timeout: int = 15,
+    ) -> None:
+        """Wait until a cross-node target can see every new qcow2 overlay."""
+        if node == template_node or not storage_ids:
+            return
+        clone_config = self.client.nodes(node).qemu(vmid).config.get()
+        clone_refs = self._template_volume_refs(clone_config)
+        expected_counts: dict[str, int] = {}
+        for storage_id in storage_ids:
+            owned_refs = [
+                volume_id
+                for volume_id in clone_refs.get(storage_id, set())
+                if (
+                    f"/{vmid}/" in f"/{volume_id.split(':', 1)[-1]}"
+                    or re.search(rf"(?:^|[/_-])vm-{vmid}-", volume_id.split(":", 1)[-1])
+                )
+            ]
+            # A linked template storage always creates at least one overlay;
+            # for multi-disk templates wait for every VM-owned volume.
+            expected_counts[storage_id] = max(1, len(owned_refs))
+        deadline = time.monotonic() + max(1, timeout)
+        pending = set(storage_ids)
+        while pending and time.monotonic() < deadline:
+            for storage_id in tuple(pending):
+                try:
+                    visible = self.client.nodes(node).storage(storage_id).content.get(vmid=vmid)
+                    visible_count = sum(1 for item in visible if item.get("volid"))
+                    if visible_count >= expected_counts[storage_id]:
+                        pending.remove(storage_id)
+                except Exception:
+                    pass
+            if pending:
+                time.sleep(0.5)
+        if pending:
+            raise RuntimeError(
+                f"После linked clone нода {node} не видит overlay VMID {vmid} "
+                f"на storage: {', '.join(sorted(pending))}"
+            )
+
+    @staticmethod
     def _is_powershell(script: str) -> bool:
         meaningful = [line.strip() for line in script.splitlines() if line.strip()]
         first = meaningful[0].lower() if meaningful else ""
@@ -460,9 +650,58 @@ class LiveProxmoxGateway:
             "duration": round((time.monotonic() - started) * 1000),
         }
 
-    def _cleanup_failed_deploy(self, created: list[tuple[str, int]], pool_id: str) -> None:
+    def _cleanup_failed_deploy(
+        self,
+        created: list[tuple[str, int]],
+        pool_id: str,
+        expected_marker: str,
+    ) -> tuple[list[tuple[str, int]], list[str]]:
+        attempt_errors: list[str] = []
+        candidate_ids = {int(vmid) for _, vmid in created}
+
+        # Never stop or delete a VM merely because its numeric ID was returned
+        # by nextid.  An external creator can win the same ID.  Only resources
+        # that PVE confirms as members of this exact dashboard-owned pool are
+        # eligible for rollback.
+        pool: dict[str, Any] | None = None
+        for attempt in range(11 if candidate_ids else 1):
+            try:
+                pool = self.client.pools(pool_id).get()
+            except Exception as exc:
+                return [], [f"не удалось проверить пул {pool_id}; он сохранён: {exc}"]
+            if str(pool.get("comment") or "").strip() != expected_marker:
+                return [], [f"метка владельца пула {pool_id} изменилась; автоочистка отменена"]
+            member_ids = {
+                int(member["vmid"])
+                for member in pool.get("members", [])
+                if member.get("type") == "qemu" and member.get("vmid") is not None
+            }
+            if candidate_ids.issubset(member_ids) or attempt == 10:
+                break
+            # Covers an accepted clone whose HTTP response was lost before the
+            # new config became visible in the cluster pool.
+            time.sleep(0.5)
+
+        assert pool is not None
+        pool_members = {
+            int(member["vmid"]): str(member.get("node") or "")
+            for member in pool.get("members", [])
+            if member.get("type") == "qemu" and member.get("vmid") is not None
+        }
+        unknown_pool_ids = sorted(set(pool_members) - candidate_ids)
+        if unknown_pool_ids:
+            ids = ", ".join(str(vmid) for vmid in unknown_pool_ids)
+            return [
+                (pool_members[vmid], vmid) for vmid in unknown_pool_ids
+            ], [f"в пуле {pool_id} есть VMID {ids}, не создававшиеся этим запуском; автоочистка отменена"]
+
+        owned = [
+            (pool_members[vmid], vmid)
+            for vmid in sorted(candidate_ids & set(pool_members))
+        ]
+        unconfirmed_ids = sorted(candidate_ids - set(pool_members))
         stop_tasks: list[tuple[str, str]] = []
-        for node, vmid in reversed(created):
+        for node, vmid in reversed(owned):
             api = self.client.nodes(node).qemu(vmid)
             try:
                 current = api.status.current.get()
@@ -474,10 +713,10 @@ class LiveProxmoxGateway:
                 pass
         try:
             self._wait_tasks(stop_tasks, timeout=180)
-        except Exception:
-            pass
+        except Exception as exc:
+            attempt_errors.append(f"остановка VM: {exc}")
         delete_tasks: list[tuple[str, str]] = []
-        for node, vmid in reversed(created):
+        for node, vmid in reversed(owned):
             api = self.client.nodes(node).qemu(vmid)
             try:
                 api.config.put(**{"delete": "lock"})
@@ -489,16 +728,61 @@ class LiveProxmoxGateway:
                 upid = api.delete(purge=1)
                 if upid:
                     delete_tasks.append((node, str(upid)))
-            except Exception:
-                pass
+            except Exception as exc:
+                attempt_errors.append(f"удаление VM {vmid}: {exc}")
         try:
             self._wait_tasks(delete_tasks, timeout=600)
-        except Exception:
-            pass
+        except Exception as exc:
+            attempt_errors.append(f"ожидание удаления VM: {exc}")
+
+        owned_ids = {int(vmid) for _, vmid in owned}
         try:
+            remaining = [
+                (str(item.get("node") or ""), int(item["vmid"]))
+                for item in self.client.cluster.resources.get(type="vm")
+                if item.get("vmid") is not None and int(item["vmid"]) in owned_ids
+            ]
+        except Exception as exc:
+            # Without a successful inventory refresh, deleting the ownership
+            # pool could turn surviving VMs into untracked orphans.
+            remaining = list(dict.fromkeys((str(node), int(vmid)) for node, vmid in owned))
+            attempt_errors.append(f"проверка отката: {exc}")
+
+        if remaining:
+            ids = ", ".join(str(vmid) for _, vmid in remaining)
+            errors = [f"не удалены VMID {ids}; пул {pool_id} сохранён для повторной очистки"]
+            errors.extend(attempt_errors[-3:])
+            return remaining, errors
+
+        if unconfirmed_ids:
+            ids = ", ".join(str(vmid) for vmid in unconfirmed_ids)
+            return [], [
+                f"VMID {ids} не подтверждены как члены пула {pool_id}; "
+                "пул сохранён для безопасной повторной проверки"
+            ]
+
+        try:
+            latest_pool = self.client.pools(pool_id).get()
+            if str(latest_pool.get("comment") or "").strip() != expected_marker:
+                return [], [f"метка владельца пула {pool_id} изменилась перед удалением"]
+            late_members = [
+                member
+                for member in latest_pool.get("members", [])
+                if member.get("type") in {"qemu", "lxc"} and member.get("vmid") is not None
+            ]
+            if late_members:
+                late_resources = [
+                    (str(member.get("node") or ""), int(member["vmid"]))
+                    for member in late_members
+                ]
+                ids = ", ".join(str(vmid) for _, vmid in late_resources)
+                return late_resources, [
+                    f"перед удалением в пуле {pool_id} появились VMID {ids}; пул сохранён"
+                ]
             self.client.pools(pool_id).delete()
-        except Exception:
-            pass
+        except Exception as exc:
+            return [], [f"не удалён пул {pool_id}: {exc}"]
+        return [], []
 
     @staticmethod
     def _network_with_bridge(network: str, bridge: str) -> str:
@@ -514,7 +798,8 @@ class LiveProxmoxGateway:
         pools = {pool["poolid"] for pool in self.client.pools.get()}
         if pool_id in pools:
             raise RuntimeError(f"Пул Proxmox {pool_id} уже существует")
-        self.client.pools.post(poolid=pool_id, comment=f"DEMOEXAM dashboard stand_id={stand['id']}")
+        expected_marker = f"DEMOEXAM dashboard stand_id={stand['id']}"
+        self.client.pools.post(poolid=pool_id, comment=expected_marker)
         created: list[tuple[str, int]] = []
         try:
             progress(12, "Пул создан")
@@ -522,12 +807,30 @@ class LiveProxmoxGateway:
             if template_vmid <= 0:
                 raise RuntimeError("Не указан VMID шаблона")
             template_node = self._find_template_node(template_vmid)
-            target_nodes = self._rank_nodes()
+            ranked_nodes = self._rank_nodes()
+            target_nodes, template_storages, linked_disk_storages = self._linked_clone_nodes(
+                template_node, template_vmid, ranked_nodes,
+            )
             requested_node = str(stand.get("node", "")).strip()
             if requested_node and requested_node != "auto":
-                if requested_node not in target_nodes:
+                if requested_node not in ranked_nodes:
                     raise RuntimeError(f"Нода {requested_node} недоступна")
+                if requested_node not in target_nodes:
+                    storage_label = ", ".join(template_storages) or "хранилище шаблона"
+                    raise RuntimeError(
+                        f"Linked clone шаблона VMID {template_vmid} нельзя разместить "
+                        f"на ноде {requested_node}: {storage_label} не подтверждено "
+                        f"как общее и доступное. Выберите «Автоматически» "
+                        f"или ноду шаблона {template_node}."
+                    )
                 target_nodes = [requested_node]
+            elif target_nodes == [template_node] and len(ranked_nodes) > 1:
+                storage_label = ", ".join(template_storages) or "хранилище шаблона"
+                progress(
+                    12,
+                    f"Linked clone: {storage_label} не подтверждено на всех нодах; "
+                    f"размещение на {template_node}",
+                )
             vm_count = int(blueprint.get("vm_count") or 1)
             credentials = blueprint.get("credentials") if isinstance(blueprint.get("credentials"), list) else []
             allocated_ips = blueprint.get("allocated_ips") if isinstance(blueprint.get("allocated_ips"), list) else []
@@ -535,13 +838,11 @@ class LiveProxmoxGateway:
             clone_tasks: list[tuple[str, str]] = []
             clone_batch = self._batch_limit("PROXMOX_CLONE_BATCH")
 
-            # Submit linked clones in bounded parallel batches. nextid is
-            # requested immediately before each submit so the accepted clone
-            # reserves the ID before the following request.
+            # Submit linked clones in bounded parallel batches.  Allocation and
+            # submission are locked together across deployment threads because
+            # nextid reports availability but does not reserve the number.
             for index in range(1, vm_count + 1):
                 target_node = target_nodes[(index - 1) % len(target_nodes)]
-                new_vmid = int(self.client.cluster.nextid.get())
-                created.append((target_node, new_vmid))
                 name = f"{pool_id}-{index}"
                 vm_ip = (
                     str(allocated_ips[index - 1])
@@ -553,18 +854,24 @@ class LiveProxmoxGateway:
                     credential["password"] = base64.urlsafe_b64encode(os.urandom(15)).decode("ascii").rstrip("=")[:18]
                 credential.setdefault("guest_username", "root")
                 credential.setdefault("web_username", "root@pam")
+                with self._clone_submit_lock:
+                    new_vmid = int(self.client.cluster.nextid.get())
+                    # Kept as a candidate before POST so an accepted request
+                    # with a lost HTTP response can be recovered from the pool.
+                    # Rollback still verifies pool ownership before deletion.
+                    created.append((target_node, new_vmid))
+                    params: dict[str, Any] = {
+                        "newid": new_vmid, "name": name, "full": 0,
+                        "target": target_node, "pool": pool_id,
+                    }
+                    upid = self.client.nodes(template_node).qemu(template_vmid).clone.post(**params)
                 plans.append({
                     "index": index, "node": target_node, "vmid": new_vmid,
                     "name": name, "ip": vm_ip, "credential": credential,
                 })
-                params: dict[str, Any] = {
-                    "newid": new_vmid, "name": name, "full": 0,
-                    "target": target_node, "pool": pool_id,
-                }
-                upid = self.client.nodes(template_node).qemu(template_vmid).clone.post(**params)
                 if upid:
                     clone_tasks.append((template_node, str(upid)))
-                progress(12 + round(index / vm_count * 12), f"Клонирование VM {index} из {vm_count} запущено")
+                progress(14 + round(index / vm_count * 10), f"Клонирование VM {index} из {vm_count} запущено")
                 if len(clone_tasks) >= clone_batch:
                     self._wait_tasks(clone_tasks)
                     clone_tasks.clear()
@@ -573,22 +880,43 @@ class LiveProxmoxGateway:
             progress(38, f"Клонировано VM: {vm_count}")
 
             start_tasks: list[tuple[str, str]] = []
-            for plan in plans:
-                target_node = str(plan["node"])
-                new_vmid = int(plan["vmid"])
-                config: dict[str, Any] = {"agent": "1"}
-                if blueprint.get("bridge"):
-                    vm_api = self.client.nodes(target_node).qemu(new_vmid)
-                    current_config = vm_api.config.get()
-                    config["net0"] = self._network_with_bridge(
-                        str(current_config.get("net0", "")), str(blueprint["bridge"]),
+            try:
+                for plan in plans:
+                    target_node = str(plan["node"])
+                    new_vmid = int(plan["vmid"])
+                    self._wait_linked_clone_visible(
+                        target_node,
+                        template_node,
+                        new_vmid,
+                        linked_disk_storages,
                     )
-                self.client.nodes(target_node).qemu(new_vmid).config.put(**config)
-                upid = self.client.nodes(target_node).qemu(new_vmid).status.start.post()
-                if upid:
-                    start_tasks.append((target_node, str(upid)))
-
-            self._wait_tasks(start_tasks, timeout=600)
+                    config: dict[str, Any] = {"agent": "1"}
+                    if blueprint.get("bridge"):
+                        vm_api = self.client.nodes(target_node).qemu(new_vmid)
+                        current_config = vm_api.config.get()
+                        config["net0"] = self._network_with_bridge(
+                            str(current_config.get("net0", "")), str(blueprint["bridge"]),
+                        )
+                    self.client.nodes(target_node).qemu(new_vmid).config.put(**config)
+                    upid = self.client.nodes(target_node).qemu(new_vmid).status.start.post()
+                    if upid:
+                        start_tasks.append((target_node, str(upid)))
+                self._wait_tasks(start_tasks, timeout=600)
+            except Exception as exc:
+                detail = str(exc)
+                storage_problem = (
+                    ("volume '" in detail and "does not exist" in detail)
+                    or "не видит overlay" in detail
+                )
+                if storage_problem:
+                    nodes_label = ", ".join(dict.fromkeys(str(plan["node"]) for plan in plans))
+                    storage_label = ", ".join(template_storages) or "хранилище шаблона"
+                    raise RuntimeError(
+                        f"Linked clone не запустился: одна из нод ({nodes_label}) не видит "
+                        f"базовый или overlay-диск VMID {template_vmid} на {storage_label}. "
+                        f"Проверьте mount/storage на целевой ноде. Proxmox: {detail}"
+                    ) from exc
+                raise
             progress(55, f"Запущено VM: {vm_count}")
 
             completed = 0
@@ -676,8 +1004,15 @@ class LiveProxmoxGateway:
             progress(97, "Начальные снимки start созданы")
             progress(100, "Стенд готов")
             return deployed
-        except Exception:
-            self._cleanup_failed_deploy(created, pool_id)
+        except Exception as exc:
+            remaining, cleanup_errors = self._cleanup_failed_deploy(
+                created, pool_id, expected_marker,
+            )
+            if remaining or cleanup_errors:
+                raise RuntimeError(
+                    f"{exc}; автоматический откат не завершён: "
+                    + "; ".join(cleanup_errors)
+                ) from exc
             raise
 
     def _locate_vm(self, vmid: int) -> str:
@@ -816,24 +1151,69 @@ class LiveProxmoxGateway:
         try:
             pool = self.client.pools(pool_id).get()
         except Exception as exc:
+            status_code = getattr(exc, "status_code", None)
+            response = getattr(exc, "response", None)
+            if status_code is None and response is not None:
+                status_code = getattr(response, "status_code", None)
+            try:
+                missing_pool = int(status_code) == 404
+            except (TypeError, ValueError):
+                missing_pool = False
+            if not missing_pool:
+                # PVE's pool API historically reports this specific not-found
+                # condition as HTTP 500 instead of 404.
+                missing_pool = bool(
+                    re.search(r"\bpool\s+['\"][^'\"]+['\"]\s+does not exist\b", str(exc), re.IGNORECASE)
+                )
+            if (
+                str(stand.get("status") or "") == "error"
+                and not vmids
+                and missing_pool
+            ):
+                # The automatic deployment rollback already removed the pool.
+                return
             raise RuntimeError(f"Управляемый пул {pool_id} не найден; удаление отменено") from exc
         expected_marker = f"DEMOEXAM dashboard stand_id={stand['id']}"
         if str(pool.get("comment", "")).strip() != expected_marker:
             raise RuntimeError("Пул не имеет метки владельца DemoOps; удаление отменено")
-        pool_vmids = {
-            int(member["vmid"])
+        pool_members = [
+            member
             for member in pool.get("members", [])
             if member.get("type") in {"qemu", "lxc"} and member.get("vmid") is not None
+        ]
+        pool_vmids = {
+            int(member["vmid"])
+            for member in pool_members
         }
-        # A tracked VM may already have been deleted manually.  That is safe to
-        # ignore; the inverse (an untracked VM in our pool) must still abort.
-        untracked_vmids = sorted(pool_vmids - set(vmids))
-        if untracked_vmids:
-            raise RuntimeError(
-                "В пуле обнаружены VM, отсутствующие в учёте DemoOps; удаление отменено: "
-                + ", ".join(str(vmid) for vmid in untracked_vmids)
-            )
-        existing_vmids = sorted(pool_vmids & set(vmids))
+        if str(stand.get("status") or "") == "error":
+            # A failed deploy can leave clones in the pool before their VMIDs
+            # are committed to SQLite.  Recover only the names generated by
+            # this deploy; an unrelated/manual member still blocks deletion.
+            generated_name = re.compile(rf"^{re.escape(pool_id)}-\d+$")
+            recoverable_vmids = {
+                int(member["vmid"])
+                for member in pool_members
+                if member.get("type") == "qemu"
+                and generated_name.fullmatch(str(member.get("name") or ""))
+            }
+            unexpected_vmids = sorted(pool_vmids - recoverable_vmids - set(vmids))
+            if unexpected_vmids:
+                raise RuntimeError(
+                    "В ошибочном пуле есть ресурсы, не созданные этим стендом; "
+                    "автоудаление отменено: "
+                    + ", ".join(str(vmid) for vmid in unexpected_vmids)
+                )
+            existing_vmids = sorted((recoverable_vmids | set(vmids)) & pool_vmids)
+        else:
+            # A tracked VM may already have been deleted manually.  That is
+            # safe to ignore; an unknown VM in a healthy pool must still abort.
+            untracked_vmids = sorted(pool_vmids - set(vmids))
+            if untracked_vmids:
+                raise RuntimeError(
+                    "В пуле обнаружены VM, отсутствующие в учёте DemoOps; удаление отменено: "
+                    + ", ".join(str(vmid) for vmid in untracked_vmids)
+                )
+            existing_vmids = sorted(pool_vmids & set(vmids))
         inventory = self._vm_inventory(existing_vmids) if existing_vmids else {}
         stop_tasks: list[tuple[str, str]] = []
         for vmid in existing_vmids:
@@ -866,7 +1246,22 @@ class LiveProxmoxGateway:
                 self._wait_tasks(delete_tasks, timeout=1800)
                 delete_tasks.clear()
         self._wait_tasks(delete_tasks, timeout=1800)
-        self.client.pools(stand["pool_id"]).delete()
+        # Close the window where an ambiguous clone request could attach a VM
+        # after the first pool read but before pool deletion.
+        latest_pool = self.client.pools(pool_id).get()
+        if str(latest_pool.get("comment", "")).strip() != expected_marker:
+            raise RuntimeError("Метка владельца пула изменилась; удаление отменено")
+        late_vmids = sorted(
+            int(member["vmid"])
+            for member in latest_pool.get("members", [])
+            if member.get("type") in {"qemu", "lxc"} and member.get("vmid") is not None
+        )
+        if late_vmids:
+            raise RuntimeError(
+                "В пуле появились новые VM во время удаления; пул сохранён: "
+                + ", ".join(str(vmid) for vmid in late_vmids)
+            )
+        self.client.pools(pool_id).delete()
 
     def cluster_metrics(self, tracked_vmids: list[int] | None = None) -> dict[str, Any]:
         tracked_key = frozenset(int(vmid) for vmid in (tracked_vmids or []))

@@ -951,8 +951,10 @@ class DashboardService:
             raise ConflictError("Нельзя удалить стенд во время автопроверки VM")
         vmids = [int(vm["vmid"]) for vm in stand["vms"] if vm.get("vmid") is not None]
         imported = str(stand.get("origin") or "deployed") == "imported"
-        resources_already_rolled_back = stand["status"] == "error" and not vmids
-        if not imported and not resources_already_rolled_back:
+        # Even when a failed background deploy did not persist VMIDs, ask the
+        # live gateway to inspect the owned pool.  This makes a second cleanup
+        # attempt possible if the automatic rollback only partially succeeded.
+        if not imported:
             self.gateway.delete_stand(stand, vmids)
         self.store.execute("DELETE FROM stands WHERE id = ?", (stand_id,))
         self.store.add_activity(
