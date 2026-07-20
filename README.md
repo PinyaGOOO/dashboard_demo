@@ -62,6 +62,7 @@ python -m pip install proxmoxer
 ```powershell
 $env:PROXMOX_MODE = "live"
 $env:PROXMOX_HOST = "pve.example.com"
+$env:PROXMOX_PORT = "8006"
 $env:PROXMOX_USER = "dashboard-api@pve"
 $env:PROXMOX_TOKEN_NAME = "dashboard"
 $env:PROXMOX_TOKEN_VALUE = "новый-секрет-токена"
@@ -92,6 +93,7 @@ Live-развёртывание:
 | Переменная | Назначение | Значение по умолчанию |
 | --- | --- | --- |
 | `PROXMOX_HOST` | DNS-имя или IP Proxmox API без схемы и пути | нет; обязательна в live |
+| `PROXMOX_PORT` | порт Proxmox API; для reverse proxy без порта в URL обычно используется `443` | `8006` |
 | `PROXMOX_USER` | служебный пользователь, например `dashboard-api@pve` | нет; обязательна в live |
 | `PROXMOX_TOKEN_NAME` | имя API-токена | нет; обязательна в live |
 | `PROXMOX_TOKEN_VALUE` | секрет API-токена | нет; обязательна в live |

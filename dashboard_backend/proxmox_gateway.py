@@ -143,6 +143,13 @@ class LiveProxmoxGateway:
 
     def __init__(self) -> None:
         self.host = os.environ.get("PROXMOX_HOST", "").strip()
+        port_value = os.environ.get("PROXMOX_PORT", "8006").strip()
+        try:
+            self.port = int(port_value)
+        except ValueError as exc:
+            raise RuntimeError("PROXMOX_PORT должен быть целым числом") from exc
+        if not 1 <= self.port <= 65535:
+            raise RuntimeError("PROXMOX_PORT должен быть в диапазоне 1..65535")
         self.user = os.environ.get("PROXMOX_USER", "").strip()
         self.token_name = os.environ.get("PROXMOX_TOKEN_NAME", "").strip()
         self.token_value = os.environ.get("PROXMOX_TOKEN_VALUE", "").strip()
@@ -160,6 +167,7 @@ class LiveProxmoxGateway:
         self.client = ProxmoxAPI(
             self.host, user=self.user, token_name=self.token_name,
             token_value=self.token_value, verify_ssl=self.verify_ssl,
+            port=self.port,
         )
         self._metrics_history: deque[dict[str, Any]] = deque(maxlen=120)
         self._metrics_lock = threading.RLock()
@@ -168,11 +176,12 @@ class LiveProxmoxGateway:
         self._metrics_cache_value: dict[str, Any] | None = None
 
     def integration_info(self) -> IntegrationInfo:
+        endpoint = self.host if self.port == 443 else f"{self.host}:{self.port}"
         try:
             nodes = self.client.nodes.get()
-            return IntegrationInfo("live", True, self.host, os.environ.get("PROXMOX_CLUSTER_NAME", "Proxmox VE"), f"{len(nodes)} нод")
+            return IntegrationInfo("live", True, endpoint, os.environ.get("PROXMOX_CLUSTER_NAME", "Proxmox VE"), f"{len(nodes)} нод")
         except Exception as exc:
-            return IntegrationInfo("live", False, self.host, "Proxmox VE", str(exc))
+            return IntegrationInfo("live", False, endpoint, "Proxmox VE", str(exc))
 
     def _wait_task(self, node: str, upid: str, timeout: int = 1800) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
