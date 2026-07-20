@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import ipaddress
 import json
 import math
@@ -333,17 +334,36 @@ class LiveProxmoxGateway:
             )
             content = f"{prefix}\n{script}" if prefix else script
             remote_path = rf"C:\Windows\Temp\demoexam-{purpose}.ps1"
+            encoded_path = f"{remote_path}.b64"
+            wrapper = (
+                "$ErrorActionPreference='Stop';"
+                f"$encodedPath='{encoded_path}';"
+                f"$scriptPath='{remote_path}';"
+                "$bytes=[Convert]::FromBase64String([IO.File]::ReadAllText($encodedPath));"
+                "[IO.File]::WriteAllBytes($scriptPath,$bytes);"
+                "& $scriptPath"
+            )
             command = [
                 "powershell.exe", "-NoProfile", "-NonInteractive",
-                "-ExecutionPolicy", "Bypass", "-File", remote_path,
+                "-ExecutionPolicy", "Bypass", "-Command", wrapper,
             ]
         else:
             prefix = "\n".join(f"export {key}={shlex.quote(str(value))}" for key, value in environment.items())
             content = f"{prefix}\n{script}" if prefix else script
             remote_path = f"/tmp/demoexam-{purpose}.sh"
-            command = ["bash", remote_path]
+            encoded_path = f"{remote_path}.b64"
+            command = [
+                "bash", "-c",
+                f"base64 -d {shlex.quote(encoded_path)} > {shlex.quote(remote_path)} "
+                f"&& chmod 700 {shlex.quote(remote_path)} && bash {shlex.quote(remote_path)}",
+            ]
+        # PVE's agent/file-write endpoint passes the value through Perl's
+        # byte-oriented Base64 encoder. Sending Python Unicode directly makes
+        # Perl fail with "Wide character in subroutine entry". Upload an ASCII
+        # Base64 envelope and decode it inside the guest before execution.
+        encoded_content = base64.b64encode(content.encode("utf-8")).decode("ascii")
         api = self.client.nodes(node).qemu(vmid).agent
-        api("file-write").post(file=remote_path, content=content)
+        api("file-write").post(file=encoded_path, content=encoded_content)
         task = api("exec").post(command=command)
         try:
             pid = int(task["pid"])
