@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+
+# Runtime state and local secrets
+data/
+*.db
+*.db-shm
+*.db-wal
+.env
+
+# Visual-test artifacts
+dashboard-*.png
