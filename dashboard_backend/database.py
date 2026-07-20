@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import sqlite3
 import threading
@@ -28,6 +29,7 @@ class DashboardStore:
         self._secure_db_files()
         if seed_demo:
             self._seed_if_empty()
+        self._backfill_ipam()
 
     def _secure_db_files(self) -> None:
         """Best-effort protection for the SQLite database and WAL sidecars."""
@@ -105,6 +107,7 @@ class DashboardStore:
             ram REAL NOT NULL DEFAULT 0,
             disk REAL NOT NULL DEFAULT 0,
             ip_range TEXT NOT NULL DEFAULT '',
+            ip_start TEXT NOT NULL DEFAULT '',
             check_score INTEGER,
             check_status TEXT NOT NULL DEFAULT 'idle',
             last_check TEXT,
@@ -132,7 +135,25 @@ class DashboardStore:
             password_updated_at TEXT,
             last_snapshot TEXT NOT NULL DEFAULT '',
             has_start_snapshot INTEGER NOT NULL DEFAULT 0,
+            check_score INTEGER,
+            check_status TEXT NOT NULL DEFAULT 'idle',
+            last_check TEXT,
             FOREIGN KEY (stand_id) REFERENCES stands(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS ipam_reservations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stand_id INTEGER NOT NULL,
+            stand_vm_id INTEGER,
+            address TEXT NOT NULL UNIQUE,
+            requested_cidr TEXT NOT NULL,
+            prefix_length INTEGER NOT NULL,
+            vm_index INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'reserved',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (stand_id, vm_index),
+            FOREIGN KEY (stand_id) REFERENCES stands(id) ON DELETE CASCADE,
+            FOREIGN KEY (stand_vm_id) REFERENCES stand_vms(id) ON DELETE SET NULL
         );
         CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -151,6 +172,7 @@ class DashboardStore:
         CREATE TABLE IF NOT EXISTS check_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             stand_id INTEGER NOT NULL,
+            vmid INTEGER,
             blueprint_id INTEGER,
             status TEXT NOT NULL,
             score INTEGER,
@@ -175,6 +197,8 @@ class DashboardStore:
         );
         CREATE INDEX IF NOT EXISTS idx_sessions_stand_status ON sessions(stand_id, status);
         CREATE INDEX IF NOT EXISTS idx_checks_stand_started ON check_runs(stand_id, started_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_ipam_stand ON ipam_reservations(stand_id, vm_index);
+        CREATE INDEX IF NOT EXISTS idx_ipam_status ON ipam_reservations(status);
         CREATE INDEX IF NOT EXISTS idx_activity_created ON activity(created_at DESC);
         """
         with self.connect() as connection:
@@ -184,6 +208,8 @@ class DashboardStore:
                 connection.execute("ALTER TABLE stands ADD COLUMN origin TEXT NOT NULL DEFAULT 'deployed'")
             if "last_error" not in stand_columns:
                 connection.execute("ALTER TABLE stands ADD COLUMN last_error TEXT NOT NULL DEFAULT ''")
+            if "ip_start" not in stand_columns:
+                connection.execute("ALTER TABLE stands ADD COLUMN ip_start TEXT NOT NULL DEFAULT ''")
             vm_columns = {row[1] for row in connection.execute("PRAGMA table_info(stand_vms)")}
             if "credential_username" not in vm_columns:
                 connection.execute("ALTER TABLE stand_vms ADD COLUMN credential_username TEXT NOT NULL DEFAULT 'root'")
@@ -197,12 +223,70 @@ class DashboardStore:
                 connection.execute("ALTER TABLE stand_vms ADD COLUMN last_snapshot TEXT NOT NULL DEFAULT ''")
             if "has_start_snapshot" not in vm_columns:
                 connection.execute("ALTER TABLE stand_vms ADD COLUMN has_start_snapshot INTEGER NOT NULL DEFAULT 0")
+            if "check_score" not in vm_columns:
+                connection.execute("ALTER TABLE stand_vms ADD COLUMN check_score INTEGER")
+            if "check_status" not in vm_columns:
+                connection.execute("ALTER TABLE stand_vms ADD COLUMN check_status TEXT NOT NULL DEFAULT 'idle'")
+            if "last_check" not in vm_columns:
+                connection.execute("ALTER TABLE stand_vms ADD COLUMN last_check TEXT")
+            check_columns = {row[1] for row in connection.execute("PRAGMA table_info(check_runs)")}
+            if "vmid" not in check_columns:
+                connection.execute("ALTER TABLE check_runs ADD COLUMN vmid INTEGER")
             connection.execute(
                 "UPDATE stand_vms SET has_start_snapshot = 1 WHERE last_snapshot = 'start'"
             )
             # Stands are intentionally persistent.  Clear legacy TTL values so
             # upgraded installations do not keep showing or enforcing expiry.
             connection.execute("UPDATE stands SET expires_at = NULL WHERE expires_at IS NOT NULL")
+
+    def _backfill_ipam(self) -> None:
+        """Adopt addresses from installations created before IPAM existed.
+
+        Invalid or duplicate legacy addresses are left untouched on the VM row,
+        but cannot break startup.  All new allocations go through the strict
+        unique reservation path in the service.
+        """
+        now = utc_now()
+        with self.transaction() as connection:
+            rows = connection.execute(
+                """SELECT v.id AS stand_vm_id, v.stand_id, v.ip, s.ip_range,
+                          b.subnet AS blueprint_subnet
+                FROM stand_vms v JOIN stands s ON s.id = v.stand_id
+                LEFT JOIN blueprints b ON b.id = s.blueprint_id
+                WHERE trim(v.ip) != '' ORDER BY v.stand_id, v.id"""
+            ).fetchall()
+            indexes: dict[int, int] = {}
+            for row in rows:
+                stand_id = int(row["stand_id"])
+                indexes[stand_id] = indexes.get(stand_id, 0) + 1
+                try:
+                    address = str(ipaddress.ip_interface(str(row["ip"]).strip()).ip)
+                except ValueError:
+                    continue
+                requested = str(row["ip_range"] or "").strip()
+                try:
+                    requested_interface = ipaddress.ip_interface(requested)
+                    if ipaddress.ip_address(address) not in requested_interface.network:
+                        raise ValueError
+                    prefix = requested_interface.network.prefixlen
+                except ValueError:
+                    requested = str(row["blueprint_subnet"] or "").strip()
+                    try:
+                        requested_interface = ipaddress.ip_interface(requested)
+                        if ipaddress.ip_address(address) not in requested_interface.network:
+                            raise ValueError
+                        prefix = requested_interface.network.prefixlen
+                    except ValueError:
+                        requested = f"{address}/32"
+                        prefix = 32
+                connection.execute(
+                    """INSERT OR IGNORE INTO ipam_reservations
+                    (stand_id, stand_vm_id, address, requested_cidr, prefix_length,
+                     vm_index, status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'assigned', ?, ?)""",
+                    (stand_id, row["stand_vm_id"], address, requested, prefix,
+                     indexes[stand_id], now, now),
+                )
 
     def _seed_if_empty(self) -> None:
         with self.connect() as connection:

@@ -127,6 +127,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self._json(self.service.create_stand(self._body()), HTTPStatus.ACCEPTED)
             elif parts == ["api", "pools"] and method == "GET":
                 self._json(self.service.list_pools())
+            elif parts == ["api", "ipam"] and method == "GET":
+                self._json(self.service.list_ipam())
             elif parts == ["api", "pools", "import"] and method == "POST":
                 self._json(self.service.import_pool(self._body()), HTTPStatus.CREATED)
             elif len(parts) == 3 and parts[:2] == ["api", "stands"] and method == "GET":
@@ -141,7 +143,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self._json(self.service.stand_credentials(int(parts[2])))
             elif len(parts) == 6 and parts[:2] == ["api", "stands"] and parts[3] == "vms" and parts[5] == "actions" and method == "POST":
                 body = self._body()
-                self._json(self.service.vm_action(int(parts[2]), int(parts[4]), str(body.get("action", "")), body))
+                action = str(body.get("action", ""))
+                status = HTTPStatus.ACCEPTED if action == "run_check" else HTTPStatus.OK
+                self._json(self.service.vm_action(int(parts[2]), int(parts[4]), action, body), status)
             elif len(parts) == 6 and parts[:2] == ["api", "stands"] and parts[3] == "vms" and parts[5] == "credentials" and method == "GET":
                 self._json(self.service.vm_credentials(int(parts[2]), int(parts[4])))
             elif parts == ["api", "checks"] and method == "GET":

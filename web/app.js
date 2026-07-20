@@ -4,7 +4,7 @@
   const app = document.querySelector("#app");
   const modalRoot = document.querySelector("#modal-root");
   const toastRoot = document.querySelector("#toast-root");
-  const routes = ["overview", "stands", "blueprints", "checks", "infrastructure"];
+  const routes = ["overview", "stands", "blueprints", "checks", "ipam", "infrastructure"];
   const VKLVIKL_BOOTSTRAP_SCRIPT = `#!/usr/bin/env bash
 set -euo pipefail
 
@@ -38,6 +38,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     stands: "Стенды",
     blueprints: "Сценарии",
     checks: "Автопроверки",
+    ipam: "IPAM",
     infrastructure: "Инфраструктура",
   };
   const statusLabels = {
@@ -53,12 +54,19 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     standSearch: "",
     selectedBlueprintId: null,
     editorDirty: false,
+    ipam: null,
+    ipamLoading: false,
     loading: false,
     lastUpdated: null,
   };
   let activeModalToken = 0;
   let modalReturnFocus = null;
   let pendingAdminTokenFinish = null;
+  let standDetailPollTimer = null;
+  let activeStandDetailId = null;
+  let operationPollTimer = null;
+  let operationPollBusy = false;
+  const standCredentialCache = new Map();
 
   function getRoute() {
     const value = window.location.hash.replace(/^#\/?/, "").split("?")[0];
@@ -82,6 +90,49 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     } catch {
       return "";
     }
+  }
+
+  function parseIpv4Cidr(value) {
+    const match = String(value || "").trim().match(/^((?:\d{1,3}\.){3}\d{1,3})\/(\d|[12]\d|3[0-2])$/);
+    if (!match) return null;
+    const octets = match[1].split(".").map(Number);
+    if (octets.some(part => part < 0 || part > 255)) return null;
+    const addressNumber = octets.reduce((total, part) => total * 256 + part, 0);
+    const prefixLength = Number(match[2]);
+    const blockSize = 2 ** (32 - prefixLength);
+    const networkNumber = Math.floor(addressNumber / blockSize) * blockSize;
+    return {
+      address: match[1], addressNumber, prefixLength, blockSize, networkNumber,
+      broadcastNumber: networkNumber + blockSize - 1,
+      cidr: `${match[1]}/${prefixLength}`,
+    };
+  }
+
+  function numberToIpv4(value) {
+    const safe = Math.max(0, Math.min(4294967295, Number(value) || 0));
+    return [16777216, 65536, 256, 1].map(divisor => Math.floor(safe / divisor) % 256).join(".");
+  }
+
+  function ipamPreview(cidr, vmCount) {
+    const parsed = parseIpv4Cidr(cidr);
+    if (!parsed) return null;
+    const wanted = Math.max(1, Number(vmCount) || 1);
+    const addresses = [];
+    let cursor = parsed.addressNumber;
+    if (parsed.prefixLength <= 30 && (cursor === parsed.networkNumber || cursor === parsed.broadcastNumber)) {
+      cursor = parsed.networkNumber + 1;
+    }
+    while (cursor <= parsed.broadcastNumber && addresses.length < wanted) {
+      const boundary = parsed.prefixLength <= 30 && (cursor === parsed.networkNumber || cursor === parsed.broadcastNumber);
+      if (!boundary) addresses.push(numberToIpv4(cursor));
+      cursor += 1;
+    }
+    return { ...parsed, first: addresses[0] || "—", last: addresses.at(-1) || "—", available: addresses.length };
+  }
+
+  function webUsername(credential, vm = {}) {
+    const username = credential?.access_username || credential?.web_username || vm.access_username || credential?.username || "root@pam";
+    return username === "root" ? "root@pam" : username;
   }
 
   function icon(name, className = "") {
@@ -361,7 +412,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
       <td>${statusChip(stand.status)}${stand.status === "provisioning" ? `<div class="inline-progress"><div class="progress"><div class="progress__bar progress__bar--blue" style="width:${clamp(stand.progress)}%"></div></div><small>${stand.progress}%</small></div>` : ""}</td>
       <td><div class="resource-pair">${resourceBar("CPU", stand.cpu)}${resourceBar("RAM", stand.ram, "blue")}</div></td>
       <td>${stand.check_status === "running" ? statusChip("checking", "Выполняется") : stand.check_score == null && stand.check_status === "failed" ? statusChip("failed", "Ошибка запуска") : stand.check_score == null ? `<span class="muted">Не запускалась</span>` : `<div class="score-cell"><strong class="score score--${stand.check_score >= 90 ? "good" : stand.check_score >= 70 ? "warn" : "bad"}">${stand.check_score}%</strong><small>${relativeTime(stand.last_check)}</small></div>`}</td>
-      <td class="cell-actions"><button class="icon-button" data-stand-detail="${stand.id}" title="Открыть">${icon("chevron")}</button></td>
+      <td class="cell-actions"><button class="button button--small table-check-button" data-stand-action="run_check" data-stand-id="${stand.id}" type="button" ${stand.status !== "running" ? "disabled" : ""}>${icon("check")}Автопроверка</button><button class="icon-button" data-stand-detail="${stand.id}" title="Открыть">${icon("chevron")}</button></td>
     </tr>`;
   }
 
@@ -415,7 +466,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
         </div>
       </div>
       <article class="card"><div class="card__header"><div class="card__heading"><h3 class="card__title">История запусков</h3><p class="card__subtitle">${escapeHtml(selected.name)}</p></div><button class="button button--small" data-run-check>${icon("power")}Новый запуск</button></div>
-        ${runs.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>Стенд</th><th>Результат</th><th>Проверки</th><th>Время</th><th>Длительность</th><th></th></tr></thead><tbody>${runs.slice(0, 8).map(run => `<tr><td><strong class="cell-title">${escapeHtml(run.stand_name)}</strong><small class="cell-subtitle">${escapeHtml(run.blueprint_code || "")}</small></td><td>${run.status === "running" ? statusChip("checking", "Выполняется") : statusChip(run.status)}</td><td><strong>${run.score == null ? "—" : `${run.score}%`}</strong><small class="cell-subtitle">${run.total ? `${run.passed} из ${run.total}` : "Ожидание результатов"}</small></td><td>${dateTime(run.started_at)}</td><td>${run.duration_ms ? `${formatNumber(run.duration_ms / 1000, 1)} c` : "—"}</td><td class="cell-actions"><button class="icon-button" data-check-detail="${run.id}" title="Результаты">${icon("chevron")}</button></td></tr>`).join("")}</tbody></table></div>` : emptyState("check", "Запусков пока нет", "Запустите автопроверку на совместимом стенде.")}</article>
+        ${runs.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>Стенд</th><th>Результат</th><th>Проверки</th><th>Время</th><th>Длительность</th><th></th></tr></thead><tbody>${runs.slice(0, 8).map(run => `<tr><td><strong class="cell-title">${escapeHtml(run.stand_name)}</strong><small class="cell-subtitle">${escapeHtml(run.blueprint_code || "")}${run.vmid ? ` · VM ${Number(run.vmid)}` : " · весь стенд"}</small></td><td>${run.status === "running" ? statusChip("checking", "Выполняется") : statusChip(run.status)}</td><td><strong>${run.score == null ? "—" : `${run.score}%`}</strong><small class="cell-subtitle">${run.total ? `${run.passed} из ${run.total}` : "Ожидание результатов"}</small></td><td>${dateTime(run.started_at)}</td><td>${run.duration_ms ? `${formatNumber(run.duration_ms / 1000, 1)} c` : "—"}</td><td class="cell-actions"><button class="icon-button" data-check-detail="${run.id}" title="Результаты">${icon("chevron")}</button></td></tr>`).join("")}</tbody></table></div>` : emptyState("check", "Запусков пока нет", "Запустите автопроверку на совместимом стенде.")}</article>
     </section>`;
     const editor = document.querySelector("#autocheck-editor");
     editor?.addEventListener("input", () => {
@@ -464,6 +515,57 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
       <div class="stacked-load" title="Оранжевый: экзаменационные стенды"><i style="width:${clamp(node.cpu)}%"><b style="width:${clamp(node.cpu ? node.exam_cpu / node.cpu * 100 : 0)}%"></b></i></div></div>`;
   }
 
+  async function loadIpam({ force = false } = {}) {
+    if (state.ipamLoading) return;
+    if (state.ipam && !force) return;
+    state.ipamLoading = true;
+    try {
+      state.ipam = await api("/api/ipam");
+    } catch (error) {
+      state.ipam = { reservations: [], summary: {}, error: error.message };
+    } finally {
+      state.ipamLoading = false;
+      if (state.route === "ipam") renderIpam();
+    }
+  }
+
+  function renderIpam() {
+    const payload = state.ipam;
+    if (!payload) {
+      app.innerHTML = `<section class="page">${pageHeader("IPAM", "Резервирование IPv4-адресов для экзаменационных стендов.", `<button class="button" data-refresh-ipam>${icon("refresh")}Обновить IPAM</button>`)}`
+        + `<div class="card"><div class="detail-loading"><span class="spinner"></span><p>Загружаем адресный план…</p></div></div></section>`;
+      window.setTimeout(() => loadIpam(), 0);
+      return;
+    }
+    const reservations = Array.isArray(payload.reservations) ? payload.reservations : [];
+    const pools = Array.isArray(payload.pools) ? payload.pools : [];
+    const summary = payload.summary || {};
+    const assigned = Number(summary.assigned ?? reservations.filter(item => item.status === "assigned").length);
+    const reserved = Number(summary.reserved ?? reservations.filter(item => item.status === "reserved").length);
+    const stands = Number(summary.stands ?? new Set(reservations.map(item => item.stand_id).filter(Boolean)).size);
+    const ranges = Number(summary.pools ?? (pools.length || new Set(reservations.map(item => item.requested_cidr).filter(Boolean)).size));
+    const rows = reservations.map(item => `<tr>
+      <td><strong class="mono ipam-address">${escapeHtml(item.address)}</strong><small class="cell-subtitle mono">/${Number(item.prefix_length ?? (String(item.requested_cidr || "").split("/")[1] || 0))}</small></td>
+      <td><strong class="cell-title">${escapeHtml(item.vm_name || `VMID ${item.vmid || "—"}`)}</strong><small class="cell-subtitle mono">VMID ${escapeHtml(item.vmid || "—")} · #${Number(item.vm_index ?? 0)}</small></td>
+      <td><strong class="cell-title">${escapeHtml(item.stand_name || `Стенд #${item.stand_id || "—"}`)}</strong><small class="cell-subtitle mono">${escapeHtml(item.requested_cidr || "—")}</small></td>
+      <td>${statusChip(item.status || "reserved", item.status === "assigned" ? "Назначен" : item.status === "reserved" ? "Зарезервирован" : item.status)}</td>
+      <td><span class="muted">${relativeTime(item.updated_at || item.created_at)}</span></td>
+    </tr>`).join("");
+    app.innerHTML = `<section class="page">
+      ${pageHeader("IPAM", "IP-адреса выдаются с введённой оператором точки старта; занятые адреса пропускаются автоматически.", `<button class="button" data-refresh-ipam>${icon("refresh")}Обновить IPAM</button><button class="button button--primary" data-open-deploy>${icon("plus")}Зарезервировать через развёртывание</button>`)}
+      ${payload.error ? `<div class="alert alert--error">${icon("alert")}<div><strong>Не удалось получить IPAM</strong><br>${escapeHtml(payload.error)}</div></div>` : ""}
+      <div class="metric-grid ipam-metrics">
+        ${metricCard("Адресов учтено", formatNumber(summary.total ?? reservations.length), "в активных резервациях", "activity")}
+        ${metricCard("Назначено VM", formatNumber(assigned), "адрес передан гостевой машине", "server", "green")}
+        ${metricCard("Ожидают назначения", formatNumber(reserved), "зарезервированы на время деплоя", "clock", "blue")}
+        ${metricCard("Стенды и диапазоны", `${formatNumber(stands)}<small> / ${formatNumber(ranges)}</small>`, "стендов / стартовых CIDR", "shield", "purple")}
+      </div>
+      <div class="ipam-explainer">${icon("info")}<div><strong>Стартовый адрес не приводится к началу сети</strong><p>Запись <span class="mono">10.39.4.0/16</span> означает выдачу с <span class="mono">10.39.4.0</span>, затем <span class="mono">10.39.4.1</span> и далее. Настоящий адрес сети, broadcast и уже занятые IP будут пропущены.</p></div></div>
+      ${pools.length ? `<div class="ipam-pool-grid">${pools.map(pool => `<article class="ipam-pool-card"><div><span>Стартовый запрос</span><strong class="mono">${escapeHtml(pool.requested_cidr)}</strong></div><p class="mono">${escapeHtml(pool.first_address || "—")} → ${escapeHtml(pool.last_address || "—")}</p><footer><span>${formatNumber(pool.assigned)} назначено</span><span>${formatNumber(pool.reservations)} всего</span><span>${formatNumber(pool.stands)} стенд.</span></footer></article>`).join("")}</div>` : ""}
+      <div class="table-card"><div class="card__header"><div class="card__heading"><h3 class="card__title">Резервации адресов</h3><p class="card__subtitle">${reservations.length} записей в текущем адресном плане</p></div></div>${reservations.length ? `<div class="table-wrap"><table class="data-table ipam-table"><thead><tr><th>IPv4</th><th>Виртуальная машина</th><th>Стенд / запрос</th><th>Состояние</th><th>Обновлено</th></tr></thead><tbody>${rows}</tbody></table></div>` : emptyState("activity", "Резерваций пока нет", "Адреса появятся после запуска развёртывания со стартовым IPv4 и префиксом.")}</div>
+    </section>`;
+  }
+
   function render() {
     if (!state.data) return;
     document.querySelector("#page-title").textContent = routeTitles[state.route];
@@ -472,7 +574,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
       link.classList.toggle("is-active", active);
       if (active) link.setAttribute("aria-current", "page"); else link.removeAttribute("aria-current");
     });
-    const renderers = { overview: renderOverview, stands: renderStands, blueprints: renderBlueprints, checks: renderChecks, infrastructure: renderInfrastructure };
+    const renderers = { overview: renderOverview, stands: renderStands, blueprints: renderBlueprints, checks: renderChecks, ipam: renderIpam, infrastructure: renderInfrastructure };
     renderers[state.route]();
     updateShell();
   }
@@ -502,6 +604,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
       const data = await api("/api/bootstrap");
       state.data = data;
       state.lastUpdated = new Date();
+      syncOperationPolling();
       if (silent) updateShell(); else render();
     } catch (error) {
       if (!state.data) {
@@ -523,6 +626,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
   }
 
   function showModal({ title, subtitle = "", body, footer = "", size = "", className = "" }) {
+    if (activeStandDetailId !== null && !className.includes("stand-detail-modal")) stopStandDetailPolling();
     activeModalToken += 1;
     if (!modalRoot.innerHTML) modalReturnFocus = document.activeElement;
     modalRoot.innerHTML = `<div class="modal-backdrop"><section class="modal ${size ? `modal--${size}` : ""} ${className}" role="dialog" aria-modal="true" aria-labelledby="modal-title">
@@ -538,6 +642,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
       finish(null);
       return;
     }
+    stopStandDetailPolling();
     activeModalToken += 1;
     modalRoot.innerHTML = "";
     document.body.classList.remove("is-modal-open");
@@ -606,6 +711,17 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     });
   }
 
+  function renderDeployIpamPreview(preview, vmCount) {
+    if (!preview) {
+      return `${icon("info")}<div><strong>Укажите стартовый адрес с префиксом</strong><small>Например: 10.39.4.0/16. Без значения VM продолжат использовать сеть шаблона.</small></div>`;
+    }
+    if (!preview.available) {
+      return `${icon("alert")}<div><strong>В указанном диапазоне нет доступных адресов</strong><small>Выберите другой стартовый IPv4 или более широкий префикс.</small></div>`;
+    }
+    const incomplete = preview.available < Number(vmCount);
+    return `${icon(incomplete ? "alert" : "shield")}<div><strong>${escapeHtml(preview.first)} → ${escapeHtml(preview.last)}</strong><small>${incomplete ? `Вместилось только ${preview.available} из ${vmCount} VM.` : `${vmCount} адресов будут зарезервированы по порядку.`} Занятые адреса, адрес сети и broadcast IPAM пропустит автоматически.</small></div>`;
+  }
+
   function openDeployWizard(preselectedId = null) {
     if (!state.data) { toast("Данные ещё загружаются. Повторите через несколько секунд", "warning"); return; }
     const available = state.data.blueprints.filter(item => item.status === "active");
@@ -613,7 +729,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     const model = {
       step: 1, blueprint_id: Number(preselectedId) || available[0].id,
       name: "", pool_id: `exam-${new Date().toISOString().slice(5, 10).replace("-", "")}-${String(Date.now()).slice(-3)}`,
-      node: "auto", vm_count: 1, subnet: "", bridge: "",
+      node: "auto", vm_count: 1, subnet: "", start_ip: "", bridge: "",
       owner: "Администратор",
     };
     const draw = () => {
@@ -624,18 +740,29 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
         body += `<div class="wizard-section"><h3>Выберите сценарий</h3><p>Шаблон и проверочный код будут закреплены за новым стендом.</p><div class="scenario-picker">${available.map(item => `<button type="button" class="scenario-option ${item.id === Number(model.blueprint_id) ? "is-selected" : ""}" data-wizard-blueprint="${item.id}"><span>${icon(item.category === "Безопасность" ? "shield" : "server")}</span><div><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.code)} · шаблон VMID ${item.template_vmid}</small></div><i>${icon("check")}</i></button>`).join("")}</div>
           <div class="form-grid"><label class="field"><span class="field-label">Название стенда</span><input class="input" id="deploy-name" value="${escapeHtml(model.name)}" placeholder="Например, ДЭ-24 · Группа 4" required></label><label class="field"><span class="field-label">Pool ID</span><input class="input mono" id="deploy-pool" value="${escapeHtml(model.pool_id)}" pattern="[A-Za-z0-9_.-]+" required><small class="field-hint">Латиница, цифры, точка, дефис</small></label></div></div>`;
       } else if (model.step === 2) {
-        body += `<div class="wizard-section"><h3>Параметры развёртывания</h3><p>Количество машин и сеть задаются отдельно для каждого стенда. Все VM создаются как linked clone.</p><div class="deploy-plan-card"><div class="deploy-plan-card__icon">${icon("server")}</div><div><strong>${escapeHtml(blueprint.name)}</strong><small>Шаблон VMID ${blueprint.template_vmid} · связанные клоны</small></div><span>Linked clone</span></div>
-          <div class="form-grid"><label class="field"><span class="field-label">Количество VM</span><input class="input" id="deploy-vm-count" type="number" min="1" max="50" value="${model.vm_count}"></label><label class="field"><span class="field-label">Подсеть IPv4</span><input class="input mono" id="deploy-subnet" value="${escapeHtml(model.subnet)}" placeholder="10.39.10.0/24"><small class="field-hint">VM_IP и STAND_SUBNET будут переданы bootstrap-скрипту</small></label><label class="field field--full"><span class="field-label">Bridge Proxmox</span><input class="input mono" id="deploy-bridge" value="${escapeHtml(model.bridge)}" placeholder="Оставьте пустым — сеть сохранится из шаблона"><small class="field-hint">Указывайте bridge только если он существует на каждой выбранной ноде</small></label><label class="field field--full"><span class="field-label">Политика размещения</span><select class="input" id="deploy-node"><option value="auto" ${model.node === "auto" ? "selected" : ""}>Автоматически по нагрузке</option>${state.data.metrics.nodes.filter(node => node.status === "online").map(node => `<option value="${escapeHtml(node.name)}" ${model.node === node.name ? "selected" : ""}>${escapeHtml(node.name)} · CPU ${formatNumber(node.cpu)}% · RAM ${formatNumber(node.ram)}%</option>`).join("")}</select></label></div>
-          <div class="capacity-preview"><div><span>Количество</span><strong>${model.vm_count} VM</strong></div><div><span>Сеть</span><strong class="mono">${escapeHtml(model.subnet || "DHCP")}</strong></div><div><span>Bridge</span><strong class="mono">${escapeHtml(model.bridge || "из шаблона")}</strong></div><div><span>Тип</span><strong>Linked clone</strong></div></div></div>`;
+        const preview = ipamPreview(model.subnet, model.vm_count);
+        body += `<div class="wizard-section"><h3>Параметры развёртывания и IPAM</h3><p>IPAM резервирует последовательные свободные адреса, начиная именно с указанного IPv4. Все VM создаются как linked clone.</p><div class="deploy-plan-card"><div class="deploy-plan-card__icon">${icon("server")}</div><div><strong>${escapeHtml(blueprint.name)}</strong><small>Шаблон VMID ${blueprint.template_vmid} · связанные клоны</small></div><span>Linked clone</span></div>
+          <div class="form-grid"><label class="field"><span class="field-label">Количество VM</span><input class="input" id="deploy-vm-count" type="number" min="1" max="50" value="${model.vm_count}"></label><label class="field"><span class="field-label">Стартовый IPv4 / префикс</span><input class="input mono" id="deploy-subnet" value="${escapeHtml(model.subnet)}" placeholder="10.39.4.0/16"><small class="field-hint">Например, 10.39.4.0/16 начнёт выдачу с 10.39.4.0, а не с 10.39.0.1</small></label><label class="field field--full"><span class="field-label">Bridge Proxmox</span><input class="input mono" id="deploy-bridge" value="${escapeHtml(model.bridge)}" placeholder="Оставьте пустым — сеть сохранится из шаблона"><small class="field-hint">Указывайте bridge только если он существует на каждой выбранной ноде</small></label><label class="field field--full"><span class="field-label">Политика размещения</span><select class="input" id="deploy-node"><option value="auto" ${model.node === "auto" ? "selected" : ""}>Автоматически по нагрузке</option>${state.data.metrics.nodes.filter(node => node.status === "online").map(node => `<option value="${escapeHtml(node.name)}" ${model.node === node.name ? "selected" : ""}>${escapeHtml(node.name)} · CPU ${formatNumber(node.cpu)}% · RAM ${formatNumber(node.ram)}%</option>`).join("")}</select></label></div>
+          <div class="ipam-preview" id="deploy-ipam-preview">${renderDeployIpamPreview(preview, model.vm_count)}</div>
+          <div class="capacity-preview"><div><span>Количество</span><strong>${model.vm_count} VM</strong></div><div><span>Старт IPAM</span><strong class="mono">${escapeHtml(preview?.first || "DHCP")}</strong></div><div><span>Bridge</span><strong class="mono">${escapeHtml(model.bridge || "из шаблона")}</strong></div><div><span>Тип</span><strong>Linked clone</strong></div></div></div>`;
       } else if (model.step === 3) {
         body += `<div class="wizard-section"><h3>Доступ и автоматические действия</h3><p>Стенд создаётся бессрочно и будет работать, пока оператор не остановит или не удалит его.</p><div class="form-grid"><label class="field field--full"><span class="field-label">Ответственный</span><input class="input" id="deploy-owner" value="${escapeHtml(model.owner)}"></label></div>
           <div class="option-list"><label class="option-row"><span>${icon("lock")}</span><span><strong>Учётные данные для каждой VM</strong><small>Логин и пароль будут доступны в карточке стенда после готовности машины</small></span><input type="checkbox" checked disabled></label><label class="option-row"><span>${icon("copy")}</span><span><strong>Начальный снимок «start»</strong><small>Контрольная точка исходного состояния создаётся автоматически для каждой VM</small></span><input type="checkbox" checked disabled></label><label class="option-row"><span>${icon("check")}</span><span><strong>Автопроверка после деплоя</strong><small>Запускается вручную после готовности стенда</small></span><input type="checkbox" disabled></label></div></div>`;
       } else {
-        body += `<div class="wizard-section"><div class="confirm-hero"><span>${icon("check")}</span><h3>План готов к запуску</h3><p>Проверьте параметры. Развёртывание продолжится в фоне.</p></div><dl class="review-list"><div><dt>Стенд</dt><dd><strong>${escapeHtml(model.name)}</strong><small class="mono">${escapeHtml(model.pool_id)}</small></dd></div><div><dt>Сценарий</dt><dd><strong>${escapeHtml(blueprint.name)}</strong><small>${escapeHtml(blueprint.code)} · VMID ${blueprint.template_vmid}</small></dd></div><div><dt>Топология</dt><dd><strong>${model.vm_count} VM · Linked clone</strong><small>${escapeHtml(model.node === "auto" ? "Автораспределение" : model.node)}</small></dd></div><div><dt>Сеть</dt><dd><strong class="mono">${escapeHtml(model.subnet || "DHCP")}</strong><small class="mono">${escapeHtml(model.bridge || "bridge из шаблона")}</small></dd></div><div><dt>Ответственный</dt><dd><strong>${escapeHtml(model.owner)}</strong><small>Бессрочный стенд · snapshot start автоматически</small></dd></div></dl>
+        const preview = ipamPreview(model.subnet, model.vm_count);
+        body += `<div class="wizard-section"><div class="confirm-hero"><span>${icon("check")}</span><h3>План готов к запуску</h3><p>Проверьте параметры. Развёртывание продолжится в фоне.</p></div><dl class="review-list"><div><dt>Стенд</dt><dd><strong>${escapeHtml(model.name)}</strong><small class="mono">${escapeHtml(model.pool_id)}</small></dd></div><div><dt>Сценарий</dt><dd><strong>${escapeHtml(blueprint.name)}</strong><small>${escapeHtml(blueprint.code)} · VMID ${blueprint.template_vmid}</small></dd></div><div><dt>Топология</dt><dd><strong>${model.vm_count} VM · Linked clone</strong><small>${escapeHtml(model.node === "auto" ? "Автораспределение" : model.node)}</small></dd></div><div><dt>IPAM</dt><dd><strong class="mono">${escapeHtml(model.subnet || "DHCP")}</strong><small class="mono">${preview ? `${escapeHtml(preview.first)} → ${escapeHtml(preview.last)}` : escapeHtml(model.bridge || "bridge из шаблона")}</small></dd></div><div><dt>Ответственный</dt><dd><strong>${escapeHtml(model.owner)}</strong><small>Бессрочный стенд · snapshot start автоматически</small></dd></div></dl>
           <div class="alert alert--warning">${icon("alert")} В live-режиме будут созданы реальные VM и пул Proxmox. Операция появится в журнале аудита.</div></div>`;
       }
       const footer = `<button class="button" type="button" ${model.step === 1 ? "data-close-modal" : "data-wizard-back"}>${model.step === 1 ? "Отмена" : "Назад"}</button><button class="button button--primary" type="button" ${model.step === 4 ? "data-wizard-submit" : "data-wizard-next"}>${model.step === 4 ? `${icon("power")}Начать развёртывание` : `Продолжить ${icon("chevron")}`}</button>`;
       showModal({ title: "Развернуть новый стенд", subtitle: `Шаг ${model.step} из 4 · ${steps[model.step - 1]}`, body, footer, size: "wide", className: "deploy-modal" });
+      const updateIpamPreview = () => {
+        const cidr = modalRoot.querySelector("#deploy-subnet")?.value || "";
+        const vmCount = Number(modalRoot.querySelector("#deploy-vm-count")?.value || 1);
+        const target = modalRoot.querySelector("#deploy-ipam-preview");
+        if (target) target.innerHTML = renderDeployIpamPreview(ipamPreview(cidr, vmCount), vmCount);
+      };
+      modalRoot.querySelector("#deploy-subnet")?.addEventListener("input", updateIpamPreview);
+      modalRoot.querySelector("#deploy-vm-count")?.addEventListener("input", updateIpamPreview);
       modalRoot.querySelectorAll("[data-wizard-blueprint]").forEach(button => button.addEventListener("click", () => { commitDeployStep(model, false); model.blueprint_id = Number(button.dataset.wizardBlueprint); draw(); }));
       modalRoot.querySelector("[data-wizard-back]")?.addEventListener("click", () => { commitDeployStep(model, false); model.step -= 1; draw(); });
       modalRoot.querySelector("[data-wizard-next]")?.addEventListener("click", () => {
@@ -646,8 +773,10 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
         const button = event.currentTarget;
         button.disabled = true; button.classList.add("is-loading");
         try {
+          model.start_ip = parseIpv4Cidr(model.subnet)?.address || "";
           const stand = await api("/api/stands", { method: "POST", body: model });
-          closeModal(); toast(`Стенд «${stand.name}» поставлен на развёртывание`); state.route = "stands"; window.location.hash = "stands"; await loadData();
+          state.ipam = null;
+          closeModal(); toast(`Стенд «${stand.name}» поставлен на развёртывание`); state.route = "stands"; window.location.hash = "stands"; await loadData(); await openStandDetail(stand.id);
         } catch (error) { button.disabled = false; button.classList.remove("is-loading"); toast(error.message, "error"); }
       });
     };
@@ -675,10 +804,15 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
       }
       if (subnet) {
         const value = subnet.value.trim();
-        if (validate && value && !/^(?:\d{1,3}\.){3}\d{1,3}\/(?:[0-9]|[12]\d|3[0-2])$/.test(value)) {
-          subnet.classList.add("is-invalid"); subnet.focus(); toast("Укажите IPv4-подсеть в формате 10.39.10.0/24", "warning"); return false;
+        const preview = value ? ipamPreview(value, model.vm_count) : null;
+        if (validate && value && !preview) {
+          subnet.classList.add("is-invalid"); subnet.focus(); toast("Укажите стартовый IPv4 и префикс в формате 10.39.4.0/16", "warning"); return false;
+        }
+        if (validate && preview && preview.available < model.vm_count) {
+          subnet.classList.add("is-invalid"); subnet.focus(); toast("В диапазоне недостаточно адресов для выбранного количества VM", "warning"); return false;
         }
         model.subnet = value;
+        model.start_ip = parseIpv4Cidr(value)?.address || "";
       }
       if (bridge) {
         const value = bridge.value.trim();
@@ -747,28 +881,33 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
   }
 
   function renderVmRow(stand, vm, credential, credentialState) {
-    const username = credential?.username || credential?.access_username || vm.access_username || "root@pam";
+    const numericVmid = Number(vm.vmid);
+    const hasVmid = Number.isInteger(numericVmid) && numericVmid > 0;
+    const username = webUsername(credential, vm);
     const password = credential?.password || credential?.access_password || "";
     const accessUrl = safeAccessUrl(vm.access_url || vm.web_url);
     const snapshots = Array.isArray(vm.snapshots) ? vm.snapshots : [];
     const hasStartSnapshot = vm.last_snapshot === "start" || vm.has_start_snapshot === true || vm.start_snapshot_created === true || vm.start_snapshot === true || snapshots.some(item => String(item?.name ?? item) === "start");
+    const checkLabel = vm.check_status === "running" ? "автопроверка идёт" : vm.check_score == null ? "не проверялась" : `автопроверка ${formatNumber(vm.check_score)}%`;
     const passwordText = password ? "••••••••••••" : credentialState === "locked" ? "Нужен токен" : credentialState === "error" ? "Ошибка загрузки" : "Не выдан";
-    const accessButton = accessUrl
-      ? `<button class="button button--primary vm-open-button" type="button" data-open-vm-stand data-url="${escapeHtml(accessUrl)}" data-user="${escapeHtml(username)}" data-password="${escapeHtml(password)}">${icon("chevron")}Перейти к стенду</button>`
+    const accessButton = accessUrl && hasVmid
+      ? `<button class="button button--primary vm-open-button" type="button" data-open-vm-stand data-url="${escapeHtml(accessUrl)}" data-user="${escapeHtml(username)}" data-password="${escapeHtml(password)}" data-vm-name="${escapeHtml(vm.name)}" data-vmid="${numericVmid}">${icon("external")}Перейти к стенду</button>`
       : `<button class="button button--primary vm-open-button" type="button" disabled title="Web URL ещё не получен">${icon("chevron")}Перейти к стенду</button>`;
     return `<article class="vm-row">
       <span class="vm-state vm-state--${escapeHtml(vm.status)}"></span>
-      <div class="vm-main"><div class="vm-main__title"><strong>${escapeHtml(vm.name)}</strong>${statusChip(vm.status)}</div><small class="mono">VMID ${vm.vmid} · ${escapeHtml(vm.ip || "IP не назначен")}</small><div class="vm-meta"><span>${icon("server")}${escapeHtml(vm.node || stand.node || "авто")}</span><span class="${hasStartSnapshot ? "is-ready" : ""}">${icon("copy")}${hasStartSnapshot ? "snapshot start готов" : "snapshot start"}</span></div></div>
-      <div class="vm-access"><div class="vm-access__hint">${icon("lock")}Доступ к веб-интерфейсу</div><div class="vm-credentials"><div><span>Логин</span><strong class="mono">${escapeHtml(username)}</strong></div><div><span>Пароль</span><strong class="mono" data-vm-secret>${escapeHtml(passwordText)}</strong>${password ? `<button type="button" data-reveal-vm-password data-password="${escapeHtml(password)}">${icon("eye")}Показать</button>` : ""}</div></div>${password ? `<button class="vm-copy-access" type="button" data-copy-vm-credential data-user="${escapeHtml(username)}" data-password="${escapeHtml(password)}">${icon("copy")}Скопировать логин и пароль</button>` : `<small class="vm-access__empty">Смените пароль этой VM или загрузите защищённые доступы.</small>`}</div>
-      <div class="vm-actions">${accessButton}<div><button class="button button--small" type="button" data-vm-action="snapshot" data-stand-id="${stand.id}" data-vmid="${vm.vmid}" data-vm-name="${escapeHtml(vm.name)}">${icon("copy")}Снимок</button><button class="button button--small" type="button" data-vm-action="password" data-stand-id="${stand.id}" data-vmid="${vm.vmid}" data-vm-name="${escapeHtml(vm.name)}" ${vm.status !== "running" ? "disabled" : ""}>${icon("lock")}Сменить пароль</button></div></div>
+      <div class="vm-main"><div class="vm-main__title"><strong>${escapeHtml(vm.name)}</strong>${statusChip(vm.status)}</div><small class="mono">${hasVmid ? `VMID ${numericVmid}` : "VM создаётся"} · ${escapeHtml(vm.ip || "IP резервируется")}</small><div class="vm-meta"><span>${icon("server")}${escapeHtml(vm.node || stand.node || "авто")}</span><span class="${hasStartSnapshot ? "is-ready" : ""}">${icon("copy")}${hasStartSnapshot ? "snapshot start готов" : "snapshot start"}</span><span class="${vm.check_status === "running" ? "is-checking" : vm.check_score == null ? "" : vm.check_score >= 90 ? "is-ready" : vm.check_score >= 70 ? "is-warning" : "is-failed"}">${icon("check")}${escapeHtml(checkLabel)}</span></div></div>
+      <div class="vm-access"><div class="vm-access__hint">${icon("lock")}Доступ к веб-интерфейсу</div><div class="vm-credentials"><div><span>Логин</span><strong class="mono">${escapeHtml(username)}</strong><button type="button" data-copy-vm-login data-value="${escapeHtml(username)}">${icon("copy")}Копировать</button></div><div><span>Пароль</span><strong class="mono" data-vm-secret>${escapeHtml(passwordText)}</strong>${password ? `<div class="vm-secret-actions"><button type="button" data-reveal-vm-password data-password="${escapeHtml(password)}">${icon("eye")}Показать</button><button type="button" data-copy-vm-password data-value="${escapeHtml(password)}">${icon("copy")}Копировать</button></div>` : ""}</div></div>${password ? `<button class="vm-copy-access" type="button" data-copy-vm-credential data-user="${escapeHtml(username)}" data-password="${escapeHtml(password)}">${icon("copy")}Скопировать парой</button>` : `<small class="vm-access__empty">Смените пароль этой VM или загрузите защищённые доступы.</small>`}</div>
+      <div class="vm-actions">${accessButton}<div><button class="button button--small" type="button" data-vm-action="snapshot" data-stand-id="${stand.id}" data-vmid="${hasVmid ? numericVmid : ""}" data-vm-name="${escapeHtml(vm.name)}" ${hasVmid ? "" : "disabled"}>${icon("copy")}Снимок</button><button class="button button--small" type="button" data-vm-action="password" data-stand-id="${stand.id}" data-vmid="${hasVmid ? numericVmid : ""}" data-vm-name="${escapeHtml(vm.name)}" ${!hasVmid || vm.status !== "running" ? "disabled" : ""}>${icon("lock")}Пароль</button><button class="button button--small" type="button" data-vm-action="run_check" data-stand-id="${stand.id}" data-vmid="${hasVmid ? numericVmid : ""}" data-vm-name="${escapeHtml(vm.name)}" ${!hasVmid || vm.status !== "running" ? "disabled" : ""}>${icon("check")}Автопроверка</button></div></div>
     </article>`;
   }
 
-  function renderStandDetailModal(stand, credentials = new Map(), credentialState = "locked", credentialError = "") {
+  function renderStandDetailModal(stand, credentials = new Map(), credentialState = "locked", credentialError = "", { updateExisting = false } = {}) {
     const runCount = stand.vms.filter(vm => vm.status === "running").length;
+    standCredentialCache.set(Number(stand.id), { stand, credentials });
+    const credentialCount = stand.vms.filter(vm => credentials.get(Number(vm.vmid))?.password || credentials.get(Number(vm.vmid))?.access_password).length;
     const credentialControl = credentialState === "loaded"
-      ? `<span class="credential-state credential-state--ready">${icon("check")}Доступы загружены</span>`
-      : `<button class="button button--small" type="button" data-load-stand-credentials="${stand.id}">${icon("lock")}Показать логины и пароли</button>`;
+      ? `<span class="credential-state credential-state--ready">${icon("check")}Доступы загружены: ${credentialCount}</span><button class="button button--small" type="button" data-copy-stand-access="${stand.id}" ${credentialCount ? "" : "disabled"}>${icon("copy")}Все IP, логины и пароли</button>`
+      : `<button class="button button--small" type="button" data-load-stand-credentials="${stand.id}">${icon("lock")}Показать логины и пароли</button><button class="button button--small" type="button" data-copy-stand-access="${stand.id}" ${stand.vms.some(vm => Number(vm.vmid) > 0) ? "" : "disabled"}>${icon("copy")}Скопировать все доступы</button>`;
     const credentialNotice = credentialState === "locked"
       ? `<div class="alert alert--info">${icon("info")}<div><strong>Пароли защищены административным токеном.</strong><br>Нажмите «Показать логины и пароли», чтобы загрузить их для этого стенда.</div></div>`
       : credentialState === "error" ? `<div class="alert alert--warning">${icon("alert")}<div><strong>Не удалось получить сохранённые доступы.</strong><br>${escapeHtml(credentialError || "Можно сменить пароль отдельно у нужной VM.")}</div></div>` : "";
@@ -779,19 +918,42 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
       <div class="detail-stat-grid"><div><span>Машины</span><strong>${runCount} / ${stand.vm_count}</strong><small>запущено</small></div><div><span>CPU</span><strong>${formatNumber(stand.cpu, 1)}%</strong><small>текущая оценка</small></div><div><span>RAM</span><strong>${formatNumber(stand.ram, 1)}%</strong><small>на ноде</small></div><div><span>Режим работы</span><strong>Бессрочно</strong><small>автоотключение выключено</small></div></div>
       <div class="detail-actions"><button class="button" data-stand-action="${stand.status === "stopped" ? "start" : "stop"}" data-stand-id="${stand.id}" ${!["running", "stopped"].includes(stand.status) || !stand.vms.length ? "disabled" : ""}>${icon("power")}${stand.status === "stopped" ? "Запустить" : "Остановить"}</button><button class="button" data-stand-action="restart" data-stand-id="${stand.id}" ${stand.status !== "running" ? "disabled" : ""}>${icon("refresh")}Перезапустить</button><button class="button" data-stand-action="snapshot" data-stand-id="${stand.id}" ${!stand.vms.length ? "disabled" : ""}>${icon("copy")}Снимок всех VM</button><button class="button" data-stand-action="password" data-stand-id="${stand.id}" ${stand.status !== "running" ? "disabled" : ""}>${icon("lock")}Пароль всех VM</button><button class="button" data-edit-stand="${stand.id}">${icon("edit")}Параметры</button><button class="button button--dark" data-stand-action="run_check" data-stand-id="${stand.id}" ${stand.status !== "running" ? "disabled" : ""}>${icon("check")}Автопроверка</button></div>
       ${credentialNotice}
-      <div class="detail-columns detail-columns--single"><section><div class="detail-section-title"><div><h4>Виртуальные машины</h4><small>Кнопка перехода открывает web UI, а доступ копируется в буфер обмена</small></div><div class="detail-section-tools"><span class="detail-count">${stand.vms.length}</span>${credentialControl}</div></div><div class="vm-list">${stand.vms.map(vm => renderVmRow(stand, vm, credentials.get(Number(vm.vmid)), credentialState)).join("") || `<p class="muted-block">Машины ещё не созданы</p>`}</div></section></div>
+      <div class="detail-columns detail-columns--single"><section><div class="detail-section-title"><div><h4>Виртуальные машины</h4><small>Доступы можно копировать по одному или одной кнопкой в формате IP | логин | пароль</small></div><div class="detail-section-tools"><span class="detail-count">${stand.vms.length}</span>${credentialControl}</div></div><div class="vm-list">${stand.vms.map(vm => renderVmRow(stand, vm, credentials.get(Number(vm.vmid)), credentialState)).join("") || `<p class="muted-block">Машины ещё не созданы</p>`}</div></section></div>
       <div class="detail-meta"><span>${icon("activity")} Создан ${dateTime(stand.created_at)}</span><span>${icon("lock")} Пароль менялся ${relativeTime(stand.password_updated_at)}</span><span>${icon("users")} Ответственный: ${escapeHtml(stand.owner)}</span></div>
     </div>`;
     const footer = `<button class="button button--danger" data-delete-stand="${stand.id}" type="button">${icon("trash")}Удалить стенд</button><button class="button" data-close-modal type="button">Закрыть</button>`;
-    showModal({ title: "Карточка стенда", subtitle: `ID ${stand.id} · управляется DemoOps`, body, footer, size: "large" });
+    const existing = updateExisting ? modalRoot.querySelector(`.modal[data-stand-detail-id="${Number(stand.id)}"]`) : null;
+    if (existing) {
+      const bodyNode = existing.querySelector(".modal__body");
+      const footerNode = existing.querySelector(".modal__footer");
+      const scrollTop = bodyNode?.scrollTop || 0;
+      const focused = document.activeElement;
+      const focusSelector = focused?.dataset?.vmAction
+        ? `[data-vm-action="${focused.dataset.vmAction}"][data-vmid="${focused.dataset.vmid}"]`
+        : focused?.dataset?.standAction ? `[data-stand-action="${focused.dataset.standAction}"]`
+        : focused?.dataset?.loadStandCredentials ? `[data-load-stand-credentials="${focused.dataset.loadStandCredentials}"]`
+        : focused?.dataset?.copyStandAccess ? `[data-copy-stand-access="${focused.dataset.copyStandAccess}"]`
+        : focused?.dataset?.deleteStand ? `[data-delete-stand="${focused.dataset.deleteStand}"]`
+        : focused?.dataset?.editStand ? `[data-edit-stand="${focused.dataset.editStand}"]` : "";
+      if (bodyNode) bodyNode.innerHTML = body;
+      if (footerNode) footerNode.innerHTML = footer;
+      if (bodyNode) bodyNode.scrollTop = scrollTop;
+      if (focusSelector) existing.querySelector(focusSelector)?.focus({ preventScroll: true });
+    } else {
+      activeStandDetailId = Number(stand.id);
+      showModal({ title: "Карточка стенда", subtitle: `ID ${stand.id} · управляется DemoOps`, body, footer, size: "large", className: "stand-detail-modal" });
+      modalRoot.querySelector(".modal")?.setAttribute("data-stand-detail-id", String(stand.id));
+    }
   }
 
   async function openStandDetail(id, { requestCredentials = false } = {}) {
-    showModal({ title: "Загрузка стенда…", body: `<div class="detail-loading"><span class="spinner"></span><p>Получаем машины и доступы</p></div>`, size: "large" });
+    stopStandDetailPolling();
+    activeStandDetailId = Number(id);
+    showModal({ title: "Загрузка стенда…", body: `<div class="detail-loading"><span class="spinner"></span><p>Получаем машины и доступы</p></div>`, size: "large", className: "stand-detail-modal" });
     const requestToken = activeModalToken;
     try {
       const stand = await api(`/api/stands/${id}`);
-      if (!requestCredentials && (requestToken !== activeModalToken || !modalRoot.innerHTML)) return;
+      if (!requestCredentials && (requestToken !== activeModalToken || activeStandDetailId !== Number(id) || !modalRoot.innerHTML)) return;
       let credentials = new Map();
       let credentialState = "loaded";
       let credentialError = "";
@@ -802,13 +964,101 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
         credentialState = error.status === 401 ? "locked" : "error";
         credentialError = error.message;
       }
-      if (!requestCredentials && (requestToken !== activeModalToken || !modalRoot.innerHTML)) return;
+      if (!requestCredentials && (requestToken !== activeModalToken || activeStandDetailId !== Number(id) || !modalRoot.innerHTML)) return;
       renderStandDetailModal(stand, credentials, credentialState, credentialError);
+      if (standNeedsLivePolling(stand)) scheduleStandDetailPoll(Number(id), credentials, credentialState, credentialError);
     } catch (error) {
       if (!requestCredentials && requestToken !== activeModalToken) return;
       closeModal();
       toast(error.message, "error");
     }
+  }
+
+  function standNeedsLivePolling(stand) {
+    return stand?.status === "provisioning" || stand?.check_status === "running" || (stand?.vms || []).some(vm => vm.check_status === "running");
+  }
+
+  function syncOperationPolling() {
+    const hasActiveOperations = (state.data?.stands || []).some(
+      stand => standNeedsLivePolling(stand) && Number(stand.id) !== activeStandDetailId,
+    );
+    if (!hasActiveOperations && operationPollTimer) {
+      window.clearTimeout(operationPollTimer);
+      operationPollTimer = null;
+      return;
+    }
+    if (hasActiveOperations && !operationPollTimer && !operationPollBusy) {
+      operationPollTimer = window.setTimeout(pollActiveOperations, 1400);
+    }
+  }
+
+  async function pollActiveOperations() {
+    operationPollTimer = null;
+    if (document.hidden) return;
+    if (operationPollBusy || !state.data) { syncOperationPolling(); return; }
+    const targets = state.data.stands.filter(stand => standNeedsLivePolling(stand) && Number(stand.id) !== activeStandDetailId);
+    if (!targets.length) { syncOperationPolling(); return; }
+    operationPollBusy = true;
+    try {
+      const updates = await Promise.allSettled(targets.map(stand => api(`/api/stands/${stand.id}`, { promptAdmin: false })));
+      updates.forEach((result, index) => {
+        if (result.status !== "fulfilled") return;
+        const stand = result.value;
+        const stateIndex = state.data.stands.findIndex(item => Number(item.id) === Number(stand.id));
+        if (stateIndex >= 0) state.data.stands[stateIndex] = { ...state.data.stands[stateIndex], ...stand };
+        if (stateIndex >= 0 && state.route === "stands") {
+          const currentRow = document.querySelector(`tr[data-stand-detail="${Number(stand.id)}"]`);
+          if (currentRow) {
+            const container = document.createElement("tbody");
+            container.innerHTML = standRow(state.data.stands[stateIndex]);
+            currentRow.replaceWith(container.firstElementChild);
+          }
+        }
+      });
+      updateShell();
+    } finally {
+      operationPollBusy = false;
+      syncOperationPolling();
+    }
+  }
+
+  function stopStandDetailPolling() {
+    if (standDetailPollTimer) window.clearTimeout(standDetailPollTimer);
+    standDetailPollTimer = null;
+    activeStandDetailId = null;
+    syncOperationPolling();
+  }
+
+  function scheduleStandDetailPoll(id, credentials, credentialState, credentialError) {
+    if (standDetailPollTimer) window.clearTimeout(standDetailPollTimer);
+    standDetailPollTimer = window.setTimeout(async () => {
+      standDetailPollTimer = null;
+      if (activeStandDetailId !== Number(id) || !modalRoot.querySelector(`.modal[data-stand-detail-id="${Number(id)}"]`)) return;
+      try {
+        const stand = await api(`/api/stands/${id}`, { promptAdmin: false });
+        let nextCredentials = credentials;
+        let nextCredentialState = credentialState;
+        let nextCredentialError = credentialError;
+        if (credentialState === "loaded") {
+          try {
+            nextCredentials = normalizeVmCredentials(await api(`/api/stands/${id}/credentials`, { promptAdmin: false }));
+            nextCredentialError = "";
+          } catch (error) {
+            nextCredentialError = error.message;
+          }
+        }
+        const index = state.data?.stands?.findIndex(item => Number(item.id) === Number(id)) ?? -1;
+        if (index >= 0) state.data.stands[index] = { ...state.data.stands[index], ...stand };
+        renderStandDetailModal(stand, nextCredentials, nextCredentialState, nextCredentialError, { updateExisting: true });
+        if (standNeedsLivePolling(stand)) {
+          scheduleStandDetailPoll(id, nextCredentials, nextCredentialState, nextCredentialError);
+        } else {
+          await loadData({ silent: true });
+        }
+      } catch (error) {
+        if (activeStandDetailId === Number(id)) standDetailPollTimer = window.setTimeout(() => scheduleStandDetailPoll(id, credentials, credentialState, credentialError), 1800);
+      }
+    }, 1000);
   }
 
   async function performStandAction(id, action) {
@@ -819,7 +1069,8 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
       if (action === "snapshot") payload.name = `manual-${new Date().toISOString().slice(0, 19).replaceAll(":", "-")}`;
       const result = await api(`/api/stands/${id}/actions`, { method: "POST", body: payload });
       toast(result.message || labels[action]);
-      closeModal(); await loadData();
+      if (action === "run_check") { await loadData({ silent: true }); await openStandDetail(id); }
+      else { closeModal(); await loadData(); }
     } catch (error) { toast(error.message, "error"); }
   }
 
@@ -828,7 +1079,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
       openPasswordModal(standId, { vmid, vmName });
       return;
     }
-    const labels = { snapshot: `Создаём снимок VM «${vmName}»…` };
+    const labels = { snapshot: `Создаём снимок VM «${vmName}»…`, run_check: `Автопроверка VM «${vmName}» запущена…` };
     try {
       const payload = { action };
       if (action === "snapshot") payload.name = `manual-${new Date().toISOString().slice(0, 19).replaceAll(":", "-")}`;
@@ -847,8 +1098,8 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     const body = `<form id="stand-edit-form" class="form-grid">
       <label class="field field--full"><span class="field-label">Название стенда</span><input class="input" name="name" value="${escapeHtml(stand.name)}" required></label>
       <label class="field"><span class="field-label">Ответственный</span><input class="input" name="owner" value="${escapeHtml(stand.owner)}"></label>
-      <label class="field"><span class="field-label">Диапазон адресов</span><input class="input mono" name="ip_range" value="${escapeHtml(stand.ip_range)}"></label>
-      <div class="field field--full"><div class="alert alert--info">${icon("info")} Стенд работает бессрочно. Изменение метаданных не перенастраивает сеть уже созданных VM.</div></div>
+      <label class="field"><span class="field-label">Диапазон IPAM</span><input class="input mono" name="ip_range" value="${escapeHtml(stand.ip_range)}" readonly><small class="field-hint">Адреса уже зарезервированы. Для другой сети разверните новый стенд.</small></label>
+      <div class="field field--full"><div class="alert alert--info">${icon("info")} Стенд работает бессрочно. Можно изменить название и ответственного; адреса VM остаются под управлением IPAM.</div></div>
     </form>`;
     showModal({ title: "Параметры стенда", subtitle: stand.pool_id, body, footer: `<button class="button" data-close-modal type="button">Отмена</button><button class="button button--primary" type="submit" form="stand-edit-form">${icon("check")}Сохранить</button>` });
     modalRoot.querySelector("#stand-edit-form").addEventListener("submit", async event => {
@@ -942,7 +1193,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     input.addEventListener("input", () => { button.disabled = input.value !== stand?.name; });
     button.addEventListener("click", async () => {
       button.disabled = true;
-      try { await api(`/api/stands/${id}`, { method: "DELETE" }); closeModal(); toast(imported ? "Pool отключён; ресурсы Proxmox сохранены" : "Стенд удалён", imported ? "info" : "warning"); await loadData(); }
+      try { await api(`/api/stands/${id}`, { method: "DELETE" }); state.ipam = null; closeModal(); toast(imported ? "Pool отключён; ресурсы Proxmox сохранены" : "Стенд удалён", imported ? "info" : "warning"); await loadData(); }
       catch (error) { button.disabled = false; toast(error.message, "error"); }
     });
   }
@@ -975,6 +1226,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     }
     state.editorDirty = false;
     state.route = route;
+    if (route === "ipam") state.ipam = null;
     window.location.hash = route;
     render();
     document.body.classList.remove("sidebar-open");
@@ -987,19 +1239,39 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     document.querySelector("#sidebar-toggle")?.setAttribute("aria-expanded", "false");
   }
 
+  function standAccessText(standId) {
+    const cached = standCredentialCache.get(Number(standId));
+    if (!cached) return { text: "", complete: 0, total: 0 };
+    let complete = 0;
+    const lines = (cached.stand.vms || []).map(vm => {
+      const credential = cached.credentials.get(Number(vm.vmid));
+      const username = webUsername(credential, vm);
+      const password = credential?.password || credential?.access_password || "пароль не выдан";
+      if (password !== "пароль не выдан") complete += 1;
+      return `${vm.ip || "IP не назначен"} | ${username} | ${password}`;
+    });
+    return { text: lines.join("\n"), complete, total: lines.length };
+  }
+
   async function openVmWeb(button) {
     const accessUrl = safeAccessUrl(button.dataset.url);
     if (!accessUrl) {
       toast("Web URL этой VM ещё не получен", "warning");
       return;
     }
-    window.open(accessUrl, "_blank", "noopener,noreferrer");
-    if (button.dataset.password) {
-      await copyText(`${button.dataset.user}\n${button.dataset.password}`);
-      toast("Страница стенда открыта. Логин и пароль скопированы — вставьте их в форму входа.", "info");
-    } else {
-      toast("Страница стенда открыта. Чтобы скопировать пароль, сначала загрузите защищённые доступы.", "warning");
-    }
+    const username = button.dataset.user || "root@pam";
+    const password = button.dataset.password || "";
+    const windowName = `demoops_vm_${String(button.dataset.vmid || Date.now()).replace(/[^0-9A-Za-z_]/g, "")}`;
+    const ticketUrl = new URL("/api2/html/access/ticket", accessUrl).href;
+    const body = `<div class="tls-access-guide">
+      <div class="tls-access-guide__head">${icon("shield")}<div><h3>${escapeHtml(button.dataset.vmName || "Web-интерфейс стенда")}</h3><p class="mono">${escapeHtml(accessUrl)}</p></div></div>
+      <div class="alert alert--warning">${icon("alert")}<div><strong>Первое открытие может остановиться на предупреждении сертификата.</strong><br>Эту системную страницу браузера нельзя нажать из дашборда автоматически.</div></div>
+      <ol class="tls-steps"><li><span>1</span><div><strong>Откройте адрес и примите риск</strong><small>Firefox: «Дополнительно» → «Принять риск и продолжить». Chrome/Edge: «Дополнительные» → «Перейти на сайт (небезопасно)».</small></div></li><li><span>2</span><div><strong>${password ? "Вернитесь сюда и нажмите «Войти автоматически»" : "Войдите вручную"}</strong><small>${password ? "Дашборд отправит логин и пароль штатной HTML-формой Proxmox в ту же вкладку." : `Используйте логин ${escapeHtml(username)}. Сначала загрузите пароль в карточке VM.`}</small></div></li><li><span>3</span><div><strong>Нажмите «Открыть интерфейс»</strong><small>Вкладка откроется повторно уже с установленной сессией. Если политика браузера заблокировала cookie, используйте кнопки копирования ниже.</small></div></li></ol>
+      <div class="tls-credentials"><div><span>Логин web UI</span><strong class="mono">${escapeHtml(username)}</strong><button class="button button--small" type="button" data-copy-vm-login data-value="${escapeHtml(username)}">${icon("copy")}Копировать логин</button></div><div><span>Пароль</span><strong class="mono" data-vm-secret>${password ? "••••••••••••" : "Не загружен"}</strong>${password ? `<div><button class="button button--small" type="button" data-reveal-vm-password data-password="${escapeHtml(password)}">${icon("eye")}Показать</button><button class="button button--small" type="button" data-copy-vm-password data-value="${escapeHtml(password)}">${icon("copy")}Копировать пароль</button></div>` : ""}</div></div>
+      ${password ? `<button class="button tls-copy-pair" type="button" data-copy-vm-credential data-user="${escapeHtml(username)}" data-password="${escapeHtml(password)}">${icon("copy")}Скопировать логин и пароль</button>` : ""}
+    </div>`;
+    const footer = `<button class="button" type="button" data-launch-vm-web data-url="${escapeHtml(accessUrl)}" data-window="${escapeHtml(windowName)}" data-password="${escapeHtml(password)}">1. Открыть и принять риск</button>${password ? `<button class="button button--primary" type="button" data-auto-login-vm data-url="${escapeHtml(ticketUrl)}" data-window="${escapeHtml(windowName)}" data-user="${escapeHtml(username)}" data-password="${escapeHtml(password)}">${icon("lock")}2. Войти автоматически</button>` : ""}<button class="button" type="button" data-launch-vm-web data-url="${escapeHtml(accessUrl)}" data-window="${escapeHtml(windowName)}" data-copy-password="false">${icon("external")}3. Открыть интерфейс</button>`;
+    showModal({ title: "Переход к стенду", subtitle: "Вход через web-интерфейс Proxmox", body, footer, size: "wide", className: "vm-access-modal" });
   }
 
   document.addEventListener("click", async event => {
@@ -1009,11 +1281,28 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     else if (target.dataset.navigate) navigate(target.dataset.navigate);
     else if (target.dataset.importPool !== undefined) openImportPoolModal();
     else if (target.matches("[data-open-deploy]")) openDeployWizard(target.dataset.openDeploy || null);
+    else if (target.matches("[data-refresh-ipam]")) { state.ipam = null; renderIpam(); await loadIpam({ force: true }); }
     else if (target.matches("[data-refresh]")) loadData();
     else if (target.dataset.standFilter) { state.standFilter = target.dataset.standFilter; renderStands(); }
     else if (target.dataset.standDetail) openStandDetail(Number(target.dataset.standDetail));
     else if (target.dataset.loadStandCredentials) openStandDetail(Number(target.dataset.loadStandCredentials), { requestCredentials: true });
     else if (target.matches("[data-open-vm-stand]")) await openVmWeb(target);
+    else if (target.matches("[data-launch-vm-web]")) {
+      const url = safeAccessUrl(target.dataset.url);
+      if (url) window.open(url, target.dataset.window || "_blank");
+      if (target.dataset.password && target.dataset.copyPassword !== "false") { await copyText(target.dataset.password); toast("Web UI открыт, пароль также скопирован. Примите риск сертификата и вернитесь к шагу 2.", "info"); }
+    }
+    else if (target.matches("[data-auto-login-vm]")) {
+      const ticketUrl = safeAccessUrl(target.dataset.url);
+      if (!ticketUrl || !target.dataset.user || !target.dataset.password) { toast("Нет данных для автоматического входа", "warning"); return; }
+      const form = document.createElement("form");
+      form.method = "POST"; form.action = ticketUrl; form.target = target.dataset.window || "_blank"; form.hidden = true;
+      [["username", target.dataset.user], ["password", target.dataset.password]].forEach(([name, value]) => {
+        const input = document.createElement("input"); input.type = "hidden"; input.name = name; input.value = value; form.append(input);
+      });
+      document.body.append(form); form.submit(); form.remove();
+      toast("Данные отправлены в Proxmox. После ответа нажмите шаг 3 — «Открыть интерфейс».", "info");
+    }
     else if (target.dataset.vmAction) {
       if (target.dataset.busy === "true") return;
       target.dataset.busy = "true"; target.disabled = true;
@@ -1040,7 +1329,31 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     }
     else if (target.dataset.editStand) openStandEditor(Number(target.dataset.editStand));
     else if (target.dataset.deleteStand) confirmDeleteStand(Number(target.dataset.deleteStand));
-    else if (target.matches("[data-reveal-vm-password]")) { const secret = target.closest(".vm-access")?.querySelector("[data-vm-secret]"); if (secret) secret.textContent = target.dataset.password; target.remove(); }
+    else if (target.matches("[data-copy-stand-access]")) {
+      const standId = Number(target.dataset.copyStandAccess);
+      let access = standAccessText(standId);
+      if (!access.total || access.complete < access.total) {
+        try {
+          const cached = standCredentialCache.get(standId);
+          const stand = cached?.stand || await api(`/api/stands/${standId}`, { promptAdmin: false });
+          const credentials = normalizeVmCredentials(await api(`/api/stands/${standId}/credentials`));
+          standCredentialCache.set(standId, { stand, credentials });
+          access = standAccessText(standId);
+          if (activeStandDetailId === standId) {
+            renderStandDetailModal(stand, credentials, "loaded", "", { updateExisting: true });
+          }
+        } catch (error) {
+          toast(error.message, "error");
+          return;
+        }
+      }
+      if (!access.text) { toast("Для этого стенда пока нет VM", "warning"); return; }
+      await copyText(access.text);
+      toast(access.complete === access.total ? `Скопированы доступы ${access.total} VM` : `Скопировано ${access.total} строк; пароли есть у ${access.complete} VM`, access.complete === access.total ? "success" : "warning");
+    }
+    else if (target.matches("[data-reveal-vm-password]")) { const secret = target.closest(".vm-access, .tls-credentials")?.querySelector("[data-vm-secret]"); if (secret) secret.textContent = target.dataset.password; target.remove(); }
+    else if (target.matches("[data-copy-vm-login]")) { await copyText(target.dataset.value || ""); toast("Логин скопирован"); }
+    else if (target.matches("[data-copy-vm-password]")) { await copyText(target.dataset.value || ""); toast("Пароль скопирован"); }
     else if (target.matches("[data-copy-vm-credential]")) { await copyText(`${target.dataset.user}\n${target.dataset.password}`); toast("Логин и пароль VM скопированы"); }
     else if (target.matches("[data-reveal-password]")) { document.querySelector("#one-time-password").textContent = target.dataset.value; target.remove(); }
     else if (target.matches("[data-copy-credential]")) { await copyText(`${target.dataset.user}\n${target.dataset.password}`); toast("Учётные данные скопированы"); }
@@ -1072,6 +1385,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     }
   });
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) syncOperationPolling(); });
   window.addEventListener("resize", () => { if (window.innerWidth > 980) closeSidebar(); });
   window.addEventListener("hashchange", () => { const route = getRoute(); if (route !== state.route) navigate(route); });
   window.addEventListener("beforeunload", event => { if (state.editorDirty) { event.preventDefault(); event.returnValue = ""; } });

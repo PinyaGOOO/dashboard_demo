@@ -121,12 +121,16 @@ class DemoProxmoxGateway:
         nodes = ["pve-01", "pve-02", "pve-03", "pve-04"]
         vm_count = int(blueprint.get("vm_count") or 1)
         credentials = blueprint.get("credentials") if isinstance(blueprint.get("credentials"), list) else []
+        allocated_ips = blueprint.get("allocated_ips") if isinstance(blueprint.get("allocated_ips"), list) else []
         return [
             {
-                "vmid": 2000 + int(stand["id"]) * 10 + index,
+                "index": index,
+                # A stand can contain up to 50 VM.  Keep a 100-ID stride so
+                # neighbouring demo stands never receive the same VMID.
+                "vmid": 2000 + int(stand["id"]) * 100 + index,
                 "name": f"{stand['pool_id']}-{index}",
                 "node": nodes[(int(stand["id"]) + index) % len(nodes)],
-                "ip": self._ip_for(blueprint.get("subnet", ""), index),
+                "ip": str(allocated_ips[index - 1]) if index <= len(allocated_ips) else self._ip_for(blueprint.get("subnet", ""), index),
                 "status": "running",
                 "guest_username": str((credentials[index - 1] if index <= len(credentials) else {}).get("guest_username", "root")),
                 "web_username": str((credentials[index - 1] if index <= len(credentials) else {}).get("web_username", "root@pam")),
@@ -140,19 +144,28 @@ class DemoProxmoxGateway:
     @staticmethod
     def _ip_for(subnet: str, index: int) -> str:
         try:
-            network = ipaddress.ip_network(str(subnet), strict=False)
+            interface = ipaddress.ip_interface(str(subnet))
         except ValueError:
             return ""
-        if network.version != 4:
+        if interface.version != 4:
             return ""
-        if network.prefixlen >= 31:
-            offset = index - 1
-        else:
-            preferred = 39 + index
-            offset = preferred if preferred < network.num_addresses - 1 else index
-        candidate = int(network.network_address) + offset
-        last_usable = int(network.broadcast_address) if network.prefixlen >= 31 else int(network.broadcast_address) - 1
-        return str(ipaddress.ip_address(candidate)) if candidate <= last_usable else ""
+        network = interface.network
+        candidate = int(interface.ip)
+        if network.prefixlen <= 30 and candidate in {
+            int(network.network_address), int(network.broadcast_address),
+        }:
+            candidate = int(network.network_address) + 1
+        remaining = max(1, index)
+        while candidate <= int(network.broadcast_address):
+            boundary = network.prefixlen <= 30 and candidate in {
+                int(network.network_address), int(network.broadcast_address),
+            }
+            if not boundary:
+                remaining -= 1
+                if remaining == 0:
+                    return str(ipaddress.ip_address(candidate))
+            candidate += 1
+        return ""
 
     def power_action(self, vmids: list[int], action: str) -> None:
         time.sleep(0.25)
@@ -517,6 +530,7 @@ class LiveProxmoxGateway:
                 target_nodes = [requested_node]
             vm_count = int(blueprint.get("vm_count") or 1)
             credentials = blueprint.get("credentials") if isinstance(blueprint.get("credentials"), list) else []
+            allocated_ips = blueprint.get("allocated_ips") if isinstance(blueprint.get("allocated_ips"), list) else []
             plans: list[dict[str, Any]] = []
             clone_tasks: list[tuple[str, str]] = []
             clone_batch = self._batch_limit("PROXMOX_CLONE_BATCH")
@@ -529,7 +543,11 @@ class LiveProxmoxGateway:
                 new_vmid = int(self.client.cluster.nextid.get())
                 created.append((target_node, new_vmid))
                 name = f"{pool_id}-{index}"
-                vm_ip = DemoProxmoxGateway._ip_for(str(blueprint.get("subnet", "")), index)
+                vm_ip = (
+                    str(allocated_ips[index - 1])
+                    if index <= len(allocated_ips)
+                    else DemoProxmoxGateway._ip_for(str(blueprint.get("subnet", "")), index)
+                )
                 credential = dict(credentials[index - 1]) if index <= len(credentials) and isinstance(credentials[index - 1], dict) else {}
                 if not credential.get("password"):
                     credential["password"] = base64.urlsafe_b64encode(os.urandom(15)).decode("ascii").rstrip("=")[:18]
@@ -615,7 +633,7 @@ class LiveProxmoxGateway:
                 )
                 changed_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
                 return {
-                    "vmid": new_vmid, "name": str(plan["name"]), "node": target_node,
+                    "index": index, "vmid": new_vmid, "name": str(plan["name"]), "node": target_node,
                     "ip": vm_ip, "status": "running", "guest_username": guest_username,
                     "web_username": str(credential.get("web_username") or "root@pam"),
                     "password": password, "password_updated_at": changed_at,

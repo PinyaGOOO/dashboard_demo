@@ -83,6 +83,131 @@ class DashboardService:
             pool["stand_id"] = stand_id
         return pools
 
+    @staticmethod
+    def _canonical_ip(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            address = ipaddress.ip_interface(text).ip
+        except ValueError:
+            return ""
+        return str(address) if address.version == 4 else ""
+
+    @staticmethod
+    def _ipam_plan(
+        connection: Any,
+        requested_cidr: str,
+        start_ip: str,
+        count: int,
+    ) -> tuple[str, int, list[str]]:
+        """Allocate IPv4 addresses atomically, retaining the entered host part.
+
+        ``ip_network(..., strict=False)`` loses the host part of a CIDR.  An
+        interface keeps it, so 10.39.4.0/16 starts at 10.39.4.0 instead of
+        silently becoming 10.39.0.0.  Only the *actual* /16 network and
+        broadcast addresses are skipped.
+        """
+        if not requested_cidr:
+            if start_ip:
+                raise ValidationError("Для начального IP укажите IPv4 CIDR")
+            return "", 0, []
+        try:
+            interface = ipaddress.ip_interface(requested_cidr)
+        except ValueError as exc:
+            raise ValidationError(
+                "Диапазон должен быть в формате IPv4 CIDR, например 10.39.4.0/16"
+            ) from exc
+        if interface.version != 4:
+            raise ValidationError("Для развёртывания поддерживается только IPv4")
+        network = interface.network
+        if start_ip:
+            try:
+                start = ipaddress.ip_interface(start_ip).ip
+            except ValueError as exc:
+                raise ValidationError("Начальный IP должен быть корректным IPv4-адресом") from exc
+            if start.version != 4 or start not in network:
+                raise ValidationError("Начальный IP должен входить в указанный CIDR")
+        else:
+            start = interface.ip
+
+        if network.prefixlen <= 30 and int(start) in {
+            int(network.network_address), int(network.broadcast_address),
+        }:
+            # A boundary entered as the start is a pool hint, not an address
+            # assignment.  In both cases begin at the first usable host.
+            start = ipaddress.ip_address(int(network.network_address) + 1)
+
+        used: set[str] = {
+            str(row[0])
+            for row in connection.execute("SELECT address FROM ipam_reservations").fetchall()
+        }
+        # Include legacy/imported VM rows even if an older installation could
+        # not backfill them into IPAM because it already contained a duplicate.
+        for row in connection.execute("SELECT ip FROM stand_vms WHERE trim(ip) != ''").fetchall():
+            canonical = DashboardService._canonical_ip(row[0])
+            if canonical:
+                used.add(canonical)
+
+        allocated: list[str] = []
+        candidate = int(start)
+        end = int(network.broadcast_address)
+        actual_network = int(network.network_address)
+        actual_broadcast = int(network.broadcast_address)
+        while candidate <= end and len(allocated) < count:
+            # RFC 3021 makes both /31 addresses usable; /32 is also a valid
+            # single-host route.  For wider networks, skip only their genuine
+            # network/broadcast boundaries.
+            boundary = network.prefixlen <= 30 and candidate in {actual_network, actual_broadcast}
+            address = str(ipaddress.ip_address(candidate))
+            if not boundary and address not in used:
+                allocated.append(address)
+                used.add(address)
+            candidate += 1
+        if len(allocated) != count:
+            raise ConflictError(
+                "Начиная с указанного IP недостаточно свободных адресов в CIDR для всех VM"
+            )
+        return str(start), int(network.prefixlen), allocated
+
+    def list_ipam(self) -> dict[str, Any]:
+        reservations = self.store.query_all(
+            """SELECT r.*, s.name AS stand_name, s.status AS stand_status,
+                      v.vmid, v.name AS vm_name, v.node AS vm_node
+            FROM ipam_reservations r
+            JOIN stands s ON s.id = r.stand_id
+            LEFT JOIN stand_vms v ON v.id = r.stand_vm_id
+            ORDER BY r.requested_cidr, r.stand_id, r.vm_index"""
+        )
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for reservation in reservations:
+            grouped.setdefault(str(reservation["requested_cidr"]), []).append(reservation)
+        pools: list[dict[str, Any]] = []
+        for requested_cidr, items in grouped.items():
+            ordered = sorted(items, key=lambda item: int(ipaddress.ip_address(item["address"])))
+            pools.append({
+                "requested_cidr": requested_cidr,
+                "prefix_length": int(items[0]["prefix_length"]),
+                "first_address": ordered[0]["address"],
+                "last_address": ordered[-1]["address"],
+                "reservations": len(items),
+                "assigned": sum(1 for item in items if item["status"] == "assigned"),
+                "stands": len({int(item["stand_id"]) for item in items}),
+            })
+        assigned = sum(1 for item in reservations if item["status"] == "assigned")
+        reserved = len(reservations) - assigned
+        return {
+            "summary": {
+                "total": len(reservations),
+                "reserved": reserved,
+                "assigned": assigned,
+                "stands": len({int(item["stand_id"]) for item in reservations}),
+                "pools": len(pools),
+            },
+            "reservations": reservations,
+            "pools": pools,
+        }
+
     def list_blueprints(self) -> list[dict[str, Any]]:
         return self.store.query_all("SELECT * FROM blueprints ORDER BY status = 'draft', updated_at DESC")
 
@@ -306,8 +431,17 @@ class DashboardService:
         cpu = round(sum(float(member.get("cpu") or 0) for member in members), 1)
         ram_values = [float(member.get("ram") or 0) for member in members]
         ram = round(sum(ram_values) / max(len(ram_values), 1), 1)
+        member_addresses = [self._canonical_ip(member.get("ip", "")) for member in members]
+        nonempty_addresses = [address for address in member_addresses if address]
+        if len(nonempty_addresses) != len(set(nonempty_addresses)):
+            raise ConflictError("В импортируемом pool один IP указан у нескольких VM")
         now = utc_now()
         with self.store.transaction() as connection:
+            for address in nonempty_addresses:
+                if connection.execute(
+                    "SELECT stand_id FROM ipam_reservations WHERE address = ?", (address,),
+                ).fetchone():
+                    raise ConflictError(f"IP {address} уже зарезервирован другим стендом")
             cursor = connection.execute(
                 """INSERT INTO stands
                 (name, blueprint_id, status, progress, node, pool_id, owner,
@@ -318,14 +452,24 @@ class DashboardService:
                  len(members), cpu, ram, now, now),
             )
             stand_id = int(cursor.lastrowid)
-            for member in members:
-                connection.execute(
+            for index, member in enumerate(members, 1):
+                address = member_addresses[index - 1]
+                vm_cursor = connection.execute(
                     """INSERT INTO stand_vms (stand_id, vmid, name, node, ip, status, cpu, ram)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     (stand_id, member["vmid"], member["name"], member.get("node", ""),
-                     member.get("ip", ""), member.get("status", "stopped"),
+                     address or member.get("ip", ""), member.get("status", "stopped"),
                      member.get("cpu", 0), member.get("ram", 0)),
                 )
+                if address:
+                    connection.execute(
+                        """INSERT INTO ipam_reservations
+                        (stand_id, stand_vm_id, address, requested_cidr, prefix_length,
+                         vm_index, status, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, 32, ?, 'assigned', ?, ?)""",
+                        (stand_id, int(vm_cursor.lastrowid), address, f"{address}/32",
+                         index, now, now),
+                    )
         self.store.add_activity("import", "Существующий pool добавлен", f"{pool_id} · {len(members)} VM · {blueprint['name']}", "success")
         return self.get_stand(stand_id)
 
@@ -341,9 +485,6 @@ class DashboardService:
         if not name:
             raise ValidationError("Укажите название стенда")
         pool_id = self._pool_id(str(payload.get("pool_id", "")) or f"exam-{int(time.time())}")
-        existing = self.store.query_one("SELECT id FROM stands WHERE pool_id = ?", (pool_id,))
-        if existing:
-            raise ConflictError("Pool ID уже используется")
         try:
             vm_count = int(payload.get("vm_count", 1))
         except (TypeError, ValueError) as exc:
@@ -351,16 +492,7 @@ class DashboardService:
         if not 1 <= vm_count <= 50:
             raise ValidationError("Количество VM должно быть от 1 до 50")
         subnet = str(payload.get("subnet", "")).strip()
-        if subnet:
-            try:
-                network = ipaddress.ip_network(subnet, strict=False)
-            except ValueError as exc:
-                raise ValidationError("Подсеть должна быть в формате IPv4 CIDR, например 10.39.10.0/24") from exc
-            if network.version != 4:
-                raise ValidationError("Для развёртывания поддерживается только IPv4-подсеть")
-            usable = network.num_addresses if network.prefixlen >= 31 else max(0, network.num_addresses - 2)
-            if usable < vm_count:
-                raise ValidationError("В выбранной подсети недостаточно адресов для указанного количества VM")
+        start_ip = str(payload.get("start_ip", "")).strip()
         bridge = str(payload.get("bridge", "")).strip()
         if bridge and not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", bridge):
             raise ValidationError("Некорректное имя сетевого bridge")
@@ -370,30 +502,67 @@ class DashboardService:
         web_username = str(payload.get("web_username", "root@pam")).strip() or "root@pam"
         if not re.fullmatch(r"[^\x00-\x1f\x7f]{1,128}", web_username):
             raise ValidationError("Некорректный логин веб-интерфейса VM")
+        credentials = [
+            {
+                "guest_username": credential_username,
+                "web_username": web_username,
+                "password": self._password(),
+            }
+            for _ in range(vm_count)
+        ]
         now = utc_now()
-        stand_id = self.store.execute(
-            """INSERT INTO stands
-            (name, blueprint_id, status, progress, node, pool_id, owner,
-             vm_count, cpu, ram, disk, ip_range, check_status, expires_at, created_at, updated_at)
-            VALUES (?, ?, 'provisioning', 4, ?, ?, ?, ?, 0, 0, 0, ?, 'idle', ?, ?, ?)""",
-            (name, blueprint_id, str(payload.get("node", "auto")), pool_id, str(payload.get("owner", "Администратор")),
-             vm_count, subnet, None, now, now),
-        )
+        requested_node = str(payload.get("node", "auto"))
+        owner = str(payload.get("owner", "Администратор"))
+        # The stand, placeholder VM rows and addresses are committed together.
+        # Concurrent requests therefore cannot reserve the same address.
+        with self.store.transaction() as connection:
+            if connection.execute("SELECT id FROM stands WHERE pool_id = ?", (pool_id,)).fetchone():
+                raise ConflictError("Pool ID уже используется")
+            canonical_start, prefix_length, allocated_ips = self._ipam_plan(
+                connection, subnet, start_ip, vm_count,
+            )
+            cursor = connection.execute(
+                """INSERT INTO stands
+                (name, blueprint_id, status, progress, node, pool_id, owner,
+                 vm_count, cpu, ram, disk, ip_range, ip_start, check_status,
+                 expires_at, created_at, updated_at)
+                VALUES (?, ?, 'provisioning', 4, ?, ?, ?, ?, 0, 0, 0, ?, ?, 'idle', ?, ?, ?)""",
+                (name, blueprint_id, requested_node, pool_id, owner, vm_count,
+                 subnet, canonical_start, None, now, now),
+            )
+            stand_id = int(cursor.lastrowid)
+            for index in range(1, vm_count + 1):
+                ip = allocated_ips[index - 1] if index <= len(allocated_ips) else ""
+                credential = credentials[index - 1]
+                vm_cursor = connection.execute(
+                    """INSERT INTO stand_vms
+                    (stand_id, vmid, name, node, ip, status, cpu, ram,
+                     credential_username, web_username, credential_password,
+                     password_updated_at, check_status)
+                    VALUES (?, NULL, ?, ?, ?, 'provisioning', 0, 0, ?, ?, ?, NULL, 'idle')""",
+                    (stand_id, f"{pool_id}-{index}", requested_node, ip,
+                     credential["guest_username"], credential["web_username"],
+                     credential["password"]),
+                )
+                if ip:
+                    connection.execute(
+                        """INSERT INTO ipam_reservations
+                        (stand_id, stand_vm_id, address, requested_cidr,
+                         prefix_length, vm_index, status, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, 'reserved', ?, ?)""",
+                        (stand_id, int(vm_cursor.lastrowid), ip, subnet,
+                         prefix_length, index, now, now),
+                    )
         deployment = dict(blueprint)
         deployment.update({
             "vm_count": vm_count,
             "subnet": subnet,
+            "start_ip": canonical_start,
+            "allocated_ips": allocated_ips,
             "bridge": bridge,
             "clone_type": "linked",
             "storage": "",
-            "credentials": [
-                {
-                    "guest_username": credential_username,
-                    "web_username": web_username,
-                    "password": self._password(),
-                }
-                for _ in range(vm_count)
-            ],
+            "credentials": credentials,
         })
         self.store.add_activity("deploy", "Развёртывание запущено", f"{name} · {blueprint['name']} · {vm_count} VM", "progress")
         thread = threading.Thread(
@@ -409,7 +578,12 @@ class DashboardService:
 
     def update_stand(self, stand_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         stand = self.get_stand(stand_id)
-        allowed = {"name", "owner", "ip_range"}
+        if "ip_range" in payload and str(payload["ip_range"]).strip() != str(stand.get("ip_range") or "").strip():
+            raise ValidationError(
+                "Диапазон работающего стенда управляется IPAM и не редактируется как метаданные. "
+                "Для другой адресации разверните новый стенд."
+            )
+        allowed = {"name", "owner"}
         data = {key: payload[key] for key in allowed if key in payload}
         if "name" in data and not str(data["name"]).strip():
             raise ValidationError("Название стенда не может быть пустым")
@@ -434,30 +608,151 @@ class DashboardService:
                     {"guest_username": "root", "web_username": "root@pam", "password": self._password()}
                     for _ in range(vm_count)
                 ]
+            if not isinstance(blueprint.get("allocated_ips"), list):
+                blueprint["allocated_ips"] = [
+                    row["address"]
+                    for row in self.store.query_all(
+                        "SELECT address FROM ipam_reservations WHERE stand_id = ? ORDER BY vm_index",
+                        (stand_id,),
+                    )
+                ]
 
             def progress(value: int, message: str) -> None:
                 self.store.execute("UPDATE stands SET progress = ?, updated_at = ? WHERE id = ?", (value, utc_now(), stand_id))
-                if value in {31, 72, 100}:
-                    self.store.add_activity("deploy", message, stand["name"], "progress" if value < 100 else "success", "Система")
+                if value in {31, 72}:
+                    self.store.add_activity("deploy", message, stand["name"], "progress", "Система")
 
             vms = self.gateway.deploy(stand, blueprint, progress)
-            self.store.execute("DELETE FROM stand_vms WHERE stand_id = ?", (stand_id,))
-            for vm in vms:
-                self.store.execute(
-                    """INSERT INTO stand_vms
-                    (stand_id, vmid, name, node, ip, status, cpu, ram, credential_username,
-                     web_username, credential_password, password_updated_at, last_snapshot,
-                     has_start_snapshot)
-                    VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        stand_id, vm.get("vmid"), vm["name"], vm.get("node", ""),
-                        vm.get("ip", ""), vm.get("status", "running"),
+            validation_error = ""
+            normalized_vms: list[dict[str, Any]] = []
+            if not isinstance(vms, list):
+                validation_error = "gateway вернул результат не в виде списка"
+            else:
+                indexes: list[int] = []
+                vmids: list[int] = []
+                try:
+                    for ordinal, raw_vm in enumerate(vms, 1):
+                        if not isinstance(raw_vm, dict):
+                            raise ValueError(f"элемент {ordinal} не является объектом VM")
+                        vm = dict(raw_vm)
+                        vm_index = int(vm.get("index") or ordinal)
+                        vmid = int(vm.get("vmid"))
+                        if vmid <= 0:
+                            raise ValueError(f"VM #{vm_index} вернула некорректный VMID")
+                        if not str(vm.get("name") or "").strip():
+                            raise ValueError(f"VM #{vm_index} вернула пустое имя")
+                        vm["index"] = vm_index
+                        vm["vmid"] = vmid
+                        indexes.append(vm_index)
+                        vmids.append(vmid)
+                        normalized_vms.append(vm)
+                    expected_indexes = set(range(1, vm_count + 1))
+                    if len(normalized_vms) != vm_count:
+                        raise ValueError(
+                            f"ожидалось {vm_count} VM, получено {len(normalized_vms)}"
+                        )
+                    if set(indexes) != expected_indexes or len(indexes) != len(set(indexes)):
+                        raise ValueError("gateway вернул неполный или повторяющийся набор индексов VM")
+                    if len(vmids) != len(set(vmids)):
+                        raise ValueError("gateway вернул повторяющиеся VMID")
+                except (TypeError, ValueError) as exc:
+                    validation_error = str(exc)
+            if validation_error:
+                cleanup_vmids: list[int] = []
+                for raw_vm in vms if isinstance(vms, list) else []:
+                    try:
+                        vmid = int(raw_vm.get("vmid")) if isinstance(raw_vm, dict) else 0
+                    except (TypeError, ValueError):
+                        vmid = 0
+                    if vmid > 0 and vmid not in cleanup_vmids:
+                        cleanup_vmids.append(vmid)
+                cleanup_vmids.sort()
+                cleanup_error = ""
+                try:
+                    self.gateway.delete_stand(stand, cleanup_vmids)
+                except Exception as exc:
+                    cleanup_error = f"; автоматический откат также завершился ошибкой: {exc}"
+                raise RuntimeError(f"Неполный результат развёртывания: {validation_error}{cleanup_error}")
+            vms = normalized_vms
+            with self.store.transaction() as connection:
+                placeholder_rows = connection.execute(
+                    "SELECT * FROM stand_vms WHERE stand_id = ? ORDER BY id", (stand_id,),
+                ).fetchall()
+                reservations = {
+                    int(row["vm_index"]): row
+                    for row in connection.execute(
+                        "SELECT * FROM ipam_reservations WHERE stand_id = ? ORDER BY vm_index",
+                        (stand_id,),
+                    ).fetchall()
+                }
+                for ordinal, vm in enumerate(vms, 1):
+                    vm_index = int(vm.get("index") or ordinal)
+                    reservation = reservations.get(vm_index)
+                    stand_vm_id = (
+                        int(reservation["stand_vm_id"])
+                        if reservation and reservation["stand_vm_id"] is not None
+                        else int(placeholder_rows[vm_index - 1]["id"])
+                        if vm_index <= len(placeholder_rows)
+                        else 0
+                    )
+                    assigned_ip = str(reservation["address"]) if reservation else str(vm.get("ip", ""))
+                    values = (
+                        vm.get("vmid"), vm["name"], vm.get("node", ""), assigned_ip,
+                        vm.get("status", "running"),
                         vm.get("guest_username", vm.get("username", "root")),
                         vm.get("web_username", "root@pam"), vm.get("password", ""),
                         vm.get("password_updated_at"), vm.get("last_snapshot", "start"),
                         1 if vm.get("last_snapshot", "start") == "start" else 0,
-                    ),
-                )
+                    )
+                    if stand_vm_id:
+                        connection.execute(
+                            """UPDATE stand_vms SET vmid = ?, name = ?, node = ?, ip = ?,
+                            status = ?, cpu = 0, ram = 0, credential_username = ?,
+                            web_username = ?, credential_password = ?, password_updated_at = ?,
+                            last_snapshot = ?, has_start_snapshot = ? WHERE id = ?""",
+                            values + (stand_vm_id,),
+                        )
+                    else:
+                        cursor = connection.execute(
+                            """INSERT INTO stand_vms
+                            (stand_id, vmid, name, node, ip, status, cpu, ram,
+                             credential_username, web_username, credential_password,
+                             password_updated_at, last_snapshot, has_start_snapshot)
+                            VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?)""",
+                            (stand_id,) + values,
+                        )
+                        stand_vm_id = int(cursor.lastrowid)
+                    if reservation:
+                        connection.execute(
+                            """UPDATE ipam_reservations SET stand_vm_id = ?, status = 'assigned',
+                            updated_at = ? WHERE id = ?""",
+                            (stand_vm_id, utc_now(), reservation["id"]),
+                        )
+                    elif self._canonical_ip(assigned_ip):
+                        address = self._canonical_ip(assigned_ip)
+                        requested_cidr = str(stand.get("ip_range") or "").strip()
+                        try:
+                            requested_interface = ipaddress.ip_interface(requested_cidr)
+                            if ipaddress.ip_address(address) not in requested_interface.network:
+                                raise ValueError
+                        except ValueError:
+                            requested_cidr = str(blueprint.get("subnet") or "").strip()
+                            try:
+                                requested_interface = ipaddress.ip_interface(requested_cidr)
+                                if ipaddress.ip_address(address) not in requested_interface.network:
+                                    raise ValueError
+                            except ValueError:
+                                requested_cidr = f"{address}/32"
+                                requested_interface = ipaddress.ip_interface(requested_cidr)
+                        connection.execute(
+                            """INSERT INTO ipam_reservations
+                            (stand_id, stand_vm_id, address, requested_cidr,
+                             prefix_length, vm_index, status, created_at, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, 'assigned', ?, ?)""",
+                            (stand_id, stand_vm_id, address, requested_cidr,
+                             requested_interface.network.prefixlen, vm_index,
+                             utc_now(), utc_now()),
+                        )
             primary_node = vms[0].get("node", "") if vms else ""
             password_updated_at = utc_now() if any(vm.get("password") for vm in vms) else None
             self.store.execute(
@@ -466,10 +761,17 @@ class DashboardService:
                 updated_at = ? WHERE id = ?""",
                 (primary_node, password_updated_at, utc_now(), stand_id),
             )
+            self.store.add_activity(
+                "deploy", "Стенд развёрнут", f"{stand['name']} · {vm_count} VM", "success", "Система",
+            )
         except Exception as exc:
             self.store.execute(
                 "UPDATE stands SET status = 'error', last_error = ?, updated_at = ? WHERE id = ?",
                 (str(exc)[-1000:], utc_now(), stand_id),
+            )
+            self.store.execute(
+                "UPDATE stand_vms SET status = 'error' WHERE stand_id = ? AND vmid IS NULL",
+                (stand_id,),
             )
             self.store.add_activity("deploy", "Ошибка развёртывания", f"Стенд #{stand_id}: {exc}", "error", "Система")
         finally:
@@ -620,6 +922,15 @@ class DashboardService:
                     "password": password, "reveal_once": True,
                 },
             }
+        if action == "run_check":
+            run = self.start_vm_check(stand_id, vmid)
+            refreshed = self.get_stand(stand_id)
+            return {
+                "stand": refreshed,
+                "vm": next(item for item in refreshed["vms"] if int(item.get("vmid") or -1) == vmid),
+                "message": f"Автопроверка VM {vmid} запущена",
+                "run": run,
+            }
         raise ValidationError("Неизвестное действие VM")
 
     @staticmethod
@@ -636,6 +947,8 @@ class DashboardService:
             raise ConflictError("Нельзя удалить стенд во время развёртывания")
         if stand["check_status"] == "running":
             raise ConflictError("Нельзя удалить стенд во время автопроверки")
+        if any(vm.get("check_status") == "running" for vm in stand["vms"]):
+            raise ConflictError("Нельзя удалить стенд во время автопроверки VM")
         vmids = [int(vm["vmid"]) for vm in stand["vms"] if vm.get("vmid") is not None]
         imported = str(stand.get("origin") or "deployed") == "imported"
         resources_already_rolled_back = stand["status"] == "error" and not vmids
@@ -762,11 +1075,20 @@ class DashboardService:
                 raise ConflictError("Автопроверка доступна только для запущенного стенда")
             if stand["check_status"] == "running":
                 raise ConflictError("На стенде уже выполняется автопроверка")
+            vm_check_count = connection.execute(
+                "SELECT COUNT(*) FROM stand_vms WHERE stand_id = ? AND check_status = 'running'",
+                (stand_id,),
+            ).fetchone()[0]
+            if int(vm_check_count):
+                raise ConflictError("На одной из VM уже выполняется автопроверка")
             vm_count = connection.execute(
                 "SELECT COUNT(*) FROM stand_vms WHERE stand_id = ? AND vmid IS NOT NULL", (stand_id,),
             ).fetchone()[0]
             if int(vm_count) == 0:
                 raise ConflictError("В стенде нет VM для автопроверки")
+            autocheck_script = str(stand["autocheck_script"] or "")
+            if not autocheck_script.strip():
+                raise ConflictError("Скрипт автопроверки сценария пуст")
             cursor = connection.execute(
                 """INSERT INTO check_runs (stand_id, blueprint_id, status, details, output, started_at)
                 VALUES (?, ?, 'running', '[]', 'Подключение к VM…', ?)""",
@@ -777,7 +1099,6 @@ class DashboardService:
                 "UPDATE stands SET check_status = 'running', updated_at = ? WHERE id = ?", (started, stand_id),
             )
             stand_name = str(stand["name"])
-            autocheck_script = str(stand["autocheck_script"] or "")
         self.store.add_activity("check", "Автопроверка запущена", stand_name, "progress")
         threading.Thread(
             target=self._check_job,
@@ -786,6 +1107,103 @@ class DashboardService:
             daemon=True,
         ).start()
         return self.store.query_one("SELECT * FROM check_runs WHERE id = ?", (run_id,)) or {}
+
+    def start_vm_check(self, stand_id: int, vmid: int) -> dict[str, Any]:
+        started = utc_now()
+        with self.store.transaction() as connection:
+            row = connection.execute(
+                """SELECT s.name AS stand_name, s.blueprint_id, s.status AS stand_status,
+                          s.check_status AS stand_check_status, v.id AS stand_vm_id,
+                          v.name AS vm_name, v.status AS vm_status, v.check_status,
+                          b.autocheck_script
+                FROM stands s
+                JOIN stand_vms v ON v.stand_id = s.id
+                LEFT JOIN blueprints b ON b.id = s.blueprint_id
+                WHERE s.id = ? AND v.vmid = ?""",
+                (stand_id, vmid),
+            ).fetchone()
+            if not row:
+                raise NotFoundError("VM не найдена в этом стенде")
+            if row["stand_status"] != "running" or row["vm_status"] != "running":
+                raise ConflictError("Автопроверка доступна только для запущенной VM")
+            if row["stand_check_status"] == "running":
+                raise ConflictError("Сейчас выполняется общая автопроверка стенда")
+            if row["check_status"] == "running":
+                raise ConflictError("На этой VM уже выполняется автопроверка")
+            script = str(row["autocheck_script"] or "")
+            if not script.strip():
+                raise ConflictError("Скрипт автопроверки сценария пуст")
+            cursor = connection.execute(
+                """INSERT INTO check_runs
+                (stand_id, vmid, blueprint_id, status, details, output, started_at)
+                VALUES (?, ?, ?, 'running', '[]', 'Подключение к VM…', ?)""",
+                (stand_id, vmid, row["blueprint_id"], started),
+            )
+            run_id = int(cursor.lastrowid)
+            connection.execute(
+                """UPDATE stand_vms SET check_status = 'running', last_check = ?
+                WHERE id = ?""",
+                (started, row["stand_vm_id"]),
+            )
+            stand_name = str(row["stand_name"])
+            vm_name = str(row["vm_name"])
+        self.store.add_activity(
+            "check", "Автопроверка VM запущена",
+            f"{stand_name} · {vm_name} (VM {vmid})", "progress",
+        )
+        threading.Thread(
+            target=self._vm_check_job,
+            args=(run_id, stand_id, vmid, script),
+            name=f"vm-check-{run_id}",
+            daemon=True,
+        ).start()
+        return self.store.query_one("SELECT * FROM check_runs WHERE id = ?", (run_id,)) or {}
+
+    def _vm_check_job(self, run_id: int, stand_id: int, vmid: int, script: str) -> None:
+        started = time.monotonic()
+        try:
+            details = self.gateway.run_autocheck([vmid], script)
+            total = max(len(details), 1)
+            passed = sum(1 for item in details if item.get("ok"))
+            score = round(passed / total * 100)
+            status = "passed" if score >= 90 else "warning" if score >= 70 else "failed"
+            finished = utc_now()
+            duration = round((time.monotonic() - started) * 1000)
+            output = f"{passed}/{total} проверок пройдено"
+            with self.store.transaction() as connection:
+                connection.execute(
+                    """UPDATE check_runs SET status = ?, score = ?, passed = ?, total = ?,
+                    duration_ms = ?, details = ?, output = ?, finished_at = ? WHERE id = ?""",
+                    (status, score, passed, total, duration,
+                     json.dumps(details, ensure_ascii=False), output, finished, run_id),
+                )
+                connection.execute(
+                    """UPDATE stand_vms SET check_score = ?, check_status = ?, last_check = ?
+                    WHERE stand_id = ? AND vmid = ?""",
+                    (score, status, finished, stand_id, vmid),
+                )
+            stand = self.get_stand(stand_id)
+            self.store.add_activity(
+                "check", "Автопроверка VM завершена",
+                f"{stand['name']} · VM {vmid} · результат {score}%",
+                "success" if score >= 90 else "warning", "Система",
+            )
+        except Exception as exc:
+            finished = utc_now()
+            with self.store.transaction() as connection:
+                connection.execute(
+                    "UPDATE check_runs SET status = 'failed', output = ?, finished_at = ? WHERE id = ?",
+                    (str(exc)[-1000:], finished, run_id),
+                )
+                connection.execute(
+                    """UPDATE stand_vms SET check_status = 'failed', last_check = ?
+                    WHERE stand_id = ? AND vmid = ?""",
+                    (finished, stand_id, vmid),
+                )
+            self.store.add_activity(
+                "check", "Ошибка автопроверки VM",
+                f"Стенд #{stand_id} · VM {vmid}: {exc}", "error", "Система",
+            )
 
     def _check_job(self, run_id: int, stand_id: int, autocheck_script: str) -> None:
         started = time.monotonic()
