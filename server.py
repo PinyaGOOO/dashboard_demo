@@ -58,8 +58,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
     def do_DELETE(self) -> None:
         self._handle_api("DELETE")
 
-    def _authorized(self, method: str) -> bool:
-        if method == "GET" or not self.admin_token:
+    def _authorized(self, method: str, *, sensitive: bool = False) -> bool:
+        if (method == "GET" and not sensitive) or not self.admin_token:
             return True
         return secrets_compare(self.headers.get("X-Admin-Token", ""), self.admin_token)
 
@@ -91,12 +91,13 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self.wfile.write(encoded)
 
     def _handle_api(self, method: str) -> None:
-        if not self._authorized(method):
-            self._json({"error": "Неверный административный токен", "code": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
-            return
         parsed = urlparse(self.path)
         parts = [part for part in parsed.path.strip("/").split("/") if part]
         query = parse_qs(parsed.query)
+        sensitive = method == "GET" and bool(parts) and parts[-1] == "credentials"
+        if not self._authorized(method, sensitive=sensitive):
+            self._json({"error": "Неверный административный токен", "code": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
+            return
         try:
             if parts == ["api", "health"] and method == "GET":
                 self._json({"status": "ok", "integration": self.service.integration()})
@@ -136,6 +137,13 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self.service.delete_stand(int(parts[2])); self._json({"ok": True})
             elif len(parts) == 4 and parts[:2] == ["api", "stands"] and parts[3] == "actions" and method == "POST":
                 body = self._body(); self._json(self.service.stand_action(int(parts[2]), str(body.get("action", "")), body))
+            elif len(parts) == 4 and parts[:2] == ["api", "stands"] and parts[3] == "credentials" and method == "GET":
+                self._json(self.service.stand_credentials(int(parts[2])))
+            elif len(parts) == 6 and parts[:2] == ["api", "stands"] and parts[3] == "vms" and parts[5] == "actions" and method == "POST":
+                body = self._body()
+                self._json(self.service.vm_action(int(parts[2]), int(parts[4]), str(body.get("action", "")), body))
+            elif len(parts) == 6 and parts[:2] == ["api", "stands"] and parts[3] == "vms" and parts[5] == "credentials" and method == "GET":
+                self._json(self.service.vm_credentials(int(parts[2]), int(parts[4])))
             elif parts == ["api", "checks"] and method == "GET":
                 self._json(self.service.list_checks())
             elif parts == ["api", "checks", "run"] and method == "POST":

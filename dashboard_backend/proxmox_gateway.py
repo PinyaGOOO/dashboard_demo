@@ -10,6 +10,7 @@ import shlex
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -115,10 +116,11 @@ class DemoProxmoxGateway:
     def deploy(self, stand: dict[str, Any], blueprint: dict[str, Any], progress: ProgressCallback) -> list[dict[str, Any]]:
         steps = [(14, "Создаём пул"), (31, "Клонируем шаблон"), (54, "Настраиваем сеть"), (72, "Запускаем guest agent"), (89, "Проверяем конфигурацию"), (100, "Стенд готов")]
         for value, message in steps:
-            time.sleep(0.55)
+            time.sleep(0.08)
             progress(value, message)
         nodes = ["pve-01", "pve-02", "pve-03", "pve-04"]
         vm_count = int(blueprint.get("vm_count") or 1)
+        credentials = blueprint.get("credentials") if isinstance(blueprint.get("credentials"), list) else []
         return [
             {
                 "vmid": 2000 + int(stand["id"]) * 10 + index,
@@ -126,6 +128,11 @@ class DemoProxmoxGateway:
                 "node": nodes[(int(stand["id"]) + index) % len(nodes)],
                 "ip": self._ip_for(blueprint.get("subnet", ""), index),
                 "status": "running",
+                "guest_username": str((credentials[index - 1] if index <= len(credentials) else {}).get("guest_username", "root")),
+                "web_username": str((credentials[index - 1] if index <= len(credentials) else {}).get("web_username", "root@pam")),
+                "password": str((credentials[index - 1] if index <= len(credentials) else {}).get("password", "")),
+                "password_updated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+                "last_snapshot": "start",
             }
             for index in range(1, vm_count + 1)
         ]
@@ -278,6 +285,60 @@ class LiveProxmoxGateway:
             time.sleep(1)
         raise TimeoutError("Истекло время ожидания задачи Proxmox")
 
+    def _wait_tasks(self, tasks: list[tuple[str, str]], timeout: int = 1800) -> None:
+        """Wait for already submitted Proxmox tasks as one parallel batch."""
+        pending = {(str(node), str(upid)) for node, upid in tasks if upid}
+        if not pending:
+            return
+        deadline = time.monotonic() + timeout
+        failures: list[str] = []
+        while pending and time.monotonic() < deadline:
+            completed: list[tuple[str, str]] = []
+            for node, upid in tuple(pending):
+                try:
+                    status = self.client.nodes(node).tasks(upid).status.get()
+                except Exception:
+                    # A transient API error must not turn a successfully running
+                    # Proxmox task into a failed dashboard operation.
+                    continue
+                if status.get("status") != "stopped":
+                    continue
+                completed.append((node, upid))
+                if status.get("exitstatus") != "OK":
+                    failures.append(f"{upid}: {status.get('exitstatus')}")
+            pending.difference_update(completed)
+            if pending:
+                time.sleep(0.75)
+        if pending:
+            raise TimeoutError(f"Истекло время ожидания {len(pending)} задач Proxmox")
+        if failures:
+            raise RuntimeError("Задачи Proxmox завершились с ошибкой: " + "; ".join(failures[:5]))
+
+    @staticmethod
+    def _batch_limit(variable: str, default: int = 6) -> int:
+        try:
+            configured = int(os.environ.get(variable, str(default)))
+        except ValueError:
+            configured = default
+        return max(1, min(configured, 12))
+
+    def _vm_inventory(self, vmids: list[int]) -> dict[int, dict[str, Any]]:
+        requested = {int(vmid) for vmid in vmids}
+        found: dict[int, dict[str, Any]] = {}
+        for resource in self.client.cluster.resources.get(type="vm"):
+            if resource.get("type") != "qemu" or resource.get("vmid") is None:
+                continue
+            vmid = int(resource["vmid"])
+            if vmid in requested:
+                found[vmid] = {
+                    "node": str(resource.get("node") or ""),
+                    "status": str(resource.get("status") or "unknown"),
+                }
+        missing = sorted(requested - set(found))
+        if missing:
+            raise RuntimeError("VM не найдены: " + ", ".join(str(vmid) for vmid in missing))
+        return found
+
     def _find_template_node(self, vmid: int) -> str:
         for node in self.client.nodes.get():
             if node.get("status") != "online":
@@ -387,24 +448,40 @@ class LiveProxmoxGateway:
         }
 
     def _cleanup_failed_deploy(self, created: list[tuple[str, int]], pool_id: str) -> None:
+        stop_tasks: list[tuple[str, str]] = []
         for node, vmid in reversed(created):
             api = self.client.nodes(node).qemu(vmid)
             try:
                 current = api.status.current.get()
                 if current.get("status") == "running":
                     upid = api.status.stop.post()
-                    self._wait_task(node, upid)
+                    if upid:
+                        stop_tasks.append((node, str(upid)))
             except Exception:
                 pass
+        try:
+            self._wait_tasks(stop_tasks, timeout=180)
+        except Exception:
+            pass
+        delete_tasks: list[tuple[str, str]] = []
+        for node, vmid in reversed(created):
+            api = self.client.nodes(node).qemu(vmid)
             try:
                 api.config.put(**{"delete": "lock"})
             except Exception:
                 pass
             try:
-                upid = api.delete(purge=1, destroy_unreferenced_disks=1)
-                self._wait_task(node, upid)
+                # destroy-unreferenced-disks is not available in older PVE
+                # schemas. Destroying the VM already removes referenced disks.
+                upid = api.delete(purge=1)
+                if upid:
+                    delete_tasks.append((node, str(upid)))
             except Exception:
                 pass
+        try:
+            self._wait_tasks(delete_tasks, timeout=600)
+        except Exception:
+            pass
         try:
             self.client.pools(pool_id).delete()
         except Exception:
@@ -425,7 +502,6 @@ class LiveProxmoxGateway:
         if pool_id in pools:
             raise RuntimeError(f"Пул Proxmox {pool_id} уже существует")
         self.client.pools.post(poolid=pool_id, comment=f"DEMOEXAM dashboard stand_id={stand['id']}")
-        deployed: list[dict[str, Any]] = []
         created: list[tuple[str, int]] = []
         try:
             progress(12, "Пул создан")
@@ -440,17 +516,48 @@ class LiveProxmoxGateway:
                     raise RuntimeError(f"Нода {requested_node} недоступна")
                 target_nodes = [requested_node]
             vm_count = int(blueprint.get("vm_count") or 1)
+            credentials = blueprint.get("credentials") if isinstance(blueprint.get("credentials"), list) else []
+            plans: list[dict[str, Any]] = []
+            clone_tasks: list[tuple[str, str]] = []
+            clone_batch = self._batch_limit("PROXMOX_CLONE_BATCH")
+
+            # Submit linked clones in bounded parallel batches. nextid is
+            # requested immediately before each submit so the accepted clone
+            # reserves the ID before the following request.
             for index in range(1, vm_count + 1):
                 target_node = target_nodes[(index - 1) % len(target_nodes)]
                 new_vmid = int(self.client.cluster.nextid.get())
                 created.append((target_node, new_vmid))
                 name = f"{pool_id}-{index}"
+                vm_ip = DemoProxmoxGateway._ip_for(str(blueprint.get("subnet", "")), index)
+                credential = dict(credentials[index - 1]) if index <= len(credentials) and isinstance(credentials[index - 1], dict) else {}
+                if not credential.get("password"):
+                    credential["password"] = base64.urlsafe_b64encode(os.urandom(15)).decode("ascii").rstrip("=")[:18]
+                credential.setdefault("guest_username", "root")
+                credential.setdefault("web_username", "root@pam")
+                plans.append({
+                    "index": index, "node": target_node, "vmid": new_vmid,
+                    "name": name, "ip": vm_ip, "credential": credential,
+                })
                 params: dict[str, Any] = {
                     "newid": new_vmid, "name": name, "full": 0,
                     "target": target_node, "pool": pool_id,
                 }
                 upid = self.client.nodes(template_node).qemu(template_vmid).clone.post(**params)
-                self._wait_task(template_node, upid)
+                if upid:
+                    clone_tasks.append((template_node, str(upid)))
+                progress(12 + round(index / vm_count * 12), f"Клонирование VM {index} из {vm_count} запущено")
+                if len(clone_tasks) >= clone_batch:
+                    self._wait_tasks(clone_tasks)
+                    clone_tasks.clear()
+
+            self._wait_tasks(clone_tasks)
+            progress(38, f"Клонировано VM: {vm_count}")
+
+            start_tasks: list[tuple[str, str]] = []
+            for plan in plans:
+                target_node = str(plan["node"])
+                new_vmid = int(plan["vmid"])
                 config: dict[str, Any] = {"agent": "1"}
                 if blueprint.get("bridge"):
                     vm_api = self.client.nodes(target_node).qemu(new_vmid)
@@ -460,8 +567,20 @@ class LiveProxmoxGateway:
                     )
                 self.client.nodes(target_node).qemu(new_vmid).config.put(**config)
                 upid = self.client.nodes(target_node).qemu(new_vmid).status.start.post()
-                self._wait_task(target_node, upid)
-                vm_ip = DemoProxmoxGateway._ip_for(str(blueprint.get("subnet", "")), index)
+                if upid:
+                    start_tasks.append((target_node, str(upid)))
+
+            self._wait_tasks(start_tasks, timeout=600)
+            progress(55, f"Запущено VM: {vm_count}")
+
+            completed = 0
+            progress_lock = threading.Lock()
+
+            def prepare_guest(plan: dict[str, Any]) -> dict[str, Any]:
+                target_node = str(plan["node"])
+                new_vmid = int(plan["vmid"])
+                index = int(plan["index"])
+                vm_ip = str(plan["ip"])
                 deploy_script = str(blueprint.get("deploy_script", ""))
                 if deploy_script.strip():
                     result = self._guest_script(
@@ -483,11 +602,60 @@ class LiveProxmoxGateway:
                     if result["exit_code"] != 0:
                         detail = result["stderr"] or result["stdout"] or f"exit code {result['exit_code']}"
                         raise RuntimeError(f"Скрипт развёртывания VM {new_vmid}: {detail[-500:]}")
-                deployed.append({
-                    "vmid": new_vmid, "name": name, "node": target_node,
-                    "ip": vm_ip, "status": "running",
-                })
-                progress(12 + round(index / vm_count * 78), f"VM {index} из {vm_count} настроена")
+
+                # Even when a blueprint has no bootstrap script, wait for QGA
+                # before applying the generated login password.
+                self._wait_guest_agent(target_node, new_vmid)
+                credential = dict(plan["credential"])
+                guest_username = str(credential.get("guest_username") or "root")
+                password = str(credential["password"])
+                self.client.nodes(target_node).qemu(new_vmid).agent("set-user-password").post(
+                    username=guest_username,
+                    password=password,
+                )
+                changed_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+                return {
+                    "vmid": new_vmid, "name": str(plan["name"]), "node": target_node,
+                    "ip": vm_ip, "status": "running", "guest_username": guest_username,
+                    "web_username": str(credential.get("web_username") or "root@pam"),
+                    "password": password, "password_updated_at": changed_at,
+                }
+
+            deployed: list[dict[str, Any]] = []
+            try:
+                configured_workers = int(os.environ.get("PROXMOX_DEPLOY_WORKERS", "6"))
+            except ValueError:
+                configured_workers = 6
+            worker_limit = max(1, min(configured_workers, vm_count, 12))
+            with ThreadPoolExecutor(max_workers=worker_limit, thread_name_prefix="pve-guest") as executor:
+                future_plans = {executor.submit(prepare_guest, plan): plan for plan in plans}
+                for future in as_completed(future_plans):
+                    deployed.append(future.result())
+                    with progress_lock:
+                        completed += 1
+                        progress(
+                            55 + round(completed / vm_count * 35),
+                            f"VM {completed} из {vm_count} настроена",
+                        )
+
+            deployed.sort(key=lambda item: int(item["vmid"]))
+            snapshot_tasks: list[tuple[str, str]] = []
+            snapshot_batch = self._batch_limit("PROXMOX_SNAPSHOT_BATCH")
+            for item in deployed:
+                node = str(item["node"])
+                upid = self.client.nodes(node).qemu(int(item["vmid"])).snapshot.post(
+                    snapname="start",
+                    description="Начальное состояние после развёртывания",
+                )
+                if upid:
+                    snapshot_tasks.append((node, str(upid)))
+                if len(snapshot_tasks) >= snapshot_batch:
+                    self._wait_tasks(snapshot_tasks, timeout=1800)
+                    snapshot_tasks.clear()
+            self._wait_tasks(snapshot_tasks, timeout=1800)
+            for item in deployed:
+                item["last_snapshot"] = "start"
+            progress(97, "Начальные снимки start созданы")
             progress(100, "Стенд готов")
             return deployed
         except Exception:
@@ -495,39 +663,55 @@ class LiveProxmoxGateway:
             raise
 
     def _locate_vm(self, vmid: int) -> str:
-        for node in self.client.nodes.get():
-            name = node["node"]
-            try:
-                if any(int(vm.get("vmid", -1)) == int(vmid) for vm in self.client.nodes(name).qemu.get()):
-                    return name
-            except Exception:
-                continue
-        raise RuntimeError(f"VM {vmid} не найдена")
+        return str(self._vm_inventory([vmid])[int(vmid)]["node"])
 
     def power_action(self, vmids: list[int], action: str) -> None:
-        endpoint = {"start": "start", "stop": "shutdown", "restart": "reboot"}.get(action)
+        # The dashboard's Stop button is an operator action for an entire lab.
+        # Use Proxmox hard-stop (as the legacy pool tool did) so one guest with
+        # a broken ACPI/QGA shutdown cannot hold a 25-VM request for minutes.
+        endpoint = {"start": "start", "stop": "stop", "restart": "reboot"}.get(action)
         if endpoint is None:
             raise ValueError("Неизвестное действие питания")
+        inventory = self._vm_inventory(vmids)
+        tasks: list[tuple[str, str]] = []
         for vmid in vmids:
-            node = self._locate_vm(vmid)
+            item = inventory[int(vmid)]
+            node = str(item["node"])
+            current = str(item["status"])
+            if action == "stop" and current == "stopped":
+                continue
+            if action == "start" and current == "running":
+                continue
+            if action == "restart" and current != "running":
+                raise RuntimeError(f"VM {vmid} остановлена; сначала запустите её")
             status = self.client.nodes(node).qemu(vmid).status
             upid = getattr(status, endpoint).post()
-            self._wait_task(node, upid)
+            if upid:
+                tasks.append((node, str(upid)))
+        self._wait_tasks(tasks, timeout=600)
 
     def rotate_password(self, vmids: list[int], username: str, password: str) -> None:
+        inventory = self._vm_inventory(vmids)
         for vmid in vmids:
-            node = self._locate_vm(vmid)
+            node = str(inventory[int(vmid)]["node"])
             self.client.nodes(node).qemu(vmid).agent("set-user-password").post(username=username, password=password)
 
     def create_snapshot(self, vmids: list[int], name: str, description: str = "") -> None:
+        inventory = self._vm_inventory(vmids)
+        tasks: list[tuple[str, str]] = []
+        batch_size = self._batch_limit("PROXMOX_SNAPSHOT_BATCH")
         for vmid in vmids:
-            node = self._locate_vm(vmid)
+            node = str(inventory[int(vmid)]["node"])
             upid = self.client.nodes(node).qemu(vmid).snapshot.post(
                 snapname=name,
                 description=description,
             )
             if upid:
-                self._wait_task(node, str(upid))
+                tasks.append((node, str(upid)))
+            if len(tasks) >= batch_size:
+                self._wait_tasks(tasks, timeout=1800)
+                tasks.clear()
+        self._wait_tasks(tasks, timeout=1800)
 
     def run_autocheck(self, vmids: list[int], script: str) -> list[dict[str, Any]]:
         """Run the editable check inside guests, never on the dashboard host."""
@@ -623,33 +807,48 @@ class LiveProxmoxGateway:
             for member in pool.get("members", [])
             if member.get("type") in {"qemu", "lxc"} and member.get("vmid") is not None
         }
-        foreign_vmids = sorted(set(vmids) - pool_vmids)
-        if foreign_vmids:
-            raise RuntimeError(
-                "VM не принадлежат управляемому пулу; удаление отменено: "
-                + ", ".join(str(vmid) for vmid in foreign_vmids)
-            )
+        # A tracked VM may already have been deleted manually.  That is safe to
+        # ignore; the inverse (an untracked VM in our pool) must still abort.
         untracked_vmids = sorted(pool_vmids - set(vmids))
         if untracked_vmids:
             raise RuntimeError(
                 "В пуле обнаружены VM, отсутствующие в учёте DemoOps; удаление отменено: "
                 + ", ".join(str(vmid) for vmid in untracked_vmids)
             )
-        for vmid in vmids:
-            node = self._locate_vm(vmid)
+        existing_vmids = sorted(pool_vmids & set(vmids))
+        inventory = self._vm_inventory(existing_vmids) if existing_vmids else {}
+        stop_tasks: list[tuple[str, str]] = []
+        for vmid in existing_vmids:
+            node = str(inventory[vmid]["node"])
+            api = self.client.nodes(node).qemu(vmid)
+            if inventory[vmid]["status"] == "running":
+                # Deletion is already explicitly confirmed by the operator, so
+                # use a parallel hard stop instead of waiting for 25 sequential
+                # guest shutdown timeouts.
+                upid = api.status.stop.post()
+                if upid:
+                    stop_tasks.append((node, str(upid)))
+        self._wait_tasks(stop_tasks, timeout=300)
+
+        delete_tasks: list[tuple[str, str]] = []
+        delete_batch = self._batch_limit("PROXMOX_DELETE_BATCH")
+        for vmid in existing_vmids:
+            node = str(inventory[vmid]["node"])
             api = self.client.nodes(node).qemu(vmid)
             try:
-                current = api.status.current.get()
-                if current.get("status") == "running":
-                    upid = api.status.stop.post()
-                    self._wait_task(node, upid)
-            finally:
-                upid = api.delete(purge=1, destroy_unreferenced_disks=1)
-                self._wait_task(node, upid)
-        try:
-            self.client.pools(stand["pool_id"]).delete()
-        except Exception:
-            pass
+                api.config.put(**{"delete": "lock"})
+            except Exception:
+                pass
+            # PVE 7 and some early PVE 8 builds reject
+            # destroy-unreferenced-disks as an unknown schema property.
+            upid = api.delete(purge=1)
+            if upid:
+                delete_tasks.append((node, str(upid)))
+            if len(delete_tasks) >= delete_batch:
+                self._wait_tasks(delete_tasks, timeout=1800)
+                delete_tasks.clear()
+        self._wait_tasks(delete_tasks, timeout=1800)
+        self.client.pools(stand["pool_id"]).delete()
 
     def cluster_metrics(self, tracked_vmids: list[int] | None = None) -> dict[str, Any]:
         tracked_key = frozenset(int(vmid) for vmid in (tracked_vmids or []))

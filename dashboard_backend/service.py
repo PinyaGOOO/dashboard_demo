@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import os
 import re
 import secrets
 import string
@@ -178,9 +179,93 @@ class DashboardService:
         stand = next((item for item in self.list_stands() if int(item["id"]) == stand_id), None)
         if not stand:
             raise NotFoundError("Стенд не найден")
-        stand["vms"] = self.store.query_all("SELECT * FROM stand_vms WHERE stand_id = ? ORDER BY id", (stand_id,))
+        raw_vms = self.store.query_all("SELECT * FROM stand_vms WHERE stand_id = ? ORDER BY id", (stand_id,))
+        stand["vms"] = [self._public_vm(vm) for vm in raw_vms]
         stand["checks"] = self.store.query_all("SELECT * FROM check_runs WHERE stand_id = ? ORDER BY started_at DESC LIMIT 10", (stand_id,))
         return stand
+
+    @staticmethod
+    def _vm_web_url(ip: str) -> str:
+        """Build a password-free URL to the stand web UI.
+
+        Installations whose nested Proxmox UI is exposed through HTTPS without
+        port 8006 can set, for example, STAND_WEB_URL_TEMPLATE=https://{ip}/.
+        Credentials are deliberately never embedded in this URL.
+        """
+        host = str(ip or "").strip().split("/", 1)[0]
+        if not host:
+            return ""
+        scheme = os.environ.get("STAND_WEB_SCHEME", "https").strip().lower()
+        if scheme not in {"http", "https"}:
+            scheme = "https"
+        port = os.environ.get("STAND_WEB_PORT", "8006").strip()
+        if port and (not port.isdigit() or not 1 <= int(port) <= 65535):
+            port = "8006"
+        authority = host if not port else f"{host}:{port}"
+        default_url = f"{scheme}://{authority}/"
+        template = os.environ.get("STAND_WEB_URL_TEMPLATE", "").strip()
+        if not template:
+            return default_url
+        try:
+            url = template.format(ip=host)
+        except (KeyError, ValueError):
+            url = default_url
+        return url if url.startswith(("https://", "http://")) else default_url
+
+    def _public_vm(self, vm: dict[str, Any]) -> dict[str, Any]:
+        item = dict(vm)
+        secret = str(item.pop("credential_password", "") or "")
+        guest_username = str(item.pop("credential_username", "root") or "root")
+        web_username = str(item.pop("web_username", "root@pam") or "root@pam")
+        web_url = self._vm_web_url(str(item.get("ip", "")))
+        item.update({
+            "username": web_username,
+            "web_username": web_username,
+            "guest_username": guest_username,
+            "credential_available": bool(secret),
+            "has_start_snapshot": bool(item.get("has_start_snapshot")),
+            "web_url": web_url,
+            "access_url": web_url,
+        })
+        return item
+
+    def stand_credentials(self, stand_id: int) -> dict[str, Any]:
+        stand = self.get_stand(stand_id)
+        rows = self.store.query_all("SELECT * FROM stand_vms WHERE stand_id = ? ORDER BY id", (stand_id,))
+        return {
+            "stand_id": stand_id,
+            "stand_name": stand["name"],
+            "credentials": [self._credential(row) for row in rows],
+            "auto_login_supported": False,
+            "auto_login_message": (
+                "Браузер не разрешает дашборду установить cookie на другом домене. "
+                "Откройте web_url и используйте указанные логин и пароль."
+            ),
+        }
+
+    def vm_credentials(self, stand_id: int, vmid: int) -> dict[str, Any]:
+        self.get_stand(stand_id)
+        row = self.store.query_one(
+            "SELECT * FROM stand_vms WHERE stand_id = ? AND vmid = ?", (stand_id, vmid),
+        )
+        if not row:
+            raise NotFoundError("VM не найдена в этом стенде")
+        return self._credential(row)
+
+    def _credential(self, vm: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "vmid": vm.get("vmid"),
+            "name": vm.get("name", ""),
+            "ip": vm.get("ip", ""),
+            "web_url": self._vm_web_url(str(vm.get("ip", ""))),
+            "access_url": self._vm_web_url(str(vm.get("ip", ""))),
+            "username": str(vm.get("web_username") or "root@pam"),
+            "web_username": str(vm.get("web_username") or "root@pam"),
+            "guest_username": str(vm.get("credential_username") or "root"),
+            "password": str(vm.get("credential_password") or ""),
+            "password_updated_at": vm.get("password_updated_at"),
+            "reveal_once": False,
+        }
 
     @staticmethod
     def _pool_id(value: str) -> str:
@@ -260,10 +345,9 @@ class DashboardService:
         if existing:
             raise ConflictError("Pool ID уже используется")
         try:
-            ttl_hours = max(1, min(720, int(payload.get("ttl_hours", 8))))
             vm_count = int(payload.get("vm_count", 1))
         except (TypeError, ValueError) as exc:
-            raise ValidationError("Количество VM и срок жизни должны быть числами") from exc
+            raise ValidationError("Количество VM должно быть числом") from exc
         if not 1 <= vm_count <= 50:
             raise ValidationError("Количество VM должно быть от 1 до 50")
         subnet = str(payload.get("subnet", "")).strip()
@@ -280,7 +364,12 @@ class DashboardService:
         bridge = str(payload.get("bridge", "")).strip()
         if bridge and not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", bridge):
             raise ValidationError("Некорректное имя сетевого bridge")
-        expires = (datetime.now(timezone.utc) + timedelta(hours=ttl_hours)).replace(microsecond=0).isoformat()
+        credential_username = str(payload.get("username", "root")).strip() or "root"
+        if not re.fullmatch(r"[^\x00-\x1f\x7f]{1,64}", credential_username):
+            raise ValidationError("Некорректное имя пользователя гостевой VM")
+        web_username = str(payload.get("web_username", "root@pam")).strip() or "root@pam"
+        if not re.fullmatch(r"[^\x00-\x1f\x7f]{1,128}", web_username):
+            raise ValidationError("Некорректный логин веб-интерфейса VM")
         now = utc_now()
         stand_id = self.store.execute(
             """INSERT INTO stands
@@ -288,7 +377,7 @@ class DashboardService:
              vm_count, cpu, ram, disk, ip_range, check_status, expires_at, created_at, updated_at)
             VALUES (?, ?, 'provisioning', 4, ?, ?, ?, ?, 0, 0, 0, ?, 'idle', ?, ?, ?)""",
             (name, blueprint_id, str(payload.get("node", "auto")), pool_id, str(payload.get("owner", "Администратор")),
-             vm_count, subnet, expires, now, now),
+             vm_count, subnet, None, now, now),
         )
         deployment = dict(blueprint)
         deployment.update({
@@ -297,6 +386,14 @@ class DashboardService:
             "bridge": bridge,
             "clone_type": "linked",
             "storage": "",
+            "credentials": [
+                {
+                    "guest_username": credential_username,
+                    "web_username": web_username,
+                    "password": self._password(),
+                }
+                for _ in range(vm_count)
+            ],
         })
         self.store.add_activity("deploy", "Развёртывание запущено", f"{name} · {blueprint['name']} · {vm_count} VM", "progress")
         thread = threading.Thread(
@@ -312,7 +409,7 @@ class DashboardService:
 
     def update_stand(self, stand_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         stand = self.get_stand(stand_id)
-        allowed = {"name", "owner", "expires_at", "ip_range"}
+        allowed = {"name", "owner", "ip_range"}
         data = {key: payload[key] for key in allowed if key in payload}
         if "name" in data and not str(data["name"]).strip():
             raise ValidationError("Название стенда не может быть пустым")
@@ -329,6 +426,14 @@ class DashboardService:
     def _deploy_job(self, stand_id: int, blueprint: dict[str, Any]) -> None:
         try:
             stand = self.get_stand(stand_id)
+            blueprint = dict(blueprint)
+            vm_count = int(blueprint.get("vm_count") or stand.get("vm_count") or 1)
+            credentials = blueprint.get("credentials")
+            if not isinstance(credentials, list) or len(credentials) < vm_count:
+                blueprint["credentials"] = [
+                    {"guest_username": "root", "web_username": "root@pam", "password": self._password()}
+                    for _ in range(vm_count)
+                ]
 
             def progress(value: int, message: str) -> None:
                 self.store.execute("UPDATE stands SET progress = ?, updated_at = ? WHERE id = ?", (value, utc_now(), stand_id))
@@ -339,14 +444,27 @@ class DashboardService:
             self.store.execute("DELETE FROM stand_vms WHERE stand_id = ?", (stand_id,))
             for vm in vms:
                 self.store.execute(
-                    """INSERT INTO stand_vms (stand_id, vmid, name, node, ip, status, cpu, ram)
-                    VALUES (?, ?, ?, ?, ?, ?, 0, 0)""",
-                    (stand_id, vm.get("vmid"), vm["name"], vm.get("node", ""), vm.get("ip", ""), vm.get("status", "running")),
+                    """INSERT INTO stand_vms
+                    (stand_id, vmid, name, node, ip, status, cpu, ram, credential_username,
+                     web_username, credential_password, password_updated_at, last_snapshot,
+                     has_start_snapshot)
+                    VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        stand_id, vm.get("vmid"), vm["name"], vm.get("node", ""),
+                        vm.get("ip", ""), vm.get("status", "running"),
+                        vm.get("guest_username", vm.get("username", "root")),
+                        vm.get("web_username", "root@pam"), vm.get("password", ""),
+                        vm.get("password_updated_at"), vm.get("last_snapshot", "start"),
+                        1 if vm.get("last_snapshot", "start") == "start" else 0,
+                    ),
                 )
             primary_node = vms[0].get("node", "") if vms else ""
+            password_updated_at = utc_now() if any(vm.get("password") for vm in vms) else None
             self.store.execute(
-                "UPDATE stands SET status = 'running', progress = 100, node = ?, cpu = 4.8, ram = 8.2, last_error = '', updated_at = ? WHERE id = ?",
-                (primary_node, utc_now(), stand_id),
+                """UPDATE stands SET status = 'running', progress = 100, node = ?, cpu = 4.8,
+                ram = 8.2, last_error = '', password_updated_at = ?, expires_at = NULL,
+                updated_at = ? WHERE id = ?""",
+                (primary_node, password_updated_at, utc_now(), stand_id),
             )
         except Exception as exc:
             self.store.execute(
@@ -375,34 +493,134 @@ class DashboardService:
             self.store.add_activity("power", labels[action], stand["name"], "success")
             return {"stand": self.get_stand(stand_id), "message": labels[action]}
         if action == "snapshot":
-            label = str(payload.get("name", "manual-point")).strip() or "manual-point"
-            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", label):
-                raise ValidationError("Имя снимка: до 64 латинских букв, цифр, '-' или '_'")
+            label = self._snapshot_label(payload.get("name"))
             if not vmids:
                 raise ConflictError("В стенде нет VM для создания снимка")
             description = str(payload.get("description", ""))[:255]
             self.gateway.create_snapshot(vmids, label, description)
+            self.store.execute(
+                """UPDATE stand_vms SET last_snapshot = ?,
+                has_start_snapshot = CASE WHEN ? = 'start' THEN 1 ELSE has_start_snapshot END
+                WHERE stand_id = ?""",
+                (label, label, stand_id),
+            )
             self.store.add_activity("snapshot", "Создан снимок", f"{stand['name']} · {label}", "success")
-            return {"stand": stand, "message": f"Снимок «{label}» создан на всех VM"}
+            return {"stand": self.get_stand(stand_id), "message": f"Снимок «{label}» создан на всех VM"}
         if action == "rotate_password":
             username = str(payload.get("username", "root")).strip()
+            web_username = str(payload.get("web_username", "root@pam")).strip() or "root@pam"
             password = str(payload.get("password", "")) or self._password()
             if stand["status"] != "running":
                 raise ConflictError("Смена пароля доступна только для запущенного стенда")
-            if not username:
+            if not re.fullmatch(r"[^\x00-\x1f\x7f]{1,64}", username):
                 raise ValidationError("Укажите имя пользователя")
+            if not re.fullmatch(r"[^\x00-\x1f\x7f]{1,128}", web_username):
+                raise ValidationError("Некорректный логин веб-интерфейса VM")
             if len(password) < 10:
                 raise ValidationError("Пароль должен содержать не менее 10 символов")
             if not vmids:
                 raise ConflictError("В стенде нет VM для смены пароля")
             self.gateway.rotate_password(vmids, username, password)
-            self.store.execute("UPDATE stands SET password_updated_at = ?, updated_at = ? WHERE id = ?", (utc_now(), utc_now(), stand_id))
+            changed_at = utc_now()
+            self.store.execute(
+                """UPDATE stand_vms SET credential_username = ?, web_username = ?,
+                credential_password = ?, password_updated_at = ? WHERE stand_id = ?""",
+                (username, web_username, password, changed_at, stand_id),
+            )
+            self.store.execute(
+                "UPDATE stands SET password_updated_at = ?, updated_at = ? WHERE id = ?",
+                (changed_at, changed_at, stand_id),
+            )
             self.store.add_activity("password", "Пароль стенда обновлён", f"{stand['name']} · пользователь {username}", "success")
-            return {"stand": self.get_stand(stand_id), "message": "Пароль обновлён на всех VM", "credential": {"username": username, "password": password, "reveal_once": True}}
+            return {
+                "stand": self.get_stand(stand_id),
+                "message": "Пароль обновлён на всех VM",
+                "credential": {"username": web_username, "guest_username": username, "password": password, "reveal_once": True},
+            }
         if action == "run_check":
             run = self.start_check(stand_id)
             return {"stand": self.get_stand(stand_id), "message": "Автопроверка запущена", "run": run}
         raise ValidationError("Неизвестное действие")
+
+    @staticmethod
+    def _snapshot_label(value: Any) -> str:
+        label = str(value or "").strip()
+        if not label:
+            label = datetime.now(timezone.utc).strftime("manual-%Y%m%d-%H%M%S")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", label):
+            raise ValidationError("Имя снимка: до 64 латинских букв, цифр, '-' или '_'")
+        return label
+
+    def vm_action(
+        self,
+        stand_id: int,
+        vmid: int,
+        action: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = payload or {}
+        stand = self.get_stand(stand_id)
+        vm = next((item for item in stand["vms"] if int(item.get("vmid") or -1) == vmid), None)
+        if not vm:
+            raise NotFoundError("VM не найдена в этом стенде")
+        if action == "snapshot":
+            label = self._snapshot_label(payload.get("name"))
+            description = str(payload.get("description", ""))[:255]
+            self.gateway.create_snapshot([vmid], label, description)
+            self.store.execute(
+                """UPDATE stand_vms SET last_snapshot = ?,
+                has_start_snapshot = CASE WHEN ? = 'start' THEN 1 ELSE has_start_snapshot END
+                WHERE stand_id = ? AND vmid = ?""",
+                (label, label, stand_id, vmid),
+            )
+            self.store.add_activity(
+                "snapshot", "Создан снимок VM", f"{stand['name']} · VM {vmid} · {label}", "success",
+            )
+            refreshed = self.get_stand(stand_id)
+            return {
+                "stand": refreshed,
+                "vm": next(item for item in refreshed["vms"] if int(item.get("vmid") or -1) == vmid),
+                "message": f"Снимок «{label}» создан на VM {vmid}",
+            }
+        if action == "rotate_password":
+            if stand["status"] != "running" or vm.get("status") != "running":
+                raise ConflictError("Смена пароля доступна только для запущенной VM")
+            guest_username = str(payload.get("username", vm.get("guest_username", "root"))).strip()
+            web_username = str(payload.get("web_username", vm.get("web_username", "root@pam"))).strip() or "root@pam"
+            password = str(payload.get("password", "")) or self._password()
+            if not re.fullmatch(r"[^\x00-\x1f\x7f]{1,64}", guest_username):
+                raise ValidationError("Укажите имя пользователя")
+            if not re.fullmatch(r"[^\x00-\x1f\x7f]{1,128}", web_username):
+                raise ValidationError("Некорректный логин веб-интерфейса VM")
+            if len(password) < 10:
+                raise ValidationError("Пароль должен содержать не менее 10 символов")
+            self.gateway.rotate_password([vmid], guest_username, password)
+            changed_at = utc_now()
+            self.store.execute(
+                """UPDATE stand_vms SET credential_username = ?, web_username = ?,
+                credential_password = ?, password_updated_at = ?
+                WHERE stand_id = ? AND vmid = ?""",
+                (guest_username, web_username or "root@pam", password, changed_at, stand_id, vmid),
+            )
+            self.store.execute(
+                "UPDATE stands SET password_updated_at = ?, updated_at = ? WHERE id = ?",
+                (changed_at, changed_at, stand_id),
+            )
+            self.store.add_activity(
+                "password", "Пароль VM обновлён",
+                f"{stand['name']} · VM {vmid} · пользователь {guest_username}", "success",
+            )
+            refreshed = self.get_stand(stand_id)
+            return {
+                "stand": refreshed,
+                "vm": next(item for item in refreshed["vms"] if int(item.get("vmid") or -1) == vmid),
+                "message": f"Пароль VM {vmid} обновлён",
+                "credential": {
+                    "username": web_username or "root@pam", "guest_username": guest_username,
+                    "password": password, "reveal_once": True,
+                },
+            }
+        raise ValidationError("Неизвестное действие VM")
 
     @staticmethod
     def _password(length: int = 16) -> str:

@@ -25,8 +25,22 @@ class DashboardStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._create_schema()
+        self._secure_db_files()
         if seed_demo:
             self._seed_if_empty()
+
+    def _secure_db_files(self) -> None:
+        """Best-effort protection for the SQLite database and WAL sidecars."""
+        for path in (self.db_path, Path(f"{self.db_path}-wal"), Path(f"{self.db_path}-shm")):
+            if not path.exists():
+                continue
+            try:
+                path.chmod(0o600)
+            except OSError:
+                # Windows ACLs and some mounted filesystems do not implement
+                # POSIX modes; deployment documentation still requires the
+                # directory to be restricted by the host administrator.
+                pass
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -38,6 +52,7 @@ class DashboardStore:
             connection.commit()
         finally:
             connection.close()
+            self._secure_db_files()
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -111,6 +126,12 @@ class DashboardStore:
             status TEXT NOT NULL DEFAULT 'stopped',
             cpu REAL NOT NULL DEFAULT 0,
             ram REAL NOT NULL DEFAULT 0,
+            credential_username TEXT NOT NULL DEFAULT 'root',
+            web_username TEXT NOT NULL DEFAULT 'root@pam',
+            credential_password TEXT NOT NULL DEFAULT '',
+            password_updated_at TEXT,
+            last_snapshot TEXT NOT NULL DEFAULT '',
+            has_start_snapshot INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (stand_id) REFERENCES stands(id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS sessions (
@@ -163,6 +184,25 @@ class DashboardStore:
                 connection.execute("ALTER TABLE stands ADD COLUMN origin TEXT NOT NULL DEFAULT 'deployed'")
             if "last_error" not in stand_columns:
                 connection.execute("ALTER TABLE stands ADD COLUMN last_error TEXT NOT NULL DEFAULT ''")
+            vm_columns = {row[1] for row in connection.execute("PRAGMA table_info(stand_vms)")}
+            if "credential_username" not in vm_columns:
+                connection.execute("ALTER TABLE stand_vms ADD COLUMN credential_username TEXT NOT NULL DEFAULT 'root'")
+            if "credential_password" not in vm_columns:
+                connection.execute("ALTER TABLE stand_vms ADD COLUMN credential_password TEXT NOT NULL DEFAULT ''")
+            if "web_username" not in vm_columns:
+                connection.execute("ALTER TABLE stand_vms ADD COLUMN web_username TEXT NOT NULL DEFAULT 'root@pam'")
+            if "password_updated_at" not in vm_columns:
+                connection.execute("ALTER TABLE stand_vms ADD COLUMN password_updated_at TEXT")
+            if "last_snapshot" not in vm_columns:
+                connection.execute("ALTER TABLE stand_vms ADD COLUMN last_snapshot TEXT NOT NULL DEFAULT ''")
+            if "has_start_snapshot" not in vm_columns:
+                connection.execute("ALTER TABLE stand_vms ADD COLUMN has_start_snapshot INTEGER NOT NULL DEFAULT 0")
+            connection.execute(
+                "UPDATE stand_vms SET has_start_snapshot = 1 WHERE last_snapshot = 'start'"
+            )
+            # Stands are intentionally persistent.  Clear legacy TTL values so
+            # upgraded installations do not keep showing or enforcing expiry.
+            connection.execute("UPDATE stands SET expires_at = NULL WHERE expires_at IS NOT NULL")
 
     def _seed_if_empty(self) -> None:
         with self.connect() as connection:
@@ -251,12 +291,11 @@ printf '%s\\n' \"${results[@]}\"""",
                 blueprints,
             )
 
-            expires = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=20)).replace(microsecond=0).isoformat()
             stands = [
-                ("ДЭ-24 · Группа 2-ИС", 1, "running", 100, "pve-02", "de24-g2is", "А. Орлова", 8, 12, 4, 36.2, 42.5, 28.0, "10.39.10.40–59", 94, "passed", iso_ago(minutes=18), expires, iso_ago(days=8), iso_ago(hours=3), now),
-                ("Тренировка · 3-СА", 2, "running", 100, "pve-01", "practice-3sa", "М. Соколов", 6, 10, 3, 24.8, 31.2, 19.0, "10.39.20.60–79", 86, "warning", iso_ago(minutes=42), expires, iso_ago(days=2), iso_ago(hours=2), now),
-                ("ДЭ-24 · Резерв", 3, "stopped", 100, "pve-03", "de24-reserve", "А. Орлова", 0, 8, 5, 0.0, 3.4, 22.0, "10.39.30.80–99", 100, "passed", iso_ago(days=1), expires, iso_ago(days=12), iso_ago(days=1), now),
-                ("Подготовка · 1-КБ", 3, "provisioning", 72, "pve-04", "prep-1kb", "И. Волков", 0, 12, 5, 12.4, 18.7, 9.0, "10.39.30.100–119", None, "idle", None, expires, None, iso_ago(minutes=6), now),
+                ("ДЭ-24 · Группа 2-ИС", 1, "running", 100, "pve-02", "de24-g2is", "А. Орлова", 8, 12, 4, 36.2, 42.5, 28.0, "10.39.10.40–59", 94, "passed", iso_ago(minutes=18), None, iso_ago(days=8), iso_ago(hours=3), now),
+                ("Тренировка · 3-СА", 2, "running", 100, "pve-01", "practice-3sa", "М. Соколов", 6, 10, 3, 24.8, 31.2, 19.0, "10.39.20.60–79", 86, "warning", iso_ago(minutes=42), None, iso_ago(days=2), iso_ago(hours=2), now),
+                ("ДЭ-24 · Резерв", 3, "stopped", 100, "pve-03", "de24-reserve", "А. Орлова", 0, 8, 5, 0.0, 3.4, 22.0, "10.39.30.80–99", 100, "passed", iso_ago(days=1), None, iso_ago(days=12), iso_ago(days=1), now),
+                ("Подготовка · 1-КБ", 3, "provisioning", 72, "pve-04", "prep-1kb", "И. Волков", 0, 12, 5, 12.4, 18.7, 9.0, "10.39.30.100–119", None, "idle", None, None, None, iso_ago(minutes=6), now),
             ]
             connection.executemany(
                 """INSERT INTO stands
