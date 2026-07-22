@@ -12,8 +12,10 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
+
+from .passwords import generate_password
 
 
 ProgressCallback = Callable[[int, str], None]
@@ -299,6 +301,13 @@ class DemoProxmoxGateway:
         time.sleep(0.08)
         return [int(item["vmid"]) for item in credentials if item.get("vmid") is not None]
 
+    def web_activity(self, vmids: list[int], window_seconds: int = 180) -> dict[str, Any]:
+        return {
+            "activity": [], "errors": [], "scanned_vms": len(vmids),
+            "window_seconds": window_seconds,
+            "observed_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        }
+
     def run_autocheck(self, vmids: list[int], script: str) -> list[dict[str, Any]]:
         time.sleep(0.9)
         names = []
@@ -462,7 +471,12 @@ class LiveProxmoxGateway:
             configured = default
         return max(1, min(configured, 12))
 
-    def _vm_inventory(self, vmids: list[int]) -> dict[int, dict[str, Any]]:
+    def _vm_inventory(
+        self,
+        vmids: list[int],
+        *,
+        require_all: bool = True,
+    ) -> dict[int, dict[str, Any]]:
         requested = {int(vmid) for vmid in vmids}
         found: dict[int, dict[str, Any]] = {}
         for resource in self.client.cluster.resources.get(type="vm"):
@@ -475,7 +489,7 @@ class LiveProxmoxGateway:
                     "status": str(resource.get("status") or "unknown"),
                 }
         missing = sorted(requested - set(found))
-        if missing:
+        if missing and require_all:
             raise RuntimeError("VM не найдены: " + ", ".join(str(vmid) for vmid in missing))
         return found
 
@@ -771,6 +785,36 @@ class LiveProxmoxGateway:
             "stdout": str(payload.get("out-data", "") or ""),
             "stderr": str(payload.get("err-data", "") or ""),
             "duration": round((time.monotonic() - started) * 1000),
+        }
+
+    def _guest_command(
+        self,
+        node: str,
+        vmid: int,
+        command: list[str],
+        timeout: int = 10,
+    ) -> dict[str, Any]:
+        """Execute one fixed argv command through QGA without invoking a shell."""
+        self._wait_guest_agent(node, vmid, timeout=min(max(1, timeout), 10))
+        api = self.client.nodes(node).qemu(vmid).agent
+        task = api("exec").post(command=command)
+        try:
+            pid = int(task["pid"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Guest agent VM {vmid} не вернул PID") from exc
+        deadline = time.monotonic() + timeout
+        payload: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            payload = api("exec-status").get(pid=pid)
+            if payload.get("exited"):
+                break
+            time.sleep(0.25)
+        else:
+            raise TimeoutError(f"Команда Guest Agent VM {vmid} превысила {timeout} секунд")
+        return {
+            "exit_code": int(payload.get("exitcode", 1)),
+            "stdout": str(payload.get("out-data", "") or ""),
+            "stderr": str(payload.get("err-data", "") or ""),
         }
 
     def _linux_network_target(
@@ -1143,7 +1187,7 @@ class LiveProxmoxGateway:
                 )
                 credential = dict(credentials[index - 1]) if index <= len(credentials) and isinstance(credentials[index - 1], dict) else {}
                 if not credential.get("password"):
-                    credential["password"] = base64.urlsafe_b64encode(os.urandom(15)).decode("ascii").rstrip("=")[:18]
+                    credential["password"] = generate_password(18)
                 credential.setdefault("guest_username", "root")
                 credential.setdefault("web_username", "root@pam")
                 with self._clone_submit_lock:
@@ -1595,6 +1639,128 @@ class LiveProxmoxGateway:
                     "message": output[-500:] or f"exit code {execution['exit_code']}",
                 })
         return results
+
+    @staticmethod
+    def _pve_access_time(value: str) -> datetime | None:
+        match = re.fullmatch(
+            r"(\d{1,2})/(\d{1,2}|[A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})",
+            value.strip(),
+        )
+        if not match:
+            return None
+        months = {
+            "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+            "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+        }
+        month_value = match.group(2)
+        month = int(month_value) if month_value.isdigit() else months.get(month_value.title())
+        if month is None:
+            return None
+        offset = timedelta(hours=int(match.group(8)), minutes=int(match.group(9)))
+        if match.group(7) == "-":
+            offset = -offset
+        try:
+            return datetime(
+                int(match.group(3)), month, int(match.group(1)),
+                int(match.group(4)), int(match.group(5)), int(match.group(6)),
+                tzinfo=timezone(offset),
+            ).astimezone(timezone.utc)
+        except ValueError:
+            return None
+
+    def web_activity(self, vmids: list[int], window_seconds: int = 180) -> dict[str, Any]:
+        """Derive recent PVE UI presence from nested pveproxy access logs."""
+        requested = sorted({int(vmid) for vmid in vmids})
+        observed = datetime.now(timezone.utc)
+        safe_window = max(30, min(int(window_seconds), 900))
+        if not requested:
+            return {
+                "activity": [], "errors": [], "scanned_vms": 0, "requested_vms": 0,
+                "window_seconds": safe_window,
+                "observed_at": observed.replace(microsecond=0).isoformat(),
+            }
+        inventory = self._vm_inventory(requested, require_all=False)
+        available = [vmid for vmid in requested if vmid in inventory]
+        errors: list[dict[str, Any]] = [
+            {"vmid": vmid, "error": "VM не найдена в Proxmox"}
+            for vmid in requested
+            if vmid not in inventory
+        ]
+        lines_by_vm: dict[int, tuple[str, str]] = {}
+
+        def read_log(vmid: int) -> tuple[int, str, str]:
+            node = str(inventory[vmid]["node"])
+            execution = self._guest_command(
+                node, vmid,
+                ["/usr/bin/tail", "-n", "500", "/var/log/pveproxy/access.log"],
+                timeout=8,
+            )
+            if execution["exit_code"] != 0:
+                raise RuntimeError(execution["stderr"] or f"tail завершился с кодом {execution['exit_code']}")
+            return vmid, node, execution["stdout"]
+
+        if available:
+            workers = max(
+                1,
+                min(self._batch_limit("PROXMOX_ACTIVITY_WORKERS", default=4), len(available)),
+            )
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pve-web-activity") as executor:
+                futures = {executor.submit(read_log, vmid): vmid for vmid in available}
+                for future in as_completed(futures):
+                    vmid = futures[future]
+                    try:
+                        _, node, output = future.result()
+                        lines_by_vm[vmid] = (node, output)
+                    except Exception as exc:
+                        errors.append({"vmid": vmid, "error": str(exc)[-500:]})
+
+        pattern = re.compile(
+            r'^(?P<ip>\S+)\s+-\s+(?P<user>\S+)\s+\[(?P<stamp>[^\]]+)\]\s+'
+            r'"(?P<method>[A-Z]+)\s+(?P<path>\S+)\s+HTTP/[0-9.]+"\s+'
+            r'(?P<status>\d{3})\s+(?P<bytes>\S+)'
+        )
+        grouped: dict[tuple[int, str, str], dict[str, Any]] = {}
+        cutoff = observed - timedelta(seconds=safe_window)
+        for vmid, (node, output) in lines_by_vm.items():
+            for line in output.splitlines():
+                match = pattern.match(line.strip())
+                if not match or match.group("user") == "-":
+                    continue
+                status_code = int(match.group("status"))
+                if not 200 <= status_code < 400:
+                    continue
+                resource_path = match.group("path").split("?", 1)[0]
+                if resource_path not in {
+                    "/api2/extjs/cluster/resources",
+                    "/api2/json/cluster/resources",
+                }:
+                    continue
+                seen = self._pve_access_time(match.group("stamp"))
+                if seen is None or seen < cutoff or seen > observed + timedelta(seconds=30):
+                    continue
+                key = (vmid, match.group("ip"), match.group("user"))
+                item = grouped.setdefault(key, {
+                    "vmid": vmid, "node": node,
+                    "source_ip": match.group("ip"), "user": match.group("user"),
+                    "last_seen": seen.replace(microsecond=0).isoformat(), "request_count": 0,
+                })
+                item["request_count"] += 1
+                if seen > datetime.fromisoformat(str(item["last_seen"])):
+                    item["last_seen"] = seen.replace(microsecond=0).isoformat()
+        activity = list(grouped.values())
+        for item in activity:
+            last_seen = datetime.fromisoformat(str(item["last_seen"]))
+            age = max(0, int((observed - last_seen).total_seconds()))
+            item["age_seconds"] = age
+            item["state"] = "active" if age <= 60 else "recent"
+        activity.sort(key=lambda item: (item["state"] != "active", item["age_seconds"], item["vmid"]))
+        return {
+            "activity": activity,
+            "errors": sorted(errors, key=lambda item: item["vmid"]),
+            "scanned_vms": len(lines_by_vm), "requested_vms": len(requested),
+            "window_seconds": safe_window,
+            "observed_at": observed.replace(microsecond=0).isoformat(),
+        }
 
     @staticmethod
     def _parse_check_output(output: str) -> list[dict[str, Any]]:

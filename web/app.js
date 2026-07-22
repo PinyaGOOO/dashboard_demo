@@ -129,6 +129,9 @@ exit 75`;
     editorDirty: false,
     ipam: null,
     ipamLoading: false,
+    webActivity: null,
+    webActivityLoading: false,
+    bulkRollbackPending: new Map(),
     loading: false,
     lastUpdated: null,
   };
@@ -139,6 +142,7 @@ exit 75`;
   let activeStandDetailId = null;
   let operationPollTimer = null;
   let operationPollBusy = false;
+  let webActivityPollTimer = null;
   const standCredentialCache = new Map();
 
   function getRoute() {
@@ -460,7 +464,7 @@ exit 75`;
       attention: state.data.stands.filter(item => item.status === "error" || ["warning", "failed"].includes(item.check_status)).length,
     };
     app.innerHTML = `<section class="page">
-      ${pageHeader("Стенды", "Управляйте пулами, виртуальными машинами, доступами и автопроверками.", `<button class="button" data-import-pool>${icon("plus")}Добавить существующий pool</button><button class="button button--primary" data-open-deploy>${icon("plus")}Развернуть стенд</button>`)}
+      ${pageHeader("Стенды", "Управляйте пулами, виртуальными машинами, доступами и автопроверками.", `<button class="button button--danger" data-rollback-all-stands ${state.data.stands.length ? "" : "disabled"}>${icon("refresh")}Вернуть все стенды к start</button><button class="button" data-import-pool>${icon("plus")}Добавить существующий pool</button><button class="button button--primary" data-open-deploy>${icon("plus")}Развернуть стенд</button>`)}
       <div class="toolbar"><div class="toolbar__primary"><label class="search-field">${icon("search")}<input id="stand-search" type="search" value="${escapeHtml(state.standSearch)}" placeholder="Название, pool ID, владелец…"></label>
         <div class="filter-tabs" role="tablist">${[["all", "Все"], ["running", "Работают"], ["provisioning", "В процессе"], ["stopped", "Остановлены"], ["attention", "Требуют внимания"]].map(([key, label]) => `<button class="filter-tab ${state.standFilter === key ? "is-active" : ""}" data-stand-filter="${key}" type="button">${label}<span>${counts[key]}</span></button>`).join("")}</div></div>
         <div class="toolbar-actions"><button class="button" data-refresh>${icon("refresh")}Обновить</button></div></div>
@@ -579,14 +583,66 @@ exit 75`;
         <article class="card"><div class="card__header"><div class="card__heading"><h3 class="card__title">Ноды Proxmox</h3><p class="card__subtitle">Распределение нагрузки и экзаменационных VM</p></div></div><div class="infra-node-list">${metrics.nodes.map(infraNode).join("")}</div></article>
         <article class="card"><div class="card__header"><div class="card__heading"><h3 class="card__title">Вклад по стендам</h3><p class="card__subtitle">Текущая оценка CPU работающих стендов</p></div></div><div class="stand-impact-list">${topStands.map((stand, index) => `<button type="button" data-stand-detail="${stand.id}" class="impact-row"><span class="impact-rank">${index + 1}</span><span class="impact-copy"><strong>${escapeHtml(stand.name)}</strong><small>${stand.vm_count} VM · ${escapeHtml(stand.node)}</small><i><b style="width:${clamp(stand.cpu)}%"></b></i></span><span class="impact-value">${formatNumber(stand.cpu, 1)}%</span></button>`).join("") || emptyState("activity", "Нет нагрузки", "Все стенды остановлены.")}</div></article>
       </div>
+      ${renderWebActivityCard(state.webActivity)}
       <div class="attribution-note">${icon("info")}<div><strong>Что означает «нагрузка стендов»</strong><p>${escapeHtml(metrics.attribution_method)}. Это практическая оценка по VM; служебные процессы гипервизора, общий page cache и нагрузку shared storage нельзя строго причинно отнести к одному стенду.</p></div></div>
     </section>`;
+    if (!state.webActivity) window.setTimeout(() => loadWebActivity({ background: true }), 0);
+    else scheduleWebActivityRefresh();
   }
 
   function infraNode(node) {
     return `<div class="infra-node"><div class="infra-node__head"><div class="node-name"><span class="node-name__icon">${icon("server")}</span><span><strong>${escapeHtml(node.name)}</strong><small>uptime ${node.uptime_days} дн. · ${node.running_vms} VM</small></span></div>${statusChip(node.status)}</div>
       <div class="infra-node__metrics"><div><span>CPU</span><strong>${formatNumber(node.cpu, 1)}%</strong><small>стенды ${formatNumber(node.exam_cpu, 1)}%</small></div><div><span>RAM</span><strong>${formatNumber(node.ram, 1)}%</strong><small>стенды ${formatNumber(node.exam_ram, 1)}%</small></div><div><span>Диск</span><strong>${formatNumber(node.disk, 1)}%</strong><small>${node.exam_vms} exam VM</small></div></div>
       <div class="stacked-load" title="Оранжевый: экзаменационные стенды"><i style="width:${clamp(node.cpu)}%"><b style="width:${clamp(node.cpu ? node.exam_cpu / node.cpu * 100 : 0)}%"></b></i></div></div>`;
+  }
+
+  function renderWebActivityCard(payload) {
+    if (!payload) {
+      return `<article class="card" id="web-activity-card"><div class="card__header"><div class="card__heading"><h3 class="card__title">Веб-активность на стендах</h3><p class="card__subtitle">Проверяем pveproxy через QEMU Guest Agent</p></div></div><div class="detail-loading"><span class="spinner"></span><p>Ищем недавние обращения web UI…</p></div></article>`;
+    }
+    if (payload.error) {
+      return `<article class="card" id="web-activity-card"><div class="card__header"><div class="card__heading"><h3 class="card__title">Веб-активность на стендах</h3><p class="card__subtitle">Не удалось получить данные</p></div><button class="button button--small" data-refresh-web-activity>${icon("refresh")}Повторить</button></div><div class="alert alert--error">${icon("alert")}<div>${escapeHtml(payload.error)}</div></div></article>`;
+    }
+    const activity = Array.isArray(payload.activity) ? payload.activity : [];
+    const errors = Array.isArray(payload.errors) ? payload.errors : [];
+    const requestedVms = Number(payload.requested_vms || 0);
+    const scannedVms = Number(payload.scanned_vms || 0);
+    const completelyUnavailable = requestedVms > 0 && scannedVms === 0;
+    const activeCount = activity.filter(item => item.state === "active").length;
+    const rows = activity.map(item => `<tr><td><strong class="cell-title">${escapeHtml(item.stand_name || `Стенд #${item.stand_id || "—"}`)}</strong><small class="cell-subtitle">${escapeHtml(item.vm_name || `VM ${item.vmid}`)} · VMID ${Number(item.vmid)}</small></td><td><strong class="mono">${escapeHtml(item.source_ip)}</strong><small class="cell-subtitle">IP клиента</small></td><td><strong class="mono">${escapeHtml(item.user)}</strong><small class="cell-subtitle">учётная запись Proxmox</small></td><td>${item.state === "active" ? statusChip("running", "Активен") : statusChip("idle", "Недавно активен")}<small class="cell-subtitle">${relativeTime(item.last_seen)}</small></td><td><strong>${formatNumber(item.request_count)}</strong><small class="cell-subtitle">запросов за окно</small></td></tr>`).join("");
+    const subtitle = completelyUnavailable
+      ? `Проверка недоступна для ${requestedVms} VM`
+      : `${activeCount} активных сейчас · ${activity.length} замечено за ${Math.round(Number(payload.window_seconds || 180) / 60)} мин.`;
+    const resultBody = rows
+      ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>Стенд / VM</th><th>Клиент</th><th>Логин</th><th>Активность</th><th>Запросы</th></tr></thead><tbody>${rows}</tbody></table></div>`
+      : completelyUnavailable
+        ? `<div class="alert alert--warning">${icon("alert")}<div><strong>Не удалось проверить ни одну VM.</strong><br>Проверьте QEMU Guest Agent, право VM.GuestAgent.Unrestricted и доступ к /var/log/pveproxy/access.log.</div></div>`
+        : emptyState("users", "Открытых web UI не обнаружено", "За последние три минуты не было регулярных запросов интерфейса Proxmox.");
+    return `<article class="card" id="web-activity-card"><div class="card__header"><div class="card__heading"><h3 class="card__title">Веб-активность на стендах</h3><p class="card__subtitle">${subtitle}</p></div><button class="button button--small" data-refresh-web-activity>${icon("refresh")}Обновить</button></div><div class="alert alert--info">${icon("info")}<div><strong>Это недавняя активность, а не точный список сессий.</strong><br>${escapeHtml(payload.notice || "Proxmox не хранит серверный список открытых браузерных вкладок.")}</div></div>${resultBody}${errors.length && !completelyUnavailable ? `<div class="card__footer"><span class="microcopy">Не удалось проверить ${errors.length} из ${requestedVms} VM. Нужен работающий QEMU Guest Agent и доступ к pveproxy log.</span></div>` : ""}</article>`;
+  }
+
+  function scheduleWebActivityRefresh() {
+    if (webActivityPollTimer) window.clearTimeout(webActivityPollTimer);
+    webActivityPollTimer = null;
+    if (state.route === "infrastructure" && !document.hidden) {
+      webActivityPollTimer = window.setTimeout(() => loadWebActivity({ background: true }), 30000);
+    }
+  }
+
+  async function loadWebActivity({ force = false, background = false } = {}) {
+    if (state.webActivityLoading) return;
+    if (state.webActivity && !force && !background) { scheduleWebActivityRefresh(); return; }
+    state.webActivityLoading = true;
+    try {
+      state.webActivity = await api(`/api/web-activity${force ? "?force=1" : ""}`, { promptAdmin: !background });
+    } catch (error) {
+      state.webActivity = { activity: [], errors: [], error: error.message };
+    } finally {
+      state.webActivityLoading = false;
+      const card = document.querySelector("#web-activity-card");
+      if (card && state.route === "infrastructure") card.outerHTML = renderWebActivityCard(state.webActivity);
+      scheduleWebActivityRefresh();
+    }
   }
 
   async function loadIpam({ force = false } = {}) {
@@ -970,7 +1026,9 @@ exit 75`;
     const password = credential?.password || credential?.access_password || "";
     const accessUrl = safeAccessUrl(vm.access_url || vm.web_url);
     const hasStartSnapshot = vmHasStartSnapshot(vm);
-    const standBusy = ["provisioning", "resetting"].includes(stand.status);
+    const standBusy = ["provisioning", "resetting"].includes(stand.status) || Boolean(stand.bulk_rollback_pending);
+    const canRollbackVm = hasVmid && hasStartSnapshot && Boolean(vm.credential_recoverable)
+      && !standBusy && stand.check_status !== "running" && vm.check_status !== "running";
     const checkLabel = vm.check_status === "running" ? "автопроверка идёт" : vm.check_score == null ? "не проверялась" : `автопроверка ${formatNumber(vm.check_score)}%`;
     const passwordUnverified = credentialState === "loaded" && !password
       && Boolean(credential?.credential_recoverable || vm.credential_recoverable);
@@ -985,13 +1043,13 @@ exit 75`;
       <span class="vm-state vm-state--${escapeHtml(vm.status)}"></span>
       <div class="vm-main"><div class="vm-main__title"><strong>${escapeHtml(vm.name)}</strong>${statusChip(vm.status)}</div><small class="mono">${hasVmid ? `VMID ${numericVmid}` : "VM создаётся"} · ${escapeHtml(vm.ip || "IP резервируется")}</small><div class="vm-meta"><span>${icon("server")}${escapeHtml(vm.node || stand.node || "авто")}</span><span class="${hasStartSnapshot ? "is-ready" : ""}">${icon("copy")}${hasStartSnapshot ? "snapshot start готов" : "snapshot start"}</span><span class="${vm.check_status === "running" ? "is-checking" : vm.check_score == null ? "" : vm.check_score >= 90 ? "is-ready" : vm.check_score >= 70 ? "is-warning" : "is-failed"}">${icon("check")}${escapeHtml(checkLabel)}</span></div></div>
       <div class="vm-access"><div class="vm-access__hint">${icon("lock")}Доступ к веб-интерфейсу</div><div class="vm-credentials"><div><span>Логин</span><strong class="mono">${escapeHtml(username)}</strong><button type="button" data-copy-vm-login data-value="${escapeHtml(username)}">${icon("copy")}Копировать</button></div><div><span>Пароль</span><strong class="mono" data-vm-secret>${escapeHtml(passwordText)}</strong>${password ? `<div class="vm-secret-actions"><button type="button" data-reveal-vm-password data-password="${escapeHtml(password)}">${icon("eye")}Показать</button><button type="button" data-copy-vm-password data-value="${escapeHtml(password)}">${icon("copy")}Копировать</button></div>` : ""}</div></div>${password ? `<button class="vm-copy-access" type="button" data-copy-vm-credential data-user="${escapeHtml(username)}" data-password="${escapeHtml(password)}">${icon("copy")}Скопировать парой</button>` : `<small class="vm-access__empty">${escapeHtml(passwordHint)}</small>`}</div>
-      <div class="vm-actions">${accessButton}<div><button class="button button--small" type="button" data-vm-action="snapshot" data-stand-id="${stand.id}" data-vmid="${hasVmid ? numericVmid : ""}" data-vm-name="${escapeHtml(vm.name)}" ${!hasVmid || standBusy ? "disabled" : ""}>${icon("copy")}Снимок</button><button class="button button--small" type="button" data-vm-action="password" data-stand-id="${stand.id}" data-vmid="${hasVmid ? numericVmid : ""}" data-vm-name="${escapeHtml(vm.name)}" ${!hasVmid || vm.status !== "running" || standBusy ? "disabled" : ""}>${icon("lock")}Пароль</button><button class="button button--small" type="button" data-vm-action="run_check" data-stand-id="${stand.id}" data-vmid="${hasVmid ? numericVmid : ""}" data-vm-name="${escapeHtml(vm.name)}" ${!hasVmid || vm.status !== "running" || standBusy ? "disabled" : ""}>${icon("check")}Автопроверка</button></div></div>
+      <div class="vm-actions">${accessButton}<div><button class="button button--small" type="button" data-vm-action="snapshot" data-stand-id="${stand.id}" data-vmid="${hasVmid ? numericVmid : ""}" data-vm-name="${escapeHtml(vm.name)}" ${!hasVmid || standBusy ? "disabled" : ""}>${icon("copy")}Снимок</button><button class="button button--small" type="button" data-vm-action="rollback_start" data-stand-id="${stand.id}" data-vmid="${hasVmid ? numericVmid : ""}" data-vm-name="${escapeHtml(vm.name)}" title="Вернуть эту VM к snapshot start" ${canRollbackVm ? "" : "disabled"}>${icon("refresh")}Вернуть к start</button><button class="button button--small" type="button" data-vm-action="password" data-stand-id="${stand.id}" data-vmid="${hasVmid ? numericVmid : ""}" data-vm-name="${escapeHtml(vm.name)}" ${!hasVmid || vm.status !== "running" || standBusy ? "disabled" : ""}>${icon("lock")}Пароль</button><button class="button button--small" type="button" data-vm-action="run_check" data-stand-id="${stand.id}" data-vmid="${hasVmid ? numericVmid : ""}" data-vm-name="${escapeHtml(vm.name)}" ${!hasVmid || vm.status !== "running" || standBusy ? "disabled" : ""}>${icon("check")}Автопроверка</button></div></div>
     </article>`;
   }
 
   function renderStandDetailModal(stand, credentials = new Map(), credentialState = "locked", credentialError = "", { updateExisting = false } = {}) {
     const runCount = stand.vms.filter(vm => vm.status === "running").length;
-    const standBusy = ["provisioning", "resetting"].includes(stand.status);
+    const standBusy = ["provisioning", "resetting"].includes(stand.status) || Boolean(stand.bulk_rollback_pending);
     const missingStartCount = stand.vms.filter(vm => !vmHasStartSnapshot(vm)).length;
     const missingCredentialCount = stand.vms.filter(vm => !vm.credential_recoverable).length;
     const canRollbackStart = stand.vms.length > 0 && !standBusy && !missingStartCount && !missingCredentialCount
@@ -1072,7 +1130,26 @@ exit 75`;
   }
 
   function standNeedsLivePolling(stand) {
-    return ["provisioning", "resetting"].includes(stand?.status) || stand?.check_status === "running" || (stand?.vms || []).some(vm => vm.check_status === "running");
+    return ["provisioning", "resetting"].includes(stand?.status)
+      || stand?.check_status === "running"
+      || (stand?.vms || []).some(vm => vm.check_status === "running")
+      || Boolean(stand?.bulk_rollback_pending)
+      || state.bulkRollbackPending.has(Number(stand?.id));
+  }
+
+  function settleBulkRollbackPending(stand) {
+    const id = Number(stand?.id);
+    const pending = state.bulkRollbackPending.get(id);
+    if (!pending) return;
+    if (stand.status === "resetting") {
+      pending.seenActive = true;
+      return;
+    }
+    if (stand.bulk_rollback_pending) return;
+    const changedSinceScheduling = String(stand.updated_at || "") !== pending.baselineUpdatedAt;
+    if (pending.seenActive || changedSinceScheduling || stand.bulk_rollback_pending === false) {
+      state.bulkRollbackPending.delete(id);
+    }
   }
 
   function syncOperationPolling() {
@@ -1101,6 +1178,7 @@ exit 75`;
       updates.forEach((result, index) => {
         if (result.status !== "fulfilled") return;
         const stand = result.value;
+        settleBulkRollbackPending(stand);
         const stateIndex = state.data.stands.findIndex(item => Number(item.id) === Number(stand.id));
         if (stateIndex >= 0) state.data.stands[stateIndex] = { ...state.data.stands[stateIndex], ...stand };
         if (stateIndex >= 0 && state.route === "stands") {
@@ -1133,6 +1211,7 @@ exit 75`;
       if (activeStandDetailId !== Number(id) || !modalRoot.querySelector(`.modal[data-stand-detail-id="${Number(id)}"]`)) return;
       try {
         const stand = await api(`/api/stands/${id}`, { promptAdmin: false });
+        settleBulkRollbackPending(stand);
         let nextCredentials = credentials;
         let nextCredentialState = credentialState;
         let nextCredentialError = credentialError;
@@ -1190,6 +1269,74 @@ exit 75`;
     });
   }
 
+  function openVmRollbackStartModal(standId, vmid, vmName) {
+    const body = `<div class="danger-confirm compact"><span>${icon("refresh")}</span><h3>Вернуть VM к snapshot start?</h3><p>Все изменения внутри <strong>${escapeHtml(vmName)}</strong> после первоначального snapshot будут безвозвратно потеряны. Остальные VM этого стенда не изменятся.</p><div class="alert alert--info">${icon("lock")}<div><strong>Текущий пароль будет сохранён.</strong><br>VM остановится, откатится, запустится снова, после чего dashboard повторно применит сохранённый пароль.</div></div></div>`;
+    showModal({
+      title: "Вернуть VM к изначальному состоянию",
+      subtitle: `${vmName} · VMID ${vmid}`,
+      body,
+      footer: `<button class="button button--danger" id="rollback-vm-confirm" type="button">${icon("refresh")}Вернуть эту VM к start</button>`,
+    });
+    const button = modalRoot.querySelector("#rollback-vm-confirm");
+    button?.addEventListener("click", async () => {
+      if (button.dataset.busy === "true") return;
+      button.dataset.busy = "true";
+      button.disabled = true;
+      button.innerHTML = `${icon("refresh")}Запускаем возврат…`;
+      try {
+        const result = await api(`/api/stands/${standId}/vms/${vmid}/actions`, { method: "POST", body: { action: "rollback_start" } });
+        toast(result.message || `Возврат VM ${vmid} запущен`);
+        closeModal();
+        await loadData({ silent: true });
+        await openStandDetail(standId);
+      } catch (error) {
+        button.disabled = false;
+        delete button.dataset.busy;
+        button.innerHTML = `${icon("refresh")}Вернуть эту VM к start`;
+        toast(error.message, "error");
+      }
+    });
+  }
+
+  function openRollbackAllStandsModal() {
+    const managed = (state.data?.stands || []).filter(stand => stand.origin !== "imported");
+    const body = `<div class="danger-confirm compact"><span>${icon("refresh")}</span><h3>Вернуть все стенды к snapshot start?</h3><p>Dashboard последовательно сбросит все подготовленные управляемые стенды. Все изменения после первоначальных snapshots будут безвозвратно потеряны.</p><div class="alert alert--warning">${icon("alert")}<div><strong>Проверка выполняется на сервере.</strong><br>Занятые стенды, импортированные pools, стенды без snapshot start или сохранённого пароля будут пропущены. Подходящих по текущему состоянию: до ${managed.length}.</div></div><label class="field"><span class="field-label">Для подтверждения введите СБРОСИТЬ</span><input class="input mono" id="rollback-all-confirm-text" autocomplete="off" spellcheck="false" placeholder="СБРОСИТЬ"></label></div>`;
+    showModal({
+      title: "Массовый возврат стендов",
+      subtitle: "Необратимая операция",
+      body,
+      footer: `<button class="button button--danger" id="rollback-all-confirm" type="button" disabled>${icon("refresh")}Вернуть все стенды</button>`,
+    });
+    const input = modalRoot.querySelector("#rollback-all-confirm-text");
+    const button = modalRoot.querySelector("#rollback-all-confirm");
+    input?.addEventListener("input", () => { button.disabled = input.value.trim() !== "СБРОСИТЬ"; });
+    button?.addEventListener("click", async () => {
+      if (button.dataset.busy === "true" || input.value.trim() !== "СБРОСИТЬ") return;
+      button.dataset.busy = "true";
+      button.disabled = true;
+      button.innerHTML = `${icon("refresh")}Формируем очередь…`;
+      try {
+        const result = await api("/api/stands/actions", { method: "POST", body: { action: "rollback_start_all" } });
+        (result.scheduled || []).forEach(id => {
+          const baseline = state.data?.stands?.find(stand => Number(stand.id) === Number(id));
+          state.bulkRollbackPending.set(Number(id), {
+            seenActive: false,
+            baselineUpdatedAt: String(baseline?.updated_at || ""),
+          });
+        });
+        closeModal();
+        toast(`${result.message}. Пропущено: ${Number(result.skipped_count || 0)}`, result.skipped_count ? "warning" : "success", 6500);
+        await loadData();
+        syncOperationPolling();
+      } catch (error) {
+        button.disabled = false;
+        delete button.dataset.busy;
+        button.innerHTML = `${icon("refresh")}Вернуть все стенды`;
+        toast(error.message, "error");
+      }
+    });
+  }
+
   async function performStandAction(id, action) {
     if (action === "password") { openPasswordModal(id); return; }
     if (action === "rollback_start") { await openRollbackStartModal(id); return; }
@@ -1207,6 +1354,10 @@ exit 75`;
   async function performVmAction(standId, vmid, action, vmName) {
     if (action === "password") {
       openPasswordModal(standId, { vmid, vmName });
+      return;
+    }
+    if (action === "rollback_start") {
+      openVmRollbackStartModal(standId, vmid, vmName);
       return;
     }
     const labels = { snapshot: `Создаём снимок VM «${vmName}»…`, run_check: `Автопроверка VM «${vmName}» запущена…` };
@@ -1246,7 +1397,7 @@ exit 75`;
     const stand = state.data.stands.find(item => item.id === Number(id));
     const singleVm = Number.isInteger(Number(vmTarget?.vmid));
     const targetName = singleVm ? (vmTarget.vmName || `VMID ${vmTarget.vmid}`) : "всех VM стенда";
-    const body = `<form id="password-form"><div class="credential-intro"><span>${icon("lock")}</span><div><h3>${singleVm ? `Только ${escapeHtml(targetName)}` : "Ротация на всех VM"}</h3><p>Новый пароль будет установлен через QEMU Guest Agent и показан только один раз.</p></div></div><div class="form-grid"><label class="field"><span class="field-label">Системный пользователь</span><input class="input mono" name="username" value="root" required><small class="field-hint">Для входа в web UI используется логин root@pam</small></label><label class="field"><span class="field-label">Режим</span><select class="input" id="password-mode"><option value="generate">Сгенерировать безопасный</option><option value="custom">Задать вручную</option></select></label><label class="field field--full" id="custom-password-field" hidden><span class="field-label">Новый пароль</span><input class="input mono" type="password" name="password" minlength="10" autocomplete="new-password"><small class="field-hint">Минимум 10 символов</small></label></div><div class="alert alert--warning">${icon("alert")} Новый пароль потребуется при следующей авторизации в веб-интерфейсе этой ${singleVm ? "VM" : "группы VM"}.</div></form>`;
+    const body = `<form id="password-form"><div class="credential-intro"><span>${icon("lock")}</span><div><h3>${singleVm ? `Только ${escapeHtml(targetName)}` : "Ротация на всех VM"}</h3><p>Новый пароль будет установлен через QEMU Guest Agent и показан только один раз.</p></div></div><div class="form-grid"><label class="field"><span class="field-label">Системный пользователь</span><input class="input mono" name="username" value="root" required><small class="field-hint">Для входа в web UI используется логин root@pam</small></label><label class="field"><span class="field-label">Режим</span><select class="input" id="password-mode"><option value="generate">Сгенерировать безопасный</option><option value="custom">Задать вручную</option></select></label><label class="field field--full" id="custom-password-field" hidden><span class="field-label">Новый пароль</span><input class="input mono" type="password" name="password" minlength="10" autocomplete="new-password"><small class="field-hint">Dashboard не вводит короткий искусственный лимит; технический предел Proxmox — 1024 символа</small></label></div><div class="alert alert--warning">${icon("alert")} Новый пароль потребуется при следующей авторизации в веб-интерфейсе этой ${singleVm ? "VM" : "группы VM"}.</div></form>`;
     const footer = `<button class="button" data-close-modal type="button">Отмена</button><button class="button button--primary" type="submit" form="password-form">${icon("lock")}Сменить пароль</button>`;
     showModal({ title: singleVm ? "Сменить пароль VM" : "Сменить пароль стенда", subtitle: singleVm ? `${stand?.name || `Стенд #${id}`} · ${targetName}` : stand?.name || `Стенд #${id}`, body, footer });
     const mode = modalRoot.querySelector("#password-mode");
@@ -1355,6 +1506,10 @@ exit 75`;
       return;
     }
     state.editorDirty = false;
+    if (route !== "infrastructure" && webActivityPollTimer) {
+      window.clearTimeout(webActivityPollTimer);
+      webActivityPollTimer = null;
+    }
     state.route = route;
     if (route === "ipam") state.ipam = null;
     window.location.hash = route;
@@ -1409,9 +1564,11 @@ exit 75`;
     if (!target) return;
     if (target.matches(".nav-link[data-route], .brand[data-route]")) { event.preventDefault(); navigate(target.dataset.route); }
     else if (target.dataset.navigate) navigate(target.dataset.navigate);
+    else if (target.dataset.rollbackAllStands !== undefined) openRollbackAllStandsModal();
     else if (target.dataset.importPool !== undefined) openImportPoolModal();
     else if (target.matches("[data-open-deploy]")) openDeployWizard(target.dataset.openDeploy || null);
     else if (target.matches("[data-refresh-ipam]")) { state.ipam = null; renderIpam(); await loadIpam({ force: true }); }
+    else if (target.matches("[data-refresh-web-activity]")) await loadWebActivity({ force: true });
     else if (target.matches("[data-refresh]")) loadData();
     else if (target.dataset.standFilter) { state.standFilter = target.dataset.standFilter; renderStands(); }
     else if (target.dataset.standDetail) openStandDetail(Number(target.dataset.standDetail));
@@ -1515,7 +1672,12 @@ exit 75`;
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     }
   });
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) syncOperationPolling(); });
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) {
+      syncOperationPolling();
+      if (state.route === "infrastructure") loadWebActivity({ background: true });
+    }
+  });
   window.addEventListener("resize", () => { if (window.innerWidth > 980) closeSidebar(); });
   window.addEventListener("hashchange", () => { const route = getRoute(); if (route !== state.route) navigate(route); });
   window.addEventListener("beforeunload", event => { if (state.editorDirty) { event.preventDefault(); event.returnValue = ""; } });

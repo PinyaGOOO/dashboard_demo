@@ -4,14 +4,14 @@ import ipaddress
 import json
 import os
 import re
-import secrets
-import string
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .database import DashboardStore, utc_now
+from .passwords import PROXMOX_PASSWORD_MAX_LENGTH, generate_password
 from .proxmox_gateway import (
     CredentialRestoreError,
     DemoProxmoxGateway,
@@ -44,6 +44,12 @@ class DashboardService:
         self._jobs: dict[int, threading.Thread] = {}
         self._job_lock = threading.Lock()
         self._stand_operation_locks: dict[int, threading.RLock] = {}
+        self._bulk_rollback_lock = threading.RLock()
+        self._bulk_rollback_job: threading.Thread | None = None
+        self._bulk_rollback_pending: set[int] = set()
+        self._web_activity_lock = threading.Lock()
+        self._web_activity_cache: dict[str, Any] | None = None
+        self._web_activity_cache_at = 0.0
         self._mark_interrupted_rollbacks()
         if gateway.mode == "demo":
             self._resume_demo_deployments()
@@ -95,6 +101,11 @@ class DashboardService:
         """Serialize mutating requests for one stand across HTTP threads."""
         with self._job_lock:
             return self._stand_operation_locks.setdefault(stand_id, threading.RLock())
+
+    def _assert_not_bulk_rollback_pending(self, stand_id: int) -> None:
+        with self._bulk_rollback_lock:
+            if int(stand_id) in self._bulk_rollback_pending:
+                raise ConflictError("Стенд уже поставлен в очередь массового возврата к snapshot start")
 
     def integration(self) -> dict[str, Any]:
         info = self.gateway.integration_info()
@@ -333,7 +344,12 @@ class DashboardService:
         ORDER BY CASE s.status WHEN 'provisioning' THEN 0 WHEN 'resetting' THEN 0 WHEN 'error' THEN 1 WHEN 'running' THEN 2 ELSE 3 END,
                  s.updated_at DESC
         """
-        return self.store.query_all(sql)
+        stands = self.store.query_all(sql)
+        with self._bulk_rollback_lock:
+            pending = set(self._bulk_rollback_pending)
+        for stand in stands:
+            stand["bulk_rollback_pending"] = int(stand["id"]) in pending
+        return stands
 
     def get_stand(self, stand_id: int) -> dict[str, Any]:
         stand = next((item for item in self.list_stands() if int(item["id"]) == stand_id), None)
@@ -618,6 +634,7 @@ class DashboardService:
         return self.get_stand(stand_id)
 
     def update_stand(self, stand_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        self._assert_not_bulk_rollback_pending(stand_id)
         stand = self.get_stand(stand_id)
         if "ip_range" in payload and str(payload["ip_range"]).strip() != str(stand.get("ip_range") or "").strip():
             raise ValidationError(
@@ -820,7 +837,16 @@ class DashboardService:
             with self._job_lock:
                 self._jobs.pop(stand_id, None)
 
-    def stand_action(self, stand_id: int, action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    def stand_action(
+        self,
+        stand_id: int,
+        action: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        _bulk_reserved: bool = False,
+    ) -> dict[str, Any]:
+        if not _bulk_reserved:
+            self._assert_not_bulk_rollback_pending(stand_id)
         with self._stand_operation_lock(stand_id):
             return self._stand_action_locked(stand_id, action, payload)
 
@@ -835,89 +861,10 @@ class DashboardService:
             if stand_id in self._jobs:
                 raise ConflictError("Для стенда уже выполняется фоновая операция")
         if action == "rollback_start":
-            if stand.get("check_status") == "running" or any(
-                vm.get("check_status") == "running" for vm in stand["vms"]
-            ):
-                raise ConflictError("Сначала дождитесь завершения автопроверки")
-            if not vmids:
-                raise ConflictError("В стенде нет VM для возврата к исходному состоянию")
-            missing = [
-                str(vm.get("vmid") or vm.get("name") or "неизвестная VM")
-                for vm in stand["vms"]
-                if vm.get("vmid") is None or not vm.get("has_start_snapshot")
-            ]
-            if missing:
-                raise ConflictError(
-                    "Возврат недоступен: snapshot start отсутствует у VM " + ", ".join(missing)
-                )
             raw_vms = self.store.query_all(
                 "SELECT * FROM stand_vms WHERE stand_id = ? ORDER BY id", (stand_id,),
             )
-            missing_credentials = [
-                str(vm.get("vmid") or vm.get("name") or "неизвестная VM")
-                for vm in raw_vms
-                if not str(vm.get("credential_password") or "")
-            ]
-            if missing_credentials:
-                raise ConflictError(
-                    "Возврат недоступен: dashboard не хранит пароль VM "
-                    + ", ".join(missing_credentials)
-                    + ". Сначала задайте пароль для этих VM."
-                )
-            thread = threading.Thread(
-                target=self._rollback_start_job,
-                args=(stand_id, str(stand["name"]), raw_vms),
-                name=f"rollback-start-{stand_id}",
-                daemon=True,
-            )
-            with self._job_lock:
-                if stand_id in self._jobs:
-                    raise ConflictError("Для стенда уже выполняется фоновая операция")
-                now = utc_now()
-                with self.store.transaction() as connection:
-                    connection.execute(
-                        """UPDATE stands SET status = 'resetting', progress = 5, last_error = '',
-                        updated_at = ? WHERE id = ?""",
-                        (now, stand_id),
-                    )
-                    connection.execute(
-                        """UPDATE stand_vms SET status = 'resetting', credential_valid = 0
-                        WHERE stand_id = ?""",
-                        (stand_id,),
-                    )
-                self._jobs[stand_id] = thread
-            try:
-                try:
-                    self.store.add_activity(
-                        "rollback", "Возврат к исходному состоянию запущен",
-                        f"{stand['name']} · {len(vmids)} VM · snapshot start", "progress",
-                    )
-                except Exception:
-                    # Audit logging must not leave a registered job without a worker.
-                    pass
-                thread.start()
-            except Exception:
-                with self._job_lock:
-                    self._jobs.pop(stand_id, None)
-                with self.store.transaction() as connection:
-                    connection.execute(
-                        "UPDATE stands SET status = ?, progress = 100, updated_at = ? WHERE id = ?",
-                        (str(stand["status"]), utc_now(), stand_id),
-                    )
-                    for vm in raw_vms:
-                        connection.execute(
-                            "UPDATE stand_vms SET status = ?, credential_valid = ? WHERE id = ?",
-                            (
-                                str(vm.get("status") or "stopped"),
-                                1 if vm.get("credential_valid", 1) else 0,
-                                int(vm["id"]),
-                            ),
-                        )
-                raise
-            return {
-                "stand": self.get_stand(stand_id),
-                "message": "Возврат всех VM к snapshot start запущен",
-            }
+            return self._enqueue_rollback_start(stand, raw_vms, "все VM")
         if action in {"start", "stop", "restart"}:
             if not vmids:
                 raise ConflictError("В стенде нет VM для управления питанием")
@@ -954,6 +901,10 @@ class DashboardService:
                 raise ValidationError("Некорректный логин веб-интерфейса VM")
             if len(password) < 10:
                 raise ValidationError("Пароль должен содержать не менее 10 символов")
+            if len(password) > PROXMOX_PASSWORD_MAX_LENGTH:
+                raise ValidationError(
+                    f"Proxmox принимает пароль длиной не более {PROXMOX_PASSWORD_MAX_LENGTH} символов"
+                )
             if not vmids:
                 raise ConflictError("В стенде нет VM для смены пароля")
             self.gateway.rotate_password(vmids, username, password)
@@ -979,11 +930,243 @@ class DashboardService:
             return {"stand": self.get_stand(stand_id), "message": "Автопроверка запущена", "run": run}
         raise ValidationError("Неизвестное действие")
 
+    def rollback_all_stands(self) -> dict[str, Any]:
+        with self._bulk_rollback_lock:
+            if self._bulk_rollback_job and self._bulk_rollback_job.is_alive():
+                raise ConflictError("Массовый возврат стендов уже выполняется")
+
+            eligible: list[int] = []
+            skipped: list[dict[str, Any]] = []
+            with self._job_lock:
+                busy_ids = set(self._jobs)
+            for summary in self.list_stands():
+                stand_id = int(summary["id"])
+                stand = self.get_stand(stand_id)
+                reason = ""
+                if str(stand.get("origin") or "deployed") == "imported":
+                    reason = "подключённый существующий pool"
+                elif stand_id in busy_ids or stand.get("status") in {"provisioning", "resetting"}:
+                    reason = "уже выполняется фоновая операция"
+                elif stand.get("check_status") == "running" or any(
+                    vm.get("check_status") == "running" for vm in stand["vms"]
+                ):
+                    reason = "выполняется автопроверка"
+                elif not stand["vms"]:
+                    reason = "нет VM"
+                elif any(vm.get("vmid") is None or not vm.get("has_start_snapshot") for vm in stand["vms"]):
+                    reason = "не у всех VM есть snapshot start"
+                elif any(not vm.get("credential_recoverable") for vm in stand["vms"]):
+                    reason = "не у всех VM сохранён пароль"
+                if reason:
+                    skipped.append({"stand_id": stand_id, "name": stand["name"], "reason": reason})
+                else:
+                    eligible.append(stand_id)
+
+            if not eligible:
+                raise ConflictError("Нет стендов, готовых к массовому возврату к snapshot start")
+            thread = threading.Thread(
+                target=self._bulk_rollback_start_job,
+                args=(eligible,),
+                name="rollback-start-all-stands",
+                daemon=True,
+            )
+            self._bulk_rollback_job = thread
+            self._bulk_rollback_pending = set(eligible)
+            try:
+                thread.start()
+            except Exception:
+                self._bulk_rollback_job = None
+                self._bulk_rollback_pending.clear()
+                raise
+        try:
+            self.store.add_activity(
+                "rollback", "Массовый возврат стендов запущен",
+                f"Запланировано {len(eligible)}, пропущено {len(skipped)}", "progress",
+            )
+        except Exception:
+            pass
+        return {
+            "message": f"Массовый возврат запущен для {len(eligible)} стендов",
+            "scheduled": eligible,
+            "scheduled_count": len(eligible),
+            "skipped": skipped,
+            "skipped_count": len(skipped),
+        }
+
+    def _bulk_rollback_start_job(self, stand_ids: list[int]) -> None:
+        try:
+            try:
+                configured = int(os.environ.get("PROXMOX_BULK_ROLLBACK_STANDS", "1"))
+            except ValueError:
+                configured = 1
+            workers = max(1, min(configured, 4, len(stand_ids)))
+
+            def reset_one(stand_id: int) -> tuple[int, str]:
+                try:
+                    self.stand_action(
+                        stand_id,
+                        "rollback_start",
+                        {"action": "rollback_start"},
+                        _bulk_reserved=True,
+                    )
+                    with self._job_lock:
+                        worker = self._jobs.get(stand_id)
+                    if worker and worker is not threading.current_thread():
+                        worker.join()
+                    stand = self.get_stand(stand_id)
+                    if stand.get("status") == "error":
+                        return stand_id, str(stand.get("last_error") or "ошибка возврата")
+                    return stand_id, ""
+                except Exception as exc:
+                    try:
+                        self.store.execute(
+                            "UPDATE stands SET last_error = ?, updated_at = ? WHERE id = ?",
+                            (f"Массовый возврат пропущен: {str(exc)[-900:]}", utc_now(), stand_id),
+                        )
+                    except Exception:
+                        pass
+                    return stand_id, str(exc)
+                finally:
+                    # A completed stand can be managed again even while later
+                    # stands are still waiting in the global queue.
+                    with self._bulk_rollback_lock:
+                        self._bulk_rollback_pending.discard(stand_id)
+
+            failures: list[tuple[int, str]] = []
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="rollback-stand") as executor:
+                futures = {executor.submit(reset_one, stand_id): stand_id for stand_id in stand_ids}
+                for future in as_completed(futures):
+                    stand_id, error = future.result()
+                    if error:
+                        failures.append((stand_id, error))
+            try:
+                self.store.add_activity(
+                    "rollback",
+                    "Массовый возврат стендов завершён" if not failures else "Массовый возврат завершён с ошибками",
+                    f"Успешно {len(stand_ids) - len(failures)} из {len(stand_ids)}"
+                    + (f" · ошибки: {', '.join(str(item[0]) for item in failures)}" if failures else ""),
+                    "success" if not failures else "warning",
+                    "Система",
+                )
+            except Exception:
+                pass
+        finally:
+            with self._bulk_rollback_lock:
+                self._bulk_rollback_job = None
+                self._bulk_rollback_pending.difference_update(stand_ids)
+
+    def _enqueue_rollback_start(
+        self,
+        stand: dict[str, Any],
+        raw_vms: list[dict[str, Any]],
+        scope_label: str,
+    ) -> dict[str, Any]:
+        stand_id = int(stand["id"])
+        if stand.get("check_status") == "running" or any(
+            vm.get("check_status") == "running" for vm in stand.get("vms", [])
+        ):
+            raise ConflictError("Сначала дождитесь завершения автопроверки")
+        if not raw_vms:
+            raise ConflictError("Нет VM для возврата к исходному состоянию")
+        missing_snapshots = [
+            str(vm.get("vmid") or vm.get("name") or "неизвестная VM")
+            for vm in raw_vms
+            if vm.get("vmid") is None or not vm.get("has_start_snapshot")
+        ]
+        if missing_snapshots:
+            raise ConflictError(
+                "Возврат недоступен: snapshot start отсутствует у VM "
+                + ", ".join(missing_snapshots)
+            )
+        missing_credentials = [
+            str(vm.get("vmid") or vm.get("name") or "неизвестная VM")
+            for vm in raw_vms
+            if not str(vm.get("credential_password") or "")
+        ]
+        if missing_credentials:
+            raise ConflictError(
+                "Возврат недоступен: dashboard не хранит пароль VM "
+                + ", ".join(missing_credentials)
+                + ". Сначала задайте пароль для этих VM."
+            )
+        vmids = [int(vm["vmid"]) for vm in raw_vms]
+        target_ids = [int(vm["id"]) for vm in raw_vms]
+        placeholders = ",".join("?" for _ in target_ids)
+        count_row = self.store.query_one(
+            "SELECT COUNT(*) AS total FROM stand_vms WHERE stand_id = ?",
+            (stand_id,),
+        )
+        full_stand = len(target_ids) == int(count_row["total"] if count_row else 0)
+        thread = threading.Thread(
+            target=self._rollback_start_job,
+            args=(stand_id, str(stand["name"]), raw_vms, scope_label, str(stand["status"])),
+            name=f"rollback-start-{stand_id}-{'all' if len(vmids) > 1 else vmids[0]}",
+            daemon=True,
+        )
+        with self._job_lock:
+            if stand_id in self._jobs:
+                raise ConflictError("Для стенда уже выполняется фоновая операция")
+            now = utc_now()
+            with self.store.transaction() as connection:
+                if full_stand:
+                    connection.execute(
+                        """UPDATE stands SET status = 'resetting', progress = 5, last_error = '',
+                        updated_at = ? WHERE id = ?""",
+                        (now, stand_id),
+                    )
+                else:
+                    connection.execute(
+                        """UPDATE stands SET status = 'resetting', progress = 5,
+                        updated_at = ? WHERE id = ?""",
+                        (now, stand_id),
+                    )
+                connection.execute(
+                    f"""UPDATE stand_vms SET status = 'resetting', credential_valid = 0
+                    WHERE stand_id = ? AND id IN ({placeholders})""",
+                    (stand_id, *target_ids),
+                )
+            self._jobs[stand_id] = thread
+        try:
+            try:
+                self.store.add_activity(
+                    "rollback", "Возврат к исходному состоянию запущен",
+                    f"{stand['name']} · {scope_label} · snapshot start", "progress",
+                )
+            except Exception:
+                pass
+            thread.start()
+        except Exception:
+            with self._job_lock:
+                self._jobs.pop(stand_id, None)
+            with self.store.transaction() as connection:
+                connection.execute(
+                    """UPDATE stands SET status = ?, progress = 100, last_error = ?,
+                    updated_at = ? WHERE id = ?""",
+                    (str(stand["status"]), str(stand.get("last_error") or ""), utc_now(), stand_id),
+                )
+                for vm in raw_vms:
+                    connection.execute(
+                        "UPDATE stand_vms SET status = ?, credential_valid = ? WHERE id = ?",
+                        (
+                            str(vm.get("status") or "stopped"),
+                            1 if vm.get("credential_valid", 1) else 0,
+                            int(vm["id"]),
+                        ),
+                    )
+            raise
+        return {
+            "stand": self.get_stand(stand_id),
+            "message": f"Возврат {scope_label} к snapshot start запущен",
+            "vmids": vmids,
+        }
+
     def _rollback_start_job(
         self,
         stand_id: int,
         stand_name: str,
         raw_vms: list[dict[str, Any]],
+        scope_label: str = "все VM",
+        original_stand_status: str = "",
     ) -> None:
         vmids = [int(vm["vmid"]) for vm in raw_vms if vm.get("vmid") is not None]
         rollback_applied = False
@@ -1029,24 +1212,58 @@ class DashboardService:
                 int(vmid) for vmid in (restored if restored is not None else [item["vmid"] for item in credentials])
             }
             now = utc_now()
+            target_ids = [int(vm["id"]) for vm in raw_vms]
+            placeholders = ",".join("?" for _ in target_ids)
+            count_row = self.store.query_one(
+                "SELECT COUNT(*) AS total FROM stand_vms WHERE stand_id = ?",
+                (stand_id,),
+            )
+            total_vm_count = int(count_row["total"] if count_row else 0)
+            full_stand = len(target_ids) == total_vm_count
             with self.store.transaction() as connection:
                 connection.execute(
-                    """UPDATE stands SET status = 'running', progress = 100, cpu = 0, ram = 0,
-                    check_score = NULL, check_status = 'idle', last_check = NULL,
-                    last_error = '', updated_at = ? WHERE id = ?""",
-                    (now, stand_id),
-                )
-                connection.execute(
-                    """UPDATE stand_vms SET status = 'running', cpu = 0, ram = 0,
+                    f"""UPDATE stand_vms SET status = 'running', cpu = 0, ram = 0,
                     last_snapshot = 'start', has_start_snapshot = 1, credential_valid = 1,
                     check_score = NULL, check_status = 'idle', last_check = NULL
-                    WHERE stand_id = ?""",
-                    (stand_id,),
+                    WHERE stand_id = ? AND id IN ({placeholders})""",
+                    (stand_id, *target_ids),
                 )
+                vm_statuses = {
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT status FROM stand_vms WHERE stand_id = ?",
+                        (stand_id,),
+                    ).fetchall()
+                }
+                preserve_unrelated_stand_error = (
+                    not full_stand
+                    and original_stand_status == "error"
+                    and all(str(vm.get("status") or "") != "error" for vm in raw_vms)
+                )
+                aggregate_status = (
+                    "error" if "error" in vm_statuses or preserve_unrelated_stand_error
+                    else "running" if "running" in vm_statuses
+                    else "stopped"
+                )
+                if full_stand:
+                    connection.execute(
+                        """UPDATE stands SET status = ?, progress = 100, cpu = 0, ram = 0,
+                        check_score = NULL, check_status = 'idle', last_check = NULL,
+                        last_error = '', updated_at = ? WHERE id = ?""",
+                        (aggregate_status, now, stand_id),
+                    )
+                else:
+                    connection.execute(
+                        """UPDATE stands SET status = ?, progress = 100,
+                        check_score = NULL, check_status = 'idle', last_check = NULL,
+                        last_error = CASE WHEN ? = 'error' THEN last_error ELSE '' END,
+                        updated_at = ? WHERE id = ?""",
+                        (aggregate_status, aggregate_status, now, stand_id),
+                    )
             try:
                 self.store.add_activity(
-                    "rollback", "Стенд возвращён к исходному состоянию",
-                    f"{stand_name} · snapshot start · текущие пароли восстановлены", "success", "Система",
+                    "rollback", "Возврат к исходному состоянию завершён",
+                    f"{stand_name} · {scope_label} · snapshot start · текущие пароли восстановлены", "success", "Система",
                 )
             except Exception:
                 # The state transition above is authoritative; audit failure
@@ -1080,7 +1297,7 @@ class DashboardService:
                     )
             self.store.add_activity(
                 "rollback", "Ошибка возврата к исходному состоянию",
-                f"{stand_name}: {detail}", "error", "Система",
+                f"{stand_name} · {scope_label}: {detail}", "error", "Система",
             )
         finally:
             with self._job_lock:
@@ -1102,6 +1319,7 @@ class DashboardService:
         action: str,
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        self._assert_not_bulk_rollback_pending(stand_id)
         with self._stand_operation_lock(stand_id):
             return self._vm_action_locked(stand_id, vmid, action, payload)
 
@@ -1122,6 +1340,14 @@ class DashboardService:
         vm = next((item for item in stand["vms"] if int(item.get("vmid") or -1) == vmid), None)
         if not vm:
             raise NotFoundError("VM не найдена в этом стенде")
+        if action == "rollback_start":
+            raw_vm = self.store.query_one(
+                "SELECT * FROM stand_vms WHERE stand_id = ? AND vmid = ?",
+                (stand_id, vmid),
+            )
+            if not raw_vm:
+                raise NotFoundError("VM не найдена в этом стенде")
+            return self._enqueue_rollback_start(stand, [raw_vm], f"VM {vmid}")
         if action == "snapshot":
             label = self._snapshot_label(payload.get("name"))
             description = str(payload.get("description", ""))[:255]
@@ -1153,6 +1379,10 @@ class DashboardService:
                 raise ValidationError("Некорректный логин веб-интерфейса VM")
             if len(password) < 10:
                 raise ValidationError("Пароль должен содержать не менее 10 символов")
+            if len(password) > PROXMOX_PASSWORD_MAX_LENGTH:
+                raise ValidationError(
+                    f"Proxmox принимает пароль длиной не более {PROXMOX_PASSWORD_MAX_LENGTH} символов"
+                )
             self.gateway.rotate_password([vmid], guest_username, password)
             changed_at = utc_now()
             self.store.execute(
@@ -1192,13 +1422,10 @@ class DashboardService:
 
     @staticmethod
     def _password(length: int = 16) -> str:
-        alphabet = string.ascii_letters + string.digits + "!@#$%"
-        while True:
-            value = "".join(secrets.choice(alphabet) for _ in range(length))
-            if any(char.islower() for char in value) and any(char.isupper() for char in value) and any(char.isdigit() for char in value):
-                return value
+        return generate_password(length)
 
     def delete_stand(self, stand_id: int) -> None:
+        self._assert_not_bulk_rollback_pending(stand_id)
         with self._stand_operation_lock(stand_id):
             self._delete_stand_locked(stand_id)
 
@@ -1326,6 +1553,7 @@ class DashboardService:
         )
 
     def start_check(self, stand_id: int) -> dict[str, Any]:
+        self._assert_not_bulk_rollback_pending(stand_id)
         with self._stand_operation_lock(stand_id):
             return self._start_check_locked(stand_id)
 
@@ -1510,6 +1738,51 @@ class DashboardService:
     def metrics(self) -> dict[str, Any]:
         vm_rows = self.store.query_all("SELECT vmid FROM stand_vms WHERE vmid IS NOT NULL")
         return self.gateway.cluster_metrics([int(row["vmid"]) for row in vm_rows])
+
+    def web_activity(self, *, force: bool = False) -> dict[str, Any]:
+        now = time.monotonic()
+        if not force and self._web_activity_cache is not None and now - self._web_activity_cache_at < 20:
+            return self._web_activity_cache
+        with self._web_activity_lock:
+            now = time.monotonic()
+            if not force and self._web_activity_cache is not None and now - self._web_activity_cache_at < 20:
+                return self._web_activity_cache
+            rows = self.store.query_all(
+                """SELECT v.vmid, v.name AS vm_name, v.ip AS vm_ip, v.node,
+                          s.id AS stand_id, s.name AS stand_name, s.pool_id
+                FROM stand_vms v JOIN stands s ON s.id = v.stand_id
+                WHERE v.vmid IS NOT NULL AND v.status = 'running'
+                ORDER BY s.id, v.id"""
+            )
+            vmids = [int(row["vmid"]) for row in rows]
+            payload = self.gateway.web_activity(vmids, window_seconds=180)
+            metadata = {int(row["vmid"]): row for row in rows}
+            activity: list[dict[str, Any]] = []
+            for raw in payload.get("activity", []):
+                item = dict(raw)
+                vmid = int(item["vmid"])
+                item.update(metadata.get(vmid, {}))
+                activity.append(item)
+            errors: list[dict[str, Any]] = []
+            for raw in payload.get("errors", []):
+                item = dict(raw)
+                vmid = int(item["vmid"])
+                item.update(metadata.get(vmid, {}))
+                errors.append(item)
+            result = {
+                **payload,
+                "activity": activity,
+                "errors": errors,
+                "exact_sessions": False,
+                "method": "pveproxy access.log через QEMU Guest Agent",
+                "notice": (
+                    "Proxmox не хранит точный список браузерных сессий. "
+                    "Показана недавняя активность по IP и логину; похожий запрос может отправить и API-клиент."
+                ),
+            }
+            self._web_activity_cache = result
+            self._web_activity_cache_at = time.monotonic()
+            return result
 
     def overview(self) -> dict[str, Any]:
         stands = self.list_stands()

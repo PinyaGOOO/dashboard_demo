@@ -183,6 +183,35 @@ class ServiceRollbackTests(unittest.TestCase):
             )
         return stand_id
 
+    def _seed_additional_stand(
+        self,
+        *,
+        name: str,
+        pool_id: str,
+        vmid: int,
+        origin: str = "deployed",
+    ) -> int:
+        now = utc_now()
+        stand_id = self.store.execute(
+            """INSERT INTO stands
+            (name, status, progress, node, pool_id, owner, vm_count, cpu, ram,
+             check_status, origin, last_error, created_at, updated_at)
+            VALUES (?, 'running', 100, 'pve-3', ?, 'Admin', 1, 4, 8,
+                    'idle', ?, '', ?, ?)""",
+            (name, pool_id, origin, now, now),
+        )
+        self.store.execute(
+            """INSERT INTO stand_vms
+            (stand_id, vmid, name, node, status, cpu, ram,
+             credential_username, credential_password, last_snapshot,
+             has_start_snapshot, check_score, check_status, last_check)
+            VALUES (?, ?, ?, 'pve-3', 'running', 4, 8,
+                    'root', 'Additional-Password-123', 'manual-2',
+                    1, 91, 'success', ?)""",
+            (stand_id, vmid, f"vm-{vmid}", now),
+        )
+        return stand_id
+
     @staticmethod
     def _capturing_thread_factory(target_list: list[threading.Thread]):
         real_thread = threading.Thread
@@ -484,8 +513,228 @@ class ServiceRollbackTests(unittest.TestCase):
         )
         self.assertFalse(self.service._jobs)
 
+    def test_vm_rollback_targets_only_selected_vm_and_preserves_sibling(self) -> None:
+        self.store.execute(
+            "UPDATE stand_vms SET status = 'error' WHERE stand_id = ? AND vmid = 275",
+            (self.stand_id,),
+        )
+        self.store.execute(
+            """UPDATE stands SET status = 'error', last_error = 'Ошибка соседней VM',
+            cpu = 17.5, ram = 23.0 WHERE id = ?""",
+            (self.stand_id,),
+        )
+        sibling_before = self.store.query_one(
+            "SELECT * FROM stand_vms WHERE stand_id = ? AND vmid = 275",
+            (self.stand_id,),
+        )
+        self.assertIsNotNone(sibling_before)
+        self.gateway.restore_credentials.return_value = [274]
+        threads: list[threading.Thread] = []
+
+        with patch(
+            "dashboard_backend.service.threading.Thread",
+            side_effect=self._capturing_thread_factory(threads),
+        ):
+            response = self.service.vm_action(
+                self.stand_id,
+                274,
+                "rollback_start",
+                {"action": "rollback_start"},
+            )
+
+        self.assertEqual(response["vmids"], [274])
+        self.assertEqual(len(threads), 1)
+        threads[0].join(2)
+        self.assertFalse(threads[0].is_alive())
+
+        rollback_call = self.gateway.rollback_snapshot.call_args
+        self.assertEqual(rollback_call.args, ([274], "start"))
+        self.assertTrue(rollback_call.kwargs["start"])
+        self.assertTrue(callable(rollback_call.kwargs["progress"]))
+        self.gateway.restore_credentials.assert_called_once_with([
+            {
+                "vmid": 274,
+                "username": "root",
+                "password": "Current-Password-274",
+            },
+        ])
+
+        target = self.store.query_one(
+            "SELECT * FROM stand_vms WHERE stand_id = ? AND vmid = 274",
+            (self.stand_id,),
+        )
+        sibling_after = self.store.query_one(
+            "SELECT * FROM stand_vms WHERE stand_id = ? AND vmid = 275",
+            (self.stand_id,),
+        )
+        self.assertEqual(target["status"], "running")
+        self.assertEqual(target["last_snapshot"], "start")
+        self.assertEqual(target["check_status"], "idle")
+        self.assertIsNone(target["check_score"])
+
+        sibling_fields = (
+            "status", "cpu", "ram", "last_snapshot", "has_start_snapshot",
+            "credential_username", "credential_password", "credential_valid",
+            "check_score", "check_status", "last_check",
+        )
+        self.assertEqual(
+            tuple(sibling_after[field] for field in sibling_fields),
+            tuple(sibling_before[field] for field in sibling_fields),
+        )
+        stand_after = self.store.query_one(
+            "SELECT status, last_error, cpu, ram FROM stands WHERE id = ?",
+            (self.stand_id,),
+        )
+        self.assertEqual(stand_after["status"], "error")
+        self.assertEqual(stand_after["last_error"], "Ошибка соседней VM")
+        self.assertEqual((stand_after["cpu"], stand_after["ram"]), (17.5, 23.0))
+
+    def test_vm_rollback_does_not_clear_unrelated_stand_error(self) -> None:
+        self.store.execute(
+            """UPDATE stands SET status = 'error', last_error = 'Ошибка pool',
+            cpu = 9.5, ram = 14.0 WHERE id = ?""",
+            (self.stand_id,),
+        )
+        self.gateway.restore_credentials.return_value = [274]
+        threads: list[threading.Thread] = []
+
+        with patch(
+            "dashboard_backend.service.threading.Thread",
+            side_effect=self._capturing_thread_factory(threads),
+        ):
+            self.service.vm_action(self.stand_id, 274, "rollback_start")
+        threads[0].join(2)
+
+        stand = self.store.query_one(
+            "SELECT status, last_error, cpu, ram FROM stands WHERE id = ?",
+            (self.stand_id,),
+        )
+        self.assertEqual(stand["status"], "error")
+        self.assertEqual(stand["last_error"], "Ошибка pool")
+        self.assertEqual((stand["cpu"], stand["ram"]), (9.5, 14.0))
+
+    def test_bulk_rollback_rejects_when_no_stand_is_eligible(self) -> None:
+        self.store.execute(
+            "UPDATE stands SET origin = 'imported' WHERE id = ?",
+            (self.stand_id,),
+        )
+
+        with self.assertRaisesRegex(ConflictError, "Нет стендов"):
+            self.service.rollback_all_stands()
+
+        self.assertIsNone(self.service._bulk_rollback_job)
+        self.gateway.rollback_snapshot.assert_not_called()
+
+    def test_bulk_rollback_rejects_duplicate_running_coordinator(self) -> None:
+        running = MagicMock()
+        running.is_alive.return_value = True
+        self.service._bulk_rollback_job = running
+
+        with (
+            patch("dashboard_backend.service.threading.Thread") as thread,
+            self.assertRaisesRegex(ConflictError, "уже выполняется"),
+        ):
+            self.service.rollback_all_stands()
+
+        thread.assert_not_called()
+        self.gateway.rollback_snapshot.assert_not_called()
+
+    def test_bulk_rollback_schedules_eligible_and_reports_imported_as_skipped(self) -> None:
+        imported_id = self._seed_additional_stand(
+            name="Imported pool",
+            pool_id="imported-pool",
+            vmid=376,
+            origin="imported",
+        )
+        coordinator = MagicMock()
+        coordinator.is_alive.return_value = False
+
+        with patch("dashboard_backend.service.threading.Thread", return_value=coordinator):
+            response = self.service.rollback_all_stands()
+
+        coordinator.start.assert_called_once_with()
+        self.assertEqual(response["scheduled"], [self.stand_id])
+        self.assertEqual(response["scheduled_count"], 1)
+        self.assertEqual(response["skipped_count"], 1)
+        self.assertEqual(self.service._bulk_rollback_pending, {self.stand_id})
+        self.assertTrue(self.service.get_stand(self.stand_id)["bulk_rollback_pending"])
+        with self.assertRaisesRegex(ConflictError, "очередь массового возврата"):
+            self.service.stand_action(self.stand_id, "stop")
+        self.assertEqual(response["skipped"], [{
+            "stand_id": imported_id,
+            "name": "Imported pool",
+            "reason": "подключённый существующий pool",
+        }])
+
+    def test_bulk_coordinator_is_serial_by_default_and_continues_after_failure(self) -> None:
+        second_id = self._seed_additional_stand(
+            name="Second stand",
+            pool_id="exam-second",
+            vmid=376,
+        )
+        calls: list[int] = []
+        active = 0
+        peak_active = 0
+        counter_lock = threading.Lock()
+        self.service._bulk_rollback_pending = {self.stand_id, second_id}
+
+        def stand_action(stand_id, action, payload, *, _bulk_reserved=False):
+            nonlocal active, peak_active
+            self.assertEqual((action, payload), ("rollback_start", {"action": "rollback_start"}))
+            self.assertTrue(_bulk_reserved)
+            if stand_id == second_id:
+                self.assertNotIn(self.stand_id, self.service._bulk_rollback_pending)
+                self.assertIn(second_id, self.service._bulk_rollback_pending)
+            with counter_lock:
+                active += 1
+                peak_active = max(peak_active, active)
+                calls.append(stand_id)
+            try:
+                if stand_id == self.stand_id:
+                    raise RuntimeError("first stand failed")
+                return {"message": "started"}
+            finally:
+                with counter_lock:
+                    active -= 1
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(self.service, "stand_action", side_effect=stand_action),
+        ):
+            self.service._bulk_rollback_start_job([self.stand_id, second_id])
+
+        self.assertEqual(calls, [self.stand_id, second_id])
+        self.assertEqual(peak_active, 1)
+        self.assertFalse(self.service._bulk_rollback_pending)
+        self.assertIn(
+            "first stand failed",
+            self.store.query_one(
+                "SELECT last_error FROM stands WHERE id = ?", (self.stand_id,),
+            )["last_error"],
+        )
+        activity = self.store.query_one("SELECT * FROM activity ORDER BY id DESC LIMIT 1")
+        self.assertEqual((activity["kind"], activity["status"]), ("rollback", "warning"))
+        self.assertIn("Успешно 1 из 2", activity["detail"])
+        self.assertIsNone(self.service._bulk_rollback_job)
+
 
 class RollbackApiTests(unittest.TestCase):
+    def test_bulk_rollback_action_returns_accepted(self) -> None:
+        handler = DashboardHandler.__new__(DashboardHandler)
+        handler.path = "/api/stands/actions"
+        handler.service = MagicMock()
+        handler._authorized = MagicMock(return_value=True)
+        body = {"action": "rollback_start_all"}
+        result = {"message": "started", "scheduled_count": 2}
+        handler._body = MagicMock(return_value=body)
+        handler._json = MagicMock()
+        handler.service.rollback_all_stands.return_value = result
+
+        handler._handle_api("POST")
+
+        handler.service.rollback_all_stands.assert_called_once_with()
+        handler._json.assert_called_once_with(result, HTTPStatus.ACCEPTED)
+
     def test_stand_rollback_action_returns_accepted(self) -> None:
         handler = DashboardHandler.__new__(DashboardHandler)
         handler.path = "/api/stands/7/actions"
@@ -500,6 +749,22 @@ class RollbackApiTests(unittest.TestCase):
         handler._handle_api("POST")
 
         handler.service.stand_action.assert_called_once_with(7, "rollback_start", body)
+        handler._json.assert_called_once_with(result, HTTPStatus.ACCEPTED)
+
+    def test_vm_rollback_action_returns_accepted(self) -> None:
+        handler = DashboardHandler.__new__(DashboardHandler)
+        handler.path = "/api/stands/7/vms/274/actions"
+        handler.service = MagicMock()
+        handler._authorized = MagicMock(return_value=True)
+        body = {"action": "rollback_start"}
+        result = {"message": "started"}
+        handler._body = MagicMock(return_value=body)
+        handler._json = MagicMock()
+        handler.service.vm_action.return_value = result
+
+        handler._handle_api("POST")
+
+        handler.service.vm_action.assert_called_once_with(7, 274, "rollback_start", body)
         handler._json.assert_called_once_with(result, HTTPStatus.ACCEPTED)
 
 

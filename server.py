@@ -94,7 +94,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         parts = [part for part in parsed.path.strip("/").split("/") if part]
         query = parse_qs(parsed.query)
-        sensitive = method == "GET" and bool(parts) and parts[-1] == "credentials"
+        sensitive = method == "GET" and (
+            (bool(parts) and parts[-1] == "credentials")
+            or parts == ["api", "web-activity"]
+        )
         if not self._authorized(method, sensitive=sensitive):
             self._json({"error": "Неверный административный токен", "code": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
             return
@@ -107,6 +110,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self._json(self.service.overview())
             elif parts == ["api", "metrics"] and method == "GET":
                 self._json(self.service.metrics())
+            elif parts == ["api", "web-activity"] and method == "GET":
+                force = query.get("force", ["0"])[0] in {"1", "true", "yes"}
+                self._json(self.service.web_activity(force=force))
             elif parts == ["api", "activity"] and method == "GET":
                 self._json(self.service.activity(int(query.get("limit", [30])[0])))
             elif parts == ["api", "blueprints"] and method == "GET":
@@ -125,6 +131,11 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self._json(self.service.list_stands())
             elif parts == ["api", "stands"] and method == "POST":
                 self._json(self.service.create_stand(self._body()), HTTPStatus.ACCEPTED)
+            elif parts == ["api", "stands", "actions"] and method == "POST":
+                body = self._body()
+                if str(body.get("action", "")) != "rollback_start_all":
+                    raise ValidationError("Неизвестное массовое действие")
+                self._json(self.service.rollback_all_stands(), HTTPStatus.ACCEPTED)
             elif parts == ["api", "pools"] and method == "GET":
                 self._json(self.service.list_pools())
             elif parts == ["api", "ipam"] and method == "GET":
@@ -147,7 +158,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             elif len(parts) == 6 and parts[:2] == ["api", "stands"] and parts[3] == "vms" and parts[5] == "actions" and method == "POST":
                 body = self._body()
                 action = str(body.get("action", ""))
-                status = HTTPStatus.ACCEPTED if action == "run_check" else HTTPStatus.OK
+                status = HTTPStatus.ACCEPTED if action in {"run_check", "rollback_start"} else HTTPStatus.OK
                 self._json(self.service.vm_action(int(parts[2]), int(parts[4]), action, body), status)
             elif len(parts) == 6 and parts[:2] == ["api", "stands"] and parts[3] == "vms" and parts[5] == "credentials" and method == "GET":
                 self._json(self.service.vm_credentials(int(parts[2]), int(parts[4])))
