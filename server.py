@@ -138,7 +138,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             elif len(parts) == 3 and parts[:2] == ["api", "stands"] and method == "DELETE":
                 self.service.delete_stand(int(parts[2])); self._json({"ok": True})
             elif len(parts) == 4 and parts[:2] == ["api", "stands"] and parts[3] == "actions" and method == "POST":
-                body = self._body(); self._json(self.service.stand_action(int(parts[2]), str(body.get("action", "")), body))
+                body = self._body()
+                action = str(body.get("action", ""))
+                status = HTTPStatus.ACCEPTED if action == "rollback_start" else HTTPStatus.OK
+                self._json(self.service.stand_action(int(parts[2]), action, body), status)
             elif len(parts) == 4 and parts[:2] == ["api", "stands"] and parts[3] == "credentials" and method == "GET":
                 self._json(self.service.stand_credentials(int(parts[2])))
             elif len(parts) == 6 and parts[:2] == ["api", "stands"] and parts[3] == "vms" and parts[5] == "actions" and method == "POST":

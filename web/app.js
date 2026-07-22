@@ -21,8 +21,28 @@ PREFIX="\${STAND_SUBNET##*/}"
 [[ -n "\${STAND_SUBNET:-}" && "\${PREFIX}" != "\${STAND_SUBNET}" ]] || PREFIX=16
 VM_GATEWAY="\${VM_GATEWAY:-10.39.1.1}"
 
-sed -i "/^iface \${GUEST_INTERFACE} inet static/,/^[^ \\t]/ s|^\\([ \\t]*address[ \\t]\\+\\).*|\\1\${VM_IP}/\${PREFIX}|" "\${INTERFACES_FILE}"
-sed -i "/^iface \${GUEST_INTERFACE} inet static/,/^[^ \\t]/ s|^\\([ \\t]*gateway[ \\t]\\+\\).*|\\1\${VM_GATEWAY}|" "\${INTERFACES_FILE}"
+if [[ ! -f "\${INTERFACES_FILE}" ]]; then
+  echo "Файл \${INTERFACES_FILE} не найден" >&2
+  exit 78
+fi
+if ! awk -v iface="\${GUEST_INTERFACE}" '
+  $1 == "iface" && $2 == iface && $3 == "inet" && $4 == "static" { found=1 }
+  END { exit(found ? 0 : 1) }
+' "\${INTERFACES_FILE}"; then
+  echo "В \${INTERFACES_FILE} нет static-секции iface \${GUEST_INTERFACE}" >&2
+  exit 78
+fi
+
+sed -i "/^[[:space:]]*iface[[:space:]]\\+\${GUEST_INTERFACE}[[:space:]]\\+inet[[:space:]]\\+static/,/^[^[:space:]]/ s|^\\([ \\t]*address[ \\t]\\+\\).*|\\1\${VM_IP}/\${PREFIX}|" "\${INTERFACES_FILE}"
+sed -i "/^[[:space:]]*iface[[:space:]]\\+\${GUEST_INTERFACE}[[:space:]]\\+inet[[:space:]]\\+static/,/^[^[:space:]]/ s|^\\([ \\t]*gateway[ \\t]\\+\\).*|\\1\${VM_GATEWAY}|" "\${INTERFACES_FILE}"
+if ! awk -v iface="\${GUEST_INTERFACE}" -v wanted="\${VM_IP}/\${PREFIX}" '
+  $1 == "iface" { active=($2 == iface && $3 == "inet" && $4 == "static"); next }
+  active && $1 == "address" && $2 == wanted { found=1 }
+  END { exit(found ? 0 : 1) }
+' "\${INTERFACES_FILE}"; then
+  echo "Не удалось записать address \${VM_IP}/\${PREFIX} для \${GUEST_INTERFACE}" >&2
+  exit 78
+fi
 
 HOSTNAME="$(tr -d '\\n' < /etc/hostname)"
 sed -i '/^127\\.0\\.1\\.1/d' /etc/hosts
@@ -30,9 +50,62 @@ printf '127.0.1.1 %s\\n' "\${HOSTNAME}" >> /etc/hosts
 sed -i "/^[0-9]\\+\\.[0-9]\\+\\.[0-9]\\+\\.[0-9]\\+.*\${HOSTNAME}/d" /etc/hosts
 printf '%s %s.example.local %s\\n' "\${VM_IP}" "\${HOSTNAME}" "\${HOSTNAME}" >> /etc/hosts
 
-ifdown "\${GUEST_INTERFACE}" 2>/dev/null || true
-ifup "\${GUEST_INTERFACE}" 2>/dev/null || true
-echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GUEST_INTERFACE}"`;
+network_ready() {
+  command -v ip >/dev/null 2>&1 || return 1
+  [[ -d "/sys/class/net/\${GUEST_INTERFACE}" ]] || return 1
+  FLAGS="$(cat "/sys/class/net/\${GUEST_INTERFACE}/flags" 2>/dev/null)" || return 1
+  (( (FLAGS & 1) == 1 )) || return 1
+  ip -o -4 addr show dev "\${GUEST_INTERFACE}" scope global 2>/dev/null |
+    awk -v wanted="\${VM_IP}/\${PREFIX}" '
+      { count++ }
+      $4 == wanted { found=1 }
+      END { exit(found && count == 1 ? 0 : 1) }
+    ' || return 1
+  if [[ -d "/sys/class/net/\${GUEST_INTERFACE}/bridge" ]]; then
+    for PORT in "/sys/class/net/\${GUEST_INTERFACE}/brif/"*; do
+      [[ -e "\${PORT}" ]] || continue
+      PORT_NAME="\${PORT##*/}"
+      PORT_FLAGS="$(cat "/sys/class/net/\${PORT_NAME}/flags" 2>/dev/null || echo 0)"
+      CARRIER="$(cat "/sys/class/net/\${PORT_NAME}/carrier" 2>/dev/null || echo 0)"
+      OPERSTATE="$(cat "/sys/class/net/\${PORT_NAME}/operstate" 2>/dev/null || true)"
+      if (( (PORT_FLAGS & 1) == 1 )) && [[ "\${CARRIER}" == "1" || "\${OPERSTATE}" == "up" ]]; then
+        return 0
+      fi
+    done
+    return 1
+  fi
+  return 0
+}
+
+if command -v ifreload >/dev/null 2>&1; then
+  if ! SYNTAX_OUTPUT="$(ifreload -a -s 2>&1)"; then
+    echo "Ошибка синтаксиса сетевой конфигурации: \${SYNTAX_OUTPUT}" >&2
+    exit 78
+  fi
+  if ! ifreload -a; then
+    echo "ifreload не смог сразу применить конфигурацию; backend выполнит восстановление" >&2
+  fi
+else
+  echo "ifreload не найден; backend безопасно перезагрузит только эту VM" >&2
+fi
+ip link set dev "\${GUEST_INTERFACE}" up 2>/dev/null || true
+
+if ! command -v ifreload >/dev/null 2>&1 && ! network_ready; then
+  exit 75
+fi
+
+for _ in $(seq 1 30); do
+  if network_ready; then
+    echo "Сетевой адрес \${VM_IP}/\${PREFIX} работает на \${GUEST_INTERFACE}"
+    exit 0
+  fi
+  sleep 1
+done
+
+ip -details link show dev "\${GUEST_INTERFACE}" >&2 2>/dev/null || true
+ip -o -4 addr show dev "\${GUEST_INTERFACE}" >&2 2>/dev/null || true
+echo "Сеть ещё не готова; передаём восстановление backend" >&2
+exit 75`;
   const routeTitles = {
     overview: "Обзор",
     stands: "Стенды",
@@ -42,7 +115,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     infrastructure: "Инфраструктура",
   };
   const statusLabels = {
-    running: "Работает", stopped: "Остановлен", provisioning: "Развёртывается",
+    running: "Работает", stopped: "Остановлен", provisioning: "Развёртывается", resetting: "Восстанавливается",
     error: "Ошибка", passed: "Пройдено", warning: "Есть замечания", failed: "Не пройдено",
     idle: "Ожидание", active: "Активна", ended: "Завершена", draft: "Черновик",
     archived: "В архиве", online: "Онлайн", checking: "Проверяется", info: "Информация",
@@ -213,7 +286,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
   }
 
   function statusChip(status, label = null) {
-    const cssStatus = status === "provisioning" ? "deploying" : status === "running-check" ? "checking" : status;
+    const cssStatus = ["provisioning", "resetting"].includes(status) ? "deploying" : status === "running-check" ? "checking" : status;
     return `<span class="status status--${escapeHtml(cssStatus)}">${escapeHtml(label || statusLabels[status] || status)}</span>`;
   }
 
@@ -304,7 +377,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
 
   function renderOverview() {
     const { overview, stands, metrics, activity, integration } = state.data;
-    const active = stands.filter(stand => ["running", "provisioning"].includes(stand.status));
+    const active = stands.filter(stand => ["running", "provisioning", "resetting"].includes(stand.status));
     const cluster = metrics.cluster;
     const modeLabel = integration.mode === "live" ? "Данные Proxmox в реальном времени" : "Безопасный демонстрационный контур";
     const historyTitle = integration.mode === "live" ? "Последние измерения нагрузки" : "Нагрузка кластера за 24 часа";
@@ -316,7 +389,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
         <small>Обновлено ${relativeTime(metrics.updated_at)}</small>
       </div>
       <div class="metric-grid">
-        ${metricCard("Активные стенды", `${overview.active_stands}<small> / ${overview.total_stands}</small>`, `<span class="metric-card__trend">●</span> ${active.filter(s => s.status === "provisioning").length ? "идёт развёртывание" : "все операции штатно"}`, "server")}
+        ${metricCard("Активные стенды", `${overview.active_stands}<small> / ${overview.total_stands}</small>`, `<span class="metric-card__trend">●</span> ${active.some(s => ["provisioning", "resetting"].includes(s.status)) ? "идёт фоновая операция" : "все операции штатно"}`, "server")}
         ${metricCard("Виртуальные машины", overview.total_vms, "учитываются в стендах", "server", "blue")}
         ${metricCard("Средний результат", `${overview.average_score}%`, `По ${stands.filter(stand => stand.check_score != null).length} последним результатам`, "check", "green")}
         ${metricCard("Нагрузка стендов", `${formatNumber(cluster.exam_cpu, 1)}%`, `${formatNumber(cluster.cpu, 1)}% CPU всего кластера`, "activity", "purple")}
@@ -363,7 +436,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
   }
 
   function activityItem(item) {
-    const icons = { deploy: "server", import: "plus", check: "check", password: "lock", snapshot: "copy", power: "power", script: "code", delete: "trash", edit: "edit" };
+    const icons = { deploy: "server", import: "plus", check: "check", password: "lock", snapshot: "copy", rollback: "refresh", power: "power", script: "code", delete: "trash", edit: "edit" };
     return `<div class="activity-item"><span class="activity-item__icon activity-item__icon--${escapeHtml(item.status)}">${icon(icons[item.kind] || "info")}</span>
       <div class="activity-item__copy"><strong>${escapeHtml(item.title)}</strong><p>${escapeHtml(item.detail)}</p></div><time class="activity-item__time" title="${escapeHtml(dateTime(item.created_at))}">${relativeTime(item.created_at)}</time></div>`;
   }
@@ -372,6 +445,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     let stands = state.data.stands;
     if (state.standFilter !== "all") {
       if (state.standFilter === "attention") stands = stands.filter(stand => stand.status === "error" || ["warning", "failed"].includes(stand.check_status));
+      else if (state.standFilter === "provisioning") stands = stands.filter(stand => ["provisioning", "resetting"].includes(stand.status));
       else stands = stands.filter(stand => stand.status === state.standFilter);
     }
     if (state.standSearch) {
@@ -381,7 +455,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     const counts = {
       all: state.data.stands.length,
       running: state.data.stands.filter(item => item.status === "running").length,
-      provisioning: state.data.stands.filter(item => item.status === "provisioning").length,
+      provisioning: state.data.stands.filter(item => ["provisioning", "resetting"].includes(item.status)).length,
       stopped: state.data.stands.filter(item => item.status === "stopped").length,
       attention: state.data.stands.filter(item => item.status === "error" || ["warning", "failed"].includes(item.check_status)).length,
     };
@@ -409,7 +483,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
   function standRow(stand) {
     return `<tr class="clickable-row" data-stand-detail="${stand.id}">
       <td><div class="entity-cell"><span class="entity-icon">${icon("server")}</span><span><strong class="cell-title">${escapeHtml(stand.name)}</strong><small class="cell-subtitle mono">${escapeHtml(stand.pool_id)} · ${escapeHtml(stand.node || "авто")}${stand.origin === "imported" ? " · подключён" : ""}</small></span></div></td>
-      <td>${statusChip(stand.status)}${stand.status === "provisioning" ? `<div class="inline-progress"><div class="progress"><div class="progress__bar progress__bar--blue" style="width:${clamp(stand.progress)}%"></div></div><small>${stand.progress}%</small></div>` : ""}</td>
+      <td>${statusChip(stand.status)}${["provisioning", "resetting"].includes(stand.status) ? `<div class="inline-progress"><div class="progress"><div class="progress__bar progress__bar--blue" style="width:${clamp(stand.progress)}%"></div></div><small>${stand.progress}%</small></div>` : ""}</td>
       <td><div class="resource-pair">${resourceBar("CPU", stand.cpu)}${resourceBar("RAM", stand.ram, "blue")}</div></td>
       <td>${stand.check_status === "running" ? statusChip("checking", "Выполняется") : stand.check_score == null && stand.check_status === "failed" ? statusChip("failed", "Ошибка запуска") : stand.check_score == null ? `<span class="muted">Не запускалась</span>` : `<div class="score-cell"><strong class="score score--${stand.check_score >= 90 ? "good" : stand.check_score >= 70 ? "warn" : "bad"}">${stand.check_score}%</strong><small>${relativeTime(stand.last_check)}</small></div>`}</td>
       <td class="cell-actions"><button class="button button--small table-check-button" data-stand-action="run_check" data-stand-id="${stand.id}" type="button" ${stand.status !== "running" ? "disabled" : ""}>${icon("check")}Автопроверка</button><button class="icon-button" data-stand-detail="${stand.id}" title="Открыть">${icon("chevron")}</button></td>
@@ -581,7 +655,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
 
   function updateShell() {
     if (!state.data) return;
-    const count = state.data.stands.filter(stand => stand.status === "running").length;
+    const count = state.data.stands.filter(stand => ["running", "resetting"].includes(stand.status)).length;
     const countNode = document.querySelector("#nav-stands-count");
     countNode.textContent = count;
     countNode.hidden = count === 0;
@@ -880,29 +954,52 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     return credentials;
   }
 
+  function vmHasStartSnapshot(vm) {
+    const snapshots = Array.isArray(vm?.snapshots) ? vm.snapshots : [];
+    return vm?.last_snapshot === "start"
+      || vm?.has_start_snapshot === true
+      || vm?.start_snapshot_created === true
+      || vm?.start_snapshot === true
+      || snapshots.some(item => String(item?.name ?? item) === "start");
+  }
+
   function renderVmRow(stand, vm, credential, credentialState) {
     const numericVmid = Number(vm.vmid);
     const hasVmid = Number.isInteger(numericVmid) && numericVmid > 0;
     const username = webUsername(credential, vm);
     const password = credential?.password || credential?.access_password || "";
     const accessUrl = safeAccessUrl(vm.access_url || vm.web_url);
-    const snapshots = Array.isArray(vm.snapshots) ? vm.snapshots : [];
-    const hasStartSnapshot = vm.last_snapshot === "start" || vm.has_start_snapshot === true || vm.start_snapshot_created === true || vm.start_snapshot === true || snapshots.some(item => String(item?.name ?? item) === "start");
+    const hasStartSnapshot = vmHasStartSnapshot(vm);
+    const standBusy = ["provisioning", "resetting"].includes(stand.status);
     const checkLabel = vm.check_status === "running" ? "автопроверка идёт" : vm.check_score == null ? "не проверялась" : `автопроверка ${formatNumber(vm.check_score)}%`;
-    const passwordText = password ? "••••••••••••" : credentialState === "locked" ? "Нужен токен" : credentialState === "error" ? "Ошибка загрузки" : "Не выдан";
-    const accessButton = accessUrl && hasVmid
+    const passwordUnverified = credentialState === "loaded" && !password
+      && Boolean(credential?.credential_recoverable || vm.credential_recoverable);
+    const passwordText = password ? "••••••••••••" : credentialState === "locked" ? "Нужен токен" : credentialState === "error" ? "Ошибка загрузки" : passwordUnverified ? "Не подтверждён" : "Не выдан";
+    const passwordHint = passwordUnverified
+      ? "Повторите возврат к snapshot start: пароль скрыт до подтверждения QEMU Guest Agent."
+      : "Смените пароль этой VM или загрузите защищённые доступы.";
+    const accessButton = accessUrl && hasVmid && !standBusy
       ? `<button class="button button--primary vm-open-button" type="button" data-open-vm-stand data-url="${escapeHtml(accessUrl)}" data-user="${escapeHtml(username)}" data-password="${escapeHtml(password)}" data-vm-name="${escapeHtml(vm.name)}" data-vmid="${numericVmid}">${icon("external")}Перейти к стенду</button>`
       : `<button class="button button--primary vm-open-button" type="button" disabled title="Web URL ещё не получен">${icon("chevron")}Перейти к стенду</button>`;
     return `<article class="vm-row">
       <span class="vm-state vm-state--${escapeHtml(vm.status)}"></span>
       <div class="vm-main"><div class="vm-main__title"><strong>${escapeHtml(vm.name)}</strong>${statusChip(vm.status)}</div><small class="mono">${hasVmid ? `VMID ${numericVmid}` : "VM создаётся"} · ${escapeHtml(vm.ip || "IP резервируется")}</small><div class="vm-meta"><span>${icon("server")}${escapeHtml(vm.node || stand.node || "авто")}</span><span class="${hasStartSnapshot ? "is-ready" : ""}">${icon("copy")}${hasStartSnapshot ? "snapshot start готов" : "snapshot start"}</span><span class="${vm.check_status === "running" ? "is-checking" : vm.check_score == null ? "" : vm.check_score >= 90 ? "is-ready" : vm.check_score >= 70 ? "is-warning" : "is-failed"}">${icon("check")}${escapeHtml(checkLabel)}</span></div></div>
-      <div class="vm-access"><div class="vm-access__hint">${icon("lock")}Доступ к веб-интерфейсу</div><div class="vm-credentials"><div><span>Логин</span><strong class="mono">${escapeHtml(username)}</strong><button type="button" data-copy-vm-login data-value="${escapeHtml(username)}">${icon("copy")}Копировать</button></div><div><span>Пароль</span><strong class="mono" data-vm-secret>${escapeHtml(passwordText)}</strong>${password ? `<div class="vm-secret-actions"><button type="button" data-reveal-vm-password data-password="${escapeHtml(password)}">${icon("eye")}Показать</button><button type="button" data-copy-vm-password data-value="${escapeHtml(password)}">${icon("copy")}Копировать</button></div>` : ""}</div></div>${password ? `<button class="vm-copy-access" type="button" data-copy-vm-credential data-user="${escapeHtml(username)}" data-password="${escapeHtml(password)}">${icon("copy")}Скопировать парой</button>` : `<small class="vm-access__empty">Смените пароль этой VM или загрузите защищённые доступы.</small>`}</div>
-      <div class="vm-actions">${accessButton}<div><button class="button button--small" type="button" data-vm-action="snapshot" data-stand-id="${stand.id}" data-vmid="${hasVmid ? numericVmid : ""}" data-vm-name="${escapeHtml(vm.name)}" ${hasVmid ? "" : "disabled"}>${icon("copy")}Снимок</button><button class="button button--small" type="button" data-vm-action="password" data-stand-id="${stand.id}" data-vmid="${hasVmid ? numericVmid : ""}" data-vm-name="${escapeHtml(vm.name)}" ${!hasVmid || vm.status !== "running" ? "disabled" : ""}>${icon("lock")}Пароль</button><button class="button button--small" type="button" data-vm-action="run_check" data-stand-id="${stand.id}" data-vmid="${hasVmid ? numericVmid : ""}" data-vm-name="${escapeHtml(vm.name)}" ${!hasVmid || vm.status !== "running" ? "disabled" : ""}>${icon("check")}Автопроверка</button></div></div>
+      <div class="vm-access"><div class="vm-access__hint">${icon("lock")}Доступ к веб-интерфейсу</div><div class="vm-credentials"><div><span>Логин</span><strong class="mono">${escapeHtml(username)}</strong><button type="button" data-copy-vm-login data-value="${escapeHtml(username)}">${icon("copy")}Копировать</button></div><div><span>Пароль</span><strong class="mono" data-vm-secret>${escapeHtml(passwordText)}</strong>${password ? `<div class="vm-secret-actions"><button type="button" data-reveal-vm-password data-password="${escapeHtml(password)}">${icon("eye")}Показать</button><button type="button" data-copy-vm-password data-value="${escapeHtml(password)}">${icon("copy")}Копировать</button></div>` : ""}</div></div>${password ? `<button class="vm-copy-access" type="button" data-copy-vm-credential data-user="${escapeHtml(username)}" data-password="${escapeHtml(password)}">${icon("copy")}Скопировать парой</button>` : `<small class="vm-access__empty">${escapeHtml(passwordHint)}</small>`}</div>
+      <div class="vm-actions">${accessButton}<div><button class="button button--small" type="button" data-vm-action="snapshot" data-stand-id="${stand.id}" data-vmid="${hasVmid ? numericVmid : ""}" data-vm-name="${escapeHtml(vm.name)}" ${!hasVmid || standBusy ? "disabled" : ""}>${icon("copy")}Снимок</button><button class="button button--small" type="button" data-vm-action="password" data-stand-id="${stand.id}" data-vmid="${hasVmid ? numericVmid : ""}" data-vm-name="${escapeHtml(vm.name)}" ${!hasVmid || vm.status !== "running" || standBusy ? "disabled" : ""}>${icon("lock")}Пароль</button><button class="button button--small" type="button" data-vm-action="run_check" data-stand-id="${stand.id}" data-vmid="${hasVmid ? numericVmid : ""}" data-vm-name="${escapeHtml(vm.name)}" ${!hasVmid || vm.status !== "running" || standBusy ? "disabled" : ""}>${icon("check")}Автопроверка</button></div></div>
     </article>`;
   }
 
   function renderStandDetailModal(stand, credentials = new Map(), credentialState = "locked", credentialError = "", { updateExisting = false } = {}) {
     const runCount = stand.vms.filter(vm => vm.status === "running").length;
+    const standBusy = ["provisioning", "resetting"].includes(stand.status);
+    const missingStartCount = stand.vms.filter(vm => !vmHasStartSnapshot(vm)).length;
+    const missingCredentialCount = stand.vms.filter(vm => !vm.credential_recoverable).length;
+    const canRollbackStart = stand.vms.length > 0 && !standBusy && !missingStartCount && !missingCredentialCount
+      && stand.check_status !== "running" && !stand.vms.some(vm => vm.check_status === "running");
+    const rollbackTitle = missingStartCount
+      ? `Snapshot start отсутствует у ${missingStartCount} VM`
+      : missingCredentialCount ? `Сохранённый пароль отсутствует у ${missingCredentialCount} VM`
+      : standBusy ? "Дождитесь завершения фоновой операции" : "Все VM будут возвращены к snapshot start";
     standCredentialCache.set(Number(stand.id), { stand, credentials });
     const credentialCount = stand.vms.filter(vm => credentials.get(Number(vm.vmid))?.password || credentials.get(Number(vm.vmid))?.access_password).length;
     const credentialControl = credentialState === "loaded"
@@ -913,15 +1010,15 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
       : credentialState === "error" ? `<div class="alert alert--warning">${icon("alert")}<div><strong>Не удалось получить сохранённые доступы.</strong><br>${escapeHtml(credentialError || "Можно сменить пароль отдельно у нужной VM.")}</div></div>` : "";
     const body = `<div class="stand-detail">
       <div class="stand-detail__hero"><div class="stand-detail__icon">${icon("server")}</div><div><div class="stand-detail__title"><h3>${escapeHtml(stand.name)}</h3>${statusChip(stand.status)}</div><p class="mono">${escapeHtml(stand.pool_id)} · ${escapeHtml(stand.blueprint_name || "Без сценария")} · ${escapeHtml(stand.node)}</p></div><div class="stand-detail__score"><strong>${stand.check_score == null ? "—" : `${stand.check_score}%`}</strong><small>автопроверка</small></div></div>
-      ${stand.status === "provisioning" ? `<div class="deploy-detail"><div><strong>Развёртывание выполняется</strong><span>${stand.progress}%</span></div><div class="progress"><div class="progress__bar progress__bar--blue" style="width:${stand.progress}%"></div></div><small>Мастер продолжает работу в фоне. Окно можно закрыть крестиком.</small></div>` : ""}
-      ${stand.status === "error" && stand.last_error ? `<div class="alert alert--error">${icon("alert")}<div><strong>Причина ошибки развёртывания</strong><br><span class="mono">${escapeHtml(stand.last_error)}</span></div></div>` : ""}
+      ${standBusy ? `<div class="deploy-detail"><div><strong>${stand.status === "resetting" ? "Возврат к исходному состоянию" : "Развёртывание выполняется"}</strong><span>${stand.progress}%</span></div><div class="progress"><div class="progress__bar progress__bar--blue" style="width:${stand.progress}%"></div></div><small>${stand.status === "resetting" ? "VM откатываются к snapshot start и запускаются заново." : "Мастер продолжает работу в фоне."} Окно можно закрыть крестиком.</small></div>` : ""}
+      ${stand.status === "error" && stand.last_error ? `<div class="alert alert--error">${icon("alert")}<div><strong>Причина ошибки операции</strong><br><span class="mono">${escapeHtml(stand.last_error)}</span></div></div>` : ""}
       <div class="detail-stat-grid"><div><span>Машины</span><strong>${runCount} / ${stand.vm_count}</strong><small>запущено</small></div><div><span>CPU</span><strong>${formatNumber(stand.cpu, 1)}%</strong><small>текущая оценка</small></div><div><span>RAM</span><strong>${formatNumber(stand.ram, 1)}%</strong><small>на ноде</small></div><div><span>Режим работы</span><strong>Бессрочно</strong><small>автоотключение выключено</small></div></div>
-      <div class="detail-actions"><button class="button" data-stand-action="${stand.status === "stopped" ? "start" : "stop"}" data-stand-id="${stand.id}" ${!["running", "stopped"].includes(stand.status) || !stand.vms.length ? "disabled" : ""}>${icon("power")}${stand.status === "stopped" ? "Запустить" : "Остановить"}</button><button class="button" data-stand-action="restart" data-stand-id="${stand.id}" ${stand.status !== "running" ? "disabled" : ""}>${icon("refresh")}Перезапустить</button><button class="button" data-stand-action="snapshot" data-stand-id="${stand.id}" ${!stand.vms.length ? "disabled" : ""}>${icon("copy")}Снимок всех VM</button><button class="button" data-stand-action="password" data-stand-id="${stand.id}" ${stand.status !== "running" ? "disabled" : ""}>${icon("lock")}Пароль всех VM</button><button class="button" data-edit-stand="${stand.id}">${icon("edit")}Параметры</button><button class="button button--dark" data-stand-action="run_check" data-stand-id="${stand.id}" ${stand.status !== "running" ? "disabled" : ""}>${icon("check")}Автопроверка</button></div>
+      <div class="detail-actions"><button class="button" data-stand-action="${stand.status === "stopped" ? "start" : "stop"}" data-stand-id="${stand.id}" ${!["running", "stopped"].includes(stand.status) || !stand.vms.length ? "disabled" : ""}>${icon("power")}${stand.status === "stopped" ? "Запустить" : "Остановить"}</button><button class="button" data-stand-action="restart" data-stand-id="${stand.id}" ${stand.status !== "running" ? "disabled" : ""}>${icon("refresh")}Перезапустить</button><button class="button" data-stand-action="snapshot" data-stand-id="${stand.id}" ${!stand.vms.length || standBusy ? "disabled" : ""}>${icon("copy")}Снимок всех VM</button><button class="button" data-stand-action="rollback_start" data-stand-id="${stand.id}" title="${escapeHtml(rollbackTitle)}" ${canRollbackStart ? "" : "disabled"}>${icon("refresh")}Вернуть к изначальному состоянию</button><button class="button" data-stand-action="password" data-stand-id="${stand.id}" ${stand.status !== "running" ? "disabled" : ""}>${icon("lock")}Пароль всех VM</button><button class="button" data-edit-stand="${stand.id}" ${standBusy ? "disabled" : ""}>${icon("edit")}Параметры</button><button class="button button--dark" data-stand-action="run_check" data-stand-id="${stand.id}" ${stand.status !== "running" ? "disabled" : ""}>${icon("check")}Автопроверка</button></div>
       ${credentialNotice}
       <div class="detail-columns detail-columns--single"><section><div class="detail-section-title"><div><h4>Виртуальные машины</h4><small>Доступы можно копировать по одному или одной кнопкой в формате IP | логин | пароль</small></div><div class="detail-section-tools"><span class="detail-count">${stand.vms.length}</span>${credentialControl}</div></div><div class="vm-list">${stand.vms.map(vm => renderVmRow(stand, vm, credentials.get(Number(vm.vmid)), credentialState)).join("") || `<p class="muted-block">Машины ещё не созданы</p>`}</div></section></div>
       <div class="detail-meta"><span>${icon("activity")} Создан ${dateTime(stand.created_at)}</span><span>${icon("lock")} Пароль менялся ${relativeTime(stand.password_updated_at)}</span><span>${icon("users")} Ответственный: ${escapeHtml(stand.owner)}</span></div>
     </div>`;
-    const footer = `<button class="button button--danger" data-delete-stand="${stand.id}" type="button">${icon("trash")}Удалить стенд</button><button class="button" data-close-modal type="button">Закрыть</button>`;
+    const footer = `<button class="button button--danger" data-delete-stand="${stand.id}" type="button" ${standBusy ? "disabled" : ""}>${icon("trash")}Удалить стенд</button><button class="button" data-close-modal type="button">Закрыть</button>`;
     const existing = updateExisting ? modalRoot.querySelector(`.modal[data-stand-detail-id="${Number(stand.id)}"]`) : null;
     if (existing) {
       const bodyNode = existing.querySelector(".modal__body");
@@ -975,7 +1072,7 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
   }
 
   function standNeedsLivePolling(stand) {
-    return stand?.status === "provisioning" || stand?.check_status === "running" || (stand?.vms || []).some(vm => vm.check_status === "running");
+    return ["provisioning", "resetting"].includes(stand?.status) || stand?.check_status === "running" || (stand?.vms || []).some(vm => vm.check_status === "running");
   }
 
   function syncOperationPolling() {
@@ -1061,8 +1158,41 @@ echo "Сетевой адрес \${VM_IP}/\${PREFIX} настроен на \${GU
     }, 1000);
   }
 
+  async function openRollbackStartModal(id) {
+    let stand = standCredentialCache.get(Number(id))?.stand;
+    if (!stand?.vms) stand = await api(`/api/stands/${id}`);
+    const vmCount = stand.vms.length;
+    const body = `<div class="danger-confirm compact"><span>${icon("refresh")}</span><h3>Вернуть стенд к snapshot start?</h3><p>Все изменения внутри ${vmCount} VM после первоначального развёртывания будут безвозвратно потеряны. Машины остановятся, откатятся и автоматически запустятся снова.</p><div class="alert alert--info">${icon("lock")}<div><strong>Доступы сохранятся.</strong><br>После запуска dashboard повторно применит текущие логины и пароли.</div></div></div>`;
+    showModal({
+      title: "Возврат к изначальному состоянию",
+      subtitle: stand.name,
+      body,
+      footer: `<button class="button button--danger" id="rollback-start-confirm" type="button">${icon("refresh")}Вернуть все VM к start</button>`,
+    });
+    const button = modalRoot.querySelector("#rollback-start-confirm");
+    button?.addEventListener("click", async () => {
+      if (button.dataset.busy === "true") return;
+      button.dataset.busy = "true";
+      button.disabled = true;
+      button.innerHTML = `${icon("refresh")}Запускаем возврат…`;
+      try {
+        const result = await api(`/api/stands/${id}/actions`, { method: "POST", body: { action: "rollback_start" } });
+        toast(result.message || "Возврат к snapshot start запущен");
+        closeModal();
+        await loadData({ silent: true });
+        await openStandDetail(id);
+      } catch (error) {
+        button.disabled = false;
+        delete button.dataset.busy;
+        button.innerHTML = `${icon("refresh")}Вернуть все VM к start`;
+        toast(error.message, "error");
+      }
+    });
+  }
+
   async function performStandAction(id, action) {
     if (action === "password") { openPasswordModal(id); return; }
+    if (action === "rollback_start") { await openRollbackStartModal(id); return; }
     const labels = { start: "Запускаем стенд…", stop: "Останавливаем стенд…", restart: "Перезапускаем стенд…", snapshot: "Создаём снимок…", run_check: "Запускаем автопроверку…" };
     try {
       const payload = { action };

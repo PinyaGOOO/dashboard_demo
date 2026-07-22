@@ -132,6 +132,7 @@ class DashboardStore:
             credential_username TEXT NOT NULL DEFAULT 'root',
             web_username TEXT NOT NULL DEFAULT 'root@pam',
             credential_password TEXT NOT NULL DEFAULT '',
+            credential_valid INTEGER NOT NULL DEFAULT 1,
             password_updated_at TEXT,
             last_snapshot TEXT NOT NULL DEFAULT '',
             has_start_snapshot INTEGER NOT NULL DEFAULT 0,
@@ -215,6 +216,8 @@ class DashboardStore:
                 connection.execute("ALTER TABLE stand_vms ADD COLUMN credential_username TEXT NOT NULL DEFAULT 'root'")
             if "credential_password" not in vm_columns:
                 connection.execute("ALTER TABLE stand_vms ADD COLUMN credential_password TEXT NOT NULL DEFAULT ''")
+            if "credential_valid" not in vm_columns:
+                connection.execute("ALTER TABLE stand_vms ADD COLUMN credential_valid INTEGER NOT NULL DEFAULT 1")
             if "web_username" not in vm_columns:
                 connection.execute("ALTER TABLE stand_vms ADD COLUMN web_username TEXT NOT NULL DEFAULT 'root@pam'")
             if "password_updated_at" not in vm_columns:

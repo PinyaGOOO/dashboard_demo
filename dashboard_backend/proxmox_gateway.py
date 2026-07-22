@@ -19,6 +19,112 @@ from typing import Any, Callable
 ProgressCallback = Callable[[int, str], None]
 
 
+class RollbackSnapshotError(RuntimeError):
+    """A rollback failed after one or more VM snapshots may have been applied."""
+
+    def __init__(self, message: str, affected_vmids: list[int]):
+        super().__init__(message)
+        self.affected_vmids = sorted({int(vmid) for vmid in affected_vmids})
+
+
+class CredentialRestoreError(RuntimeError):
+    """Current credentials could not be reapplied to every rolled-back VM."""
+
+    def __init__(self, failures: dict[int, str], restored_vmids: list[int]):
+        details = "; ".join(f"VM {vmid}: {message}" for vmid, message in sorted(failures.items()))
+        super().__init__("Не удалось восстановить текущие пароли: " + details)
+        self.failed_vmids = sorted(failures)
+        self.restored_vmids = sorted({int(vmid) for vmid in restored_vmids})
+
+
+_VKLVIKL_NETWORK_MARKER = "# Сетевой bootstrap из исходного vklvikl.py."
+
+_LINUX_NETWORK_READY_SCRIPT = r"""#!/usr/bin/env bash
+set -u
+
+network_ready() {
+  command -v ip >/dev/null 2>&1 || return 1
+  [[ -d "/sys/class/net/${NETWORK_INTERFACE}" ]] || return 1
+  local flags
+  flags="$(cat "/sys/class/net/${NETWORK_INTERFACE}/flags" 2>/dev/null)" || return 1
+  (( (flags & 1) == 1 )) || return 1
+  ip -o -4 addr show dev "${NETWORK_INTERFACE}" scope global 2>/dev/null |
+    awk -v wanted="${EXPECTED_CIDR}" '
+      { count++ }
+      $4 == wanted { found=1 }
+      END { exit(found && count == 1 ? 0 : 1) }
+    ' || return 1
+
+  # For a Linux bridge, admin-UP plus an address is not enough for external
+  # access: at least one enslaved port must also have carrier.
+  if [[ -d "/sys/class/net/${NETWORK_INTERFACE}/bridge" ]]; then
+    local port port_name port_flags carrier operstate
+    for port in "/sys/class/net/${NETWORK_INTERFACE}/brif/"*; do
+      [[ -e "${port}" ]] || continue
+      port_name="${port##*/}"
+      port_flags="$(cat "/sys/class/net/${port_name}/flags" 2>/dev/null || echo 0)"
+      carrier="$(cat "/sys/class/net/${port_name}/carrier" 2>/dev/null || echo 0)"
+      operstate="$(cat "/sys/class/net/${port_name}/operstate" 2>/dev/null || true)"
+      if (( (port_flags & 1) == 1 )) && [[ "${carrier}" == "1" || "${operstate}" == "up" ]]; then
+        return 0
+      fi
+    done
+    return 1
+  fi
+  return 0
+}
+
+network_diagnostics() {
+  echo "Интерфейс ${NETWORK_INTERFACE} не готов; ожидался ${EXPECTED_CIDR}" >&2
+  ip -details link show dev "${NETWORK_INTERFACE}" >&2 2>/dev/null || true
+  ip -o -4 addr show dev "${NETWORK_INTERFACE}" >&2 2>/dev/null || true
+  ip route show >&2 2>/dev/null || true
+  if command -v bridge >/dev/null 2>&1; then
+    bridge link show master "${NETWORK_INTERFACE}" >&2 2>/dev/null || true
+  fi
+}
+
+printf 'BOOT_ID=%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+if network_ready; then
+  echo "NETWORK_READY ${NETWORK_INTERFACE} ${EXPECTED_CIDR}"
+  exit 0
+fi
+
+if [[ "${NETWORK_REPAIR:-0}" != "1" ]]; then
+  network_diagnostics
+  exit 1
+fi
+
+for attempt in 1 2; do
+  echo "Попытка ${attempt}: применяем сетевую конфигурацию ${NETWORK_INTERFACE}" >&2
+  if command -v ifreload >/dev/null 2>&1; then
+    syntax_output="$(ifreload -a -s 2>&1)" || {
+      echo "Ошибка синтаксиса /etc/network/interfaces: ${syntax_output}" >&2
+      network_diagnostics
+      exit 2
+    }
+    ifreload -a >&2 2>&1 || true
+  else
+    echo "ifreload не найден; применяем конфигурацию безопасной перезагрузкой VM" >&2
+    network_diagnostics
+    exit 1
+  fi
+  ip link set dev "${NETWORK_INTERFACE}" up >&2 2>&1 || true
+
+  for _ in $(seq 1 15); do
+    if network_ready; then
+      echo "NETWORK_READY ${NETWORK_INTERFACE} ${EXPECTED_CIDR}"
+      exit 0
+    fi
+    sleep 1
+  done
+done
+
+network_diagnostics
+exit 1
+"""
+
+
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
@@ -175,6 +281,23 @@ class DemoProxmoxGateway:
 
     def create_snapshot(self, vmids: list[int], name: str, description: str = "") -> None:
         time.sleep(0.25)
+
+    def rollback_snapshot(
+        self,
+        vmids: list[int],
+        name: str = "start",
+        *,
+        start: bool = True,
+        progress: ProgressCallback | None = None,
+    ) -> None:
+        for value, message in ((20, "Проверяем snapshot"), (65, "Откатываем VM"), (90, "Запускаем VM")):
+            time.sleep(0.05)
+            if progress:
+                progress(value, message)
+
+    def restore_credentials(self, credentials: list[dict[str, Any]]) -> list[int]:
+        time.sleep(0.08)
+        return [int(item["vmid"]) for item in credentials if item.get("vmid") is not None]
 
     def run_autocheck(self, vmids: list[int], script: str) -> list[dict[str, Any]]:
         time.sleep(0.9)
@@ -590,7 +713,7 @@ class LiveProxmoxGateway:
     ) -> dict[str, Any]:
         if not script.strip():
             raise RuntimeError("Скрипт пуст")
-        self._wait_guest_agent(node, vmid)
+        self._wait_guest_agent(node, vmid, timeout=min(max(1, timeout), 180))
         environment = environment or {}
         if self._is_powershell(script):
             prefix = "\n".join(
@@ -649,6 +772,164 @@ class LiveProxmoxGateway:
             "stderr": str(payload.get("err-data", "") or ""),
             "duration": round((time.monotonic() - started) * 1000),
         }
+
+    def _linux_network_target(
+        self,
+        script: str,
+        vm_ip: str,
+        subnet: str,
+    ) -> tuple[str, str] | None:
+        """Return guest interface and exact CIDR for vklvikl-style Linux networking."""
+        if not script.strip() or not vm_ip.strip() or self._is_powershell(script):
+            return None
+        looks_like_network_bootstrap = _VKLVIKL_NETWORK_MARKER in script or (
+            "VM_IP" in script
+            and "/etc/network/interfaces" in script
+            and ("ifup" in script or "ifreload" in script or "GUEST_INTERFACE" in script)
+        )
+        if not looks_like_network_bootstrap:
+            return None
+
+        default_match = re.search(
+            r"GUEST_INTERFACE\s*=\s*[\"']?\$\{GUEST_INTERFACE:-([A-Za-z0-9_.:-]+)\}",
+            script,
+        )
+        fixed_match = re.search(
+            r"GUEST_INTERFACE\s*=\s*[\"']([A-Za-z0-9_.:-]+)[\"']",
+            script,
+        )
+        configured_interface = os.environ.get("PROXMOX_GUEST_INTERFACE", "").strip()
+        # A hard assignment in an editable script overrides an exported env
+        # value at runtime, so the verifier must follow the same precedence.
+        interface = (
+            fixed_match.group(1)
+            if fixed_match
+            else configured_interface
+            or (default_match.group(1) if default_match else "vmbr0")
+        )
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", interface):
+            raise RuntimeError(f"Недопустимое имя гостевого сетевого интерфейса: {interface}")
+
+        try:
+            address = ipaddress.ip_address(vm_ip.strip())
+        except ValueError as exc:
+            raise RuntimeError(f"Некорректный IP VM для проверки сети: {vm_ip}") from exc
+        if address.version != 4:
+            return None
+        try:
+            prefix = ipaddress.ip_interface(subnet.strip()).network.prefixlen
+        except ValueError:
+            # The original vklvikl bootstrap uses /16 when STAND_SUBNET has no
+            # prefix. Keep the verifier consistent with that behaviour.
+            prefix = 16
+        return interface, f"{address}/{prefix}"
+
+    @staticmethod
+    def _network_result_detail(result: dict[str, Any] | None) -> str:
+        if not result:
+            return "проверка не вернула результат"
+        detail = str(result.get("stderr") or result.get("stdout") or "").strip()
+        return detail[-1200:] if detail else f"exit code {result.get('exit_code', 1)}"
+
+    @staticmethod
+    def _network_boot_id(result: dict[str, Any] | None) -> str:
+        if not result:
+            return ""
+        match = re.search(r"^BOOT_ID=([0-9a-fA-F-]+)$", str(result.get("stdout") or ""), re.MULTILINE)
+        return match.group(1).lower() if match else ""
+
+    def _run_linux_network_readiness(
+        self,
+        node: str,
+        vmid: int,
+        interface: str,
+        expected_cidr: str,
+        *,
+        repair: bool,
+        timeout: int,
+    ) -> dict[str, Any]:
+        return self._guest_script(
+            node,
+            vmid,
+            _LINUX_NETWORK_READY_SCRIPT,
+            "network-ready",
+            {
+                "NETWORK_INTERFACE": interface,
+                "EXPECTED_CIDR": expected_cidr,
+                "NETWORK_REPAIR": "1" if repair else "0",
+            },
+            timeout=timeout,
+        )
+
+    def _ensure_linux_guest_network(
+        self,
+        node: str,
+        vmid: int,
+        interface: str,
+        expected_cidr: str,
+    ) -> None:
+        """Converge guest networking, then require admin-UP and the exact IPv4."""
+        initial: dict[str, Any] | None = None
+        initial_error = ""
+        try:
+            initial = self._run_linux_network_readiness(
+                node, vmid, interface, expected_cidr, repair=True, timeout=75,
+            )
+        except Exception as exc:
+            initial_error = str(exc)
+        if initial and int(initial.get("exit_code", 1)) == 0:
+            return
+        if initial and int(initial.get("exit_code", 1)) == 2:
+            raise RuntimeError(
+                f"Сеть VM {vmid} не применена: ошибка конфигурации внутри гостя. "
+                f"{self._network_result_detail(initial)}"
+            )
+
+        old_boot_id = self._network_boot_id(initial)
+        first_detail = initial_error or self._network_result_detail(initial)
+        try:
+            upid = self.client.nodes(node).qemu(vmid).status.reboot.post()
+            if upid:
+                self._wait_task(node, str(upid), timeout=180)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Сеть VM {vmid} ({interface}, ожидался {expected_cidr}) не поднялась, "
+                f"а автоматическая перезагрузка не запустилась: {exc}. Диагностика: {first_detail}"
+            ) from exc
+
+        try:
+            ready_timeout = int(os.environ.get("PROXMOX_NETWORK_READY_TIMEOUT", "180"))
+        except ValueError:
+            ready_timeout = 180
+        ready_timeout = max(30, min(ready_timeout, 600))
+        deadline = time.monotonic() + ready_timeout
+        last_detail = first_detail
+        while time.monotonic() < deadline:
+            remaining = max(1, round(deadline - time.monotonic()))
+            try:
+                result = self._run_linux_network_readiness(
+                    node,
+                    vmid,
+                    interface,
+                    expected_cidr,
+                    repair=False,
+                    timeout=min(20, remaining),
+                )
+                new_boot_id = self._network_boot_id(result)
+                if old_boot_id and new_boot_id == old_boot_id:
+                    last_detail = "QEMU Guest Agent ещё отвечает из предыдущей загрузки"
+                elif int(result.get("exit_code", 1)) == 0:
+                    return
+                else:
+                    last_detail = self._network_result_detail(result)
+            except Exception as exc:
+                last_detail = str(exc)
+            if time.monotonic() < deadline:
+                time.sleep(2)
+        raise RuntimeError(
+            f"Сеть VM {vmid} не готова после восстановления и автоматической перезагрузки: "
+            f"интерфейс {interface}, ожидался {expected_cidr}. {last_detail}"
+        )
 
     def _cleanup_failed_deploy(
         self,
@@ -786,11 +1067,22 @@ class LiveProxmoxGateway:
 
     @staticmethod
     def _network_with_bridge(network: str, bridge: str) -> str:
-        parts = [part for part in str(network).split(",") if part]
+        parts = [part.strip() for part in str(network).split(",") if part.strip()]
         if not parts:
             parts = ["virtio"]
-        parts = [part for part in parts if not part.startswith("bridge=")]
-        parts.append(f"bridge={bridge}")
+        inherited_bridge = next(
+            (part.split("=", 1)[1] for part in parts if part.startswith("bridge=")),
+            "",
+        )
+        # A template can be saved with Proxmox's "Disconnect" checkbox.  Do
+        # not propagate link_down=1 (or an unnecessary link_down=0) to clones.
+        parts = [
+            part for part in parts
+            if not part.startswith("bridge=") and not part.startswith("link_down=")
+        ]
+        selected_bridge = str(bridge).strip() or inherited_bridge
+        if selected_bridge:
+            parts.append(f"bridge={selected_bridge}")
         return ",".join(parts)
 
     def deploy(self, stand: dict[str, Any], blueprint: dict[str, Any], progress: ProgressCallback) -> list[dict[str, Any]]:
@@ -891,14 +1183,16 @@ class LiveProxmoxGateway:
                         linked_disk_storages,
                     )
                     config: dict[str, Any] = {"agent": "1"}
-                    if blueprint.get("bridge"):
-                        vm_api = self.client.nodes(target_node).qemu(new_vmid)
-                        current_config = vm_api.config.get()
+                    vm_api = self.client.nodes(target_node).qemu(new_vmid)
+                    current_config = vm_api.config.get()
+                    current_network = str(current_config.get("net0", ""))
+                    requested_bridge = str(blueprint.get("bridge") or "")
+                    if current_network or requested_bridge:
                         config["net0"] = self._network_with_bridge(
-                            str(current_config.get("net0", "")), str(blueprint["bridge"]),
+                            current_network, requested_bridge,
                         )
-                    self.client.nodes(target_node).qemu(new_vmid).config.put(**config)
-                    upid = self.client.nodes(target_node).qemu(new_vmid).status.start.post()
+                    vm_api.config.put(**config)
+                    upid = vm_api.status.start.post()
                     if upid:
                         start_tasks.append((target_node, str(upid)))
                 self._wait_tasks(start_tasks, timeout=600)
@@ -928,26 +1222,52 @@ class LiveProxmoxGateway:
                 index = int(plan["index"])
                 vm_ip = str(plan["ip"])
                 deploy_script = str(blueprint.get("deploy_script", ""))
+                network_target = self._linux_network_target(
+                    deploy_script,
+                    vm_ip,
+                    str(blueprint.get("subnet", "")),
+                )
+                deferred_network_error = ""
                 if deploy_script.strip():
+                    environment = {
+                        "STAND_NAME": str(stand["name"]),
+                        "STAND_POOL": str(pool_id),
+                        "VM_INDEX": str(index),
+                        "VMID": str(new_vmid),
+                        "VM_IP": vm_ip,
+                        "STAND_SUBNET": str(blueprint.get("subnet", "")),
+                        "VM_BRIDGE": str(blueprint.get("bridge", "")),
+                    }
+                    if network_target:
+                        environment["GUEST_INTERFACE"] = network_target[0]
                     result = self._guest_script(
                         target_node,
                         new_vmid,
                         deploy_script,
                         "deploy",
-                        {
-                            "STAND_NAME": str(stand["name"]),
-                            "STAND_POOL": str(pool_id),
-                            "VM_INDEX": str(index),
-                            "VMID": str(new_vmid),
-                            "VM_IP": vm_ip,
-                            "STAND_SUBNET": str(blueprint.get("subnet", "")),
-                            "VM_BRIDGE": str(blueprint.get("bridge", "")),
-                        },
+                        environment,
                         timeout=900,
                     )
                     if result["exit_code"] != 0:
                         detail = result["stderr"] or result["stdout"] or f"exit code {result['exit_code']}"
-                        raise RuntimeError(f"Скрипт развёртывания VM {new_vmid}: {detail[-500:]}")
+                        # Exit 75 is the default bootstrap's explicit signal
+                        # that its live network apply needs backend recovery.
+                        if network_target and int(result["exit_code"]) == 75:
+                            deferred_network_error = str(detail)[-500:]
+                        else:
+                            raise RuntimeError(f"Скрипт развёртывания VM {new_vmid}: {str(detail)[-500:]}")
+
+                if network_target:
+                    try:
+                        self._ensure_linux_guest_network(
+                            target_node,
+                            new_vmid,
+                            network_target[0],
+                            network_target[1],
+                        )
+                    except Exception as exc:
+                        suffix = f" Bootstrap: {deferred_network_error}" if deferred_network_error else ""
+                        raise RuntimeError(f"{exc}{suffix}") from exc
 
                 # Even when a blueprint has no bootstrap script, wait for QGA
                 # before applying the generated login password.
@@ -981,7 +1301,7 @@ class LiveProxmoxGateway:
                         completed += 1
                         progress(
                             55 + round(completed / vm_count * 35),
-                            f"VM {completed} из {vm_count} настроена",
+                            f"VM {completed} из {vm_count}: настройка и сеть готовы",
                         )
 
             deployed.sort(key=lambda item: int(item["vmid"]))
@@ -1065,6 +1385,190 @@ class LiveProxmoxGateway:
                 self._wait_tasks(tasks, timeout=1800)
                 tasks.clear()
         self._wait_tasks(tasks, timeout=1800)
+
+    def rollback_snapshot(
+        self,
+        vmids: list[int],
+        name: str = "start",
+        *,
+        start: bool = True,
+        progress: ProgressCallback | None = None,
+    ) -> None:
+        """Rollback every VM to one exact snapshot, then optionally start it."""
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", str(name)):
+            raise ValueError("Некорректное имя snapshot для отката")
+        inventory = self._vm_inventory(vmids)
+        missing: list[int] = []
+        unavailable: list[str] = []
+
+        # Complete preflight for the whole stand before changing the first VM.
+        for vmid in vmids:
+            node = str(inventory[int(vmid)]["node"])
+            vm_api = self.client.nodes(node).qemu(int(vmid))
+            config = vm_api.config.get()
+            if int(config.get("template") or 0) == 1:
+                unavailable.append(f"VMID {vmid}: это шаблон")
+                continue
+            lock = str(config.get("lock") or "").strip()
+            if lock:
+                unavailable.append(f"VMID {vmid}: активна блокировка {lock}")
+                continue
+            snapshots = vm_api.snapshot.get()
+            selected = next(
+                (
+                    item for item in snapshots
+                    if str(item.get("name") or item.get("snapname") or "") == name
+                ),
+                None,
+            )
+            if not selected:
+                missing.append(int(vmid))
+            elif str(selected.get("snapstate") or "").strip():
+                unavailable.append(f"VMID {vmid}: snapshot {name} ещё не завершён")
+        if missing or unavailable:
+            details = []
+            if missing:
+                details.append(f"нет snapshot {name} на VMID {', '.join(map(str, missing))}")
+            details.extend(unavailable)
+            raise RuntimeError("Откат не запущен: " + "; ".join(details))
+        if progress:
+            progress(20, f"Snapshot {name} проверен на всех VM")
+
+        batch_size = self._batch_limit("PROXMOX_ROLLBACK_BATCH", default=4)
+        total = max(len(vmids), 1)
+        completed = 0
+        changed_vmids: list[int] = []
+        for offset in range(0, len(vmids), batch_size):
+            batch = [int(vmid) for vmid in vmids[offset:offset + batch_size]]
+            tasks: list[tuple[str, str]] = []
+            submitted: list[int] = []
+            try:
+                for vmid in batch:
+                    node = str(inventory[vmid]["node"])
+                    upid = (
+                        self.client.nodes(node)
+                        .qemu(vmid)
+                        .snapshot(name)
+                        .rollback.post(start=0)
+                    )
+                    if upid:
+                        tasks.append((node, str(upid)))
+                    submitted.append(vmid)
+                self._wait_tasks(tasks, timeout=1800)
+            except Exception as exc:
+                if tasks:
+                    try:
+                        self._wait_tasks(tasks, timeout=1800)
+                    except Exception:
+                        pass
+                raise RollbackSnapshotError(
+                    f"Откат snapshot {name} завершился ошибкой на группе VMID "
+                    f"{', '.join(map(str, submitted or batch))}; часть стенда могла уже измениться: {exc}",
+                    changed_vmids + (submitted or batch),
+                ) from exc
+            changed_vmids.extend(batch)
+            completed += len(batch)
+            if progress:
+                progress(20 + round(completed / total * 50), f"Откат выполнен: {completed} из {len(vmids)} VM")
+
+        if not start:
+            return
+
+        start_tasks: list[tuple[str, str]] = []
+        try:
+            for vmid in vmids:
+                node = str(inventory[int(vmid)]["node"])
+                vm_api = self.client.nodes(node).qemu(int(vmid))
+                current = vm_api.status.current.get()
+                if str(current.get("status") or "") == "running":
+                    continue
+                upid = vm_api.status.start.post()
+                if upid:
+                    start_tasks.append((node, str(upid)))
+                if len(start_tasks) >= batch_size:
+                    self._wait_tasks(start_tasks, timeout=600)
+                    start_tasks.clear()
+            self._wait_tasks(start_tasks, timeout=600)
+        except Exception as exc:
+            if start_tasks:
+                try:
+                    self._wait_tasks(start_tasks, timeout=600)
+                except Exception:
+                    pass
+            raise RollbackSnapshotError(
+                f"VM откатились к snapshot {name}, но запуск завершился ошибкой: {exc}",
+                [int(vmid) for vmid in vmids],
+            ) from exc
+        if progress:
+            progress(80, "VM запущены после отката")
+
+        workers = max(1, min(self._batch_limit("PROXMOX_DEPLOY_WORKERS"), len(vmids)))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pve-rollback-ready") as executor:
+            futures = {
+                executor.submit(
+                    self._wait_guest_agent,
+                    str(inventory[int(vmid)]["node"]),
+                    int(vmid),
+                    240,
+                ): int(vmid)
+                for vmid in vmids
+            }
+            for future in as_completed(futures):
+                vmid = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    raise RollbackSnapshotError(
+                        f"VM {vmid} запущена, но QEMU Guest Agent не готов: {exc}",
+                        [int(item) for item in vmids],
+                    ) from exc
+        if progress:
+            progress(90, "Все VM отвечают после отката")
+
+    def restore_credentials(self, credentials: list[dict[str, Any]]) -> list[int]:
+        usable = [
+            dict(item) for item in credentials
+            if item.get("vmid") is not None and str(item.get("password") or "")
+        ]
+        if not usable:
+            return []
+        vmids = [int(item["vmid"]) for item in usable]
+        inventory = self._vm_inventory(vmids)
+
+        def apply(item: dict[str, Any]) -> None:
+            vmid = int(item["vmid"])
+            node = str(inventory[vmid]["node"])
+            last_error: Exception | None = None
+            for attempt in range(1, 4):
+                try:
+                    self._wait_guest_agent(node, vmid, timeout=60)
+                    self.client.nodes(node).qemu(vmid).agent("set-user-password").post(
+                        username=str(item.get("username") or "root"),
+                        password=str(item["password"]),
+                    )
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < 3:
+                        time.sleep(attempt)
+            raise RuntimeError(str(last_error or "неизвестная ошибка QEMU Guest Agent"))
+
+        workers = max(1, min(self._batch_limit("PROXMOX_DEPLOY_WORKERS"), len(usable)))
+        restored: list[int] = []
+        failures: dict[int, str] = {}
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pve-rollback-password") as executor:
+            futures = {executor.submit(apply, item): int(item["vmid"]) for item in usable}
+            for future in as_completed(futures):
+                vmid = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    failures[vmid] = str(exc)
+                else:
+                    restored.append(vmid)
+        if failures:
+            raise CredentialRestoreError(failures, restored)
+        return sorted(restored)
 
     def run_autocheck(self, vmids: list[int], script: str) -> list[dict[str, Any]]:
         """Run the editable check inside guests, never on the dashboard host."""

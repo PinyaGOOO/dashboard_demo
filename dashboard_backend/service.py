@@ -12,7 +12,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .database import DashboardStore, utc_now
-from .proxmox_gateway import DemoProxmoxGateway, LiveProxmoxGateway
+from .proxmox_gateway import (
+    CredentialRestoreError,
+    DemoProxmoxGateway,
+    LiveProxmoxGateway,
+    RollbackSnapshotError,
+)
 
 
 Gateway = DemoProxmoxGateway | LiveProxmoxGateway
@@ -38,8 +43,33 @@ class DashboardService:
         self.gateway = gateway
         self._jobs: dict[int, threading.Thread] = {}
         self._job_lock = threading.Lock()
+        self._stand_operation_locks: dict[int, threading.RLock] = {}
+        self._mark_interrupted_rollbacks()
         if gateway.mode == "demo":
             self._resume_demo_deployments()
+
+    def _mark_interrupted_rollbacks(self) -> None:
+        """A background rollback cannot survive a dashboard process restart."""
+        interrupted = self.store.query_all(
+            "SELECT id, name FROM stands WHERE status = 'resetting'",
+        )
+        for stand in interrupted:
+            message = (
+                "Возврат к snapshot start был прерван перезапуском dashboard. "
+                "Проверьте задачи Proxmox и запустите возврат повторно."
+            )
+            self.store.execute(
+                "UPDATE stands SET status = 'error', last_error = ?, updated_at = ? WHERE id = ?",
+                (message, utc_now(), int(stand["id"])),
+            )
+            self.store.execute(
+                """UPDATE stand_vms SET status = 'error', credential_valid = 0
+                WHERE stand_id = ? AND status = 'resetting'""",
+                (int(stand["id"]),),
+            )
+            self.store.add_activity(
+                "rollback", "Возврат был прерван", str(stand["name"]), "error", "Система",
+            )
 
     def _resume_demo_deployments(self) -> None:
         """Let the seeded progress card complete instead of remaining at 72%."""
@@ -60,6 +90,11 @@ class DashboardService:
             )
             self._jobs[stand_id] = thread
             thread.start()
+
+    def _stand_operation_lock(self, stand_id: int) -> threading.RLock:
+        """Serialize mutating requests for one stand across HTTP threads."""
+        with self._job_lock:
+            return self._stand_operation_locks.setdefault(stand_id, threading.RLock())
 
     def integration(self) -> dict[str, Any]:
         info = self.gateway.integration_info()
@@ -295,7 +330,7 @@ class DashboardService:
         SELECT s.*, b.name AS blueprint_name, b.code AS blueprint_code, b.category AS blueprint_category,
                (SELECT COUNT(*) FROM stand_vms v WHERE v.stand_id = s.id) AS actual_vm_count
         FROM stands s LEFT JOIN blueprints b ON b.id = s.blueprint_id
-        ORDER BY CASE s.status WHEN 'provisioning' THEN 0 WHEN 'error' THEN 1 WHEN 'running' THEN 2 ELSE 3 END,
+        ORDER BY CASE s.status WHEN 'provisioning' THEN 0 WHEN 'resetting' THEN 0 WHEN 'error' THEN 1 WHEN 'running' THEN 2 ELSE 3 END,
                  s.updated_at DESC
         """
         return self.store.query_all(sql)
@@ -340,6 +375,7 @@ class DashboardService:
     def _public_vm(self, vm: dict[str, Any]) -> dict[str, Any]:
         item = dict(vm)
         secret = str(item.pop("credential_password", "") or "")
+        credential_valid = bool(item.pop("credential_valid", 1))
         guest_username = str(item.pop("credential_username", "root") or "root")
         web_username = str(item.pop("web_username", "root@pam") or "root@pam")
         web_url = self._vm_web_url(str(item.get("ip", "")))
@@ -347,7 +383,8 @@ class DashboardService:
             "username": web_username,
             "web_username": web_username,
             "guest_username": guest_username,
-            "credential_available": bool(secret),
+            "credential_available": bool(secret) and credential_valid,
+            "credential_recoverable": bool(secret),
             "has_start_snapshot": bool(item.get("has_start_snapshot")),
             "web_url": web_url,
             "access_url": web_url,
@@ -378,6 +415,8 @@ class DashboardService:
         return self._credential(row)
 
     def _credential(self, vm: dict[str, Any]) -> dict[str, Any]:
+        credential_valid = bool(vm.get("credential_valid", 1))
+        stored_password = str(vm.get("credential_password") or "")
         return {
             "vmid": vm.get("vmid"),
             "name": vm.get("name", ""),
@@ -387,7 +426,9 @@ class DashboardService:
             "username": str(vm.get("web_username") or "root@pam"),
             "web_username": str(vm.get("web_username") or "root@pam"),
             "guest_username": str(vm.get("credential_username") or "root"),
-            "password": str(vm.get("credential_password") or ""),
+            "password": stored_password if credential_valid else "",
+            "credential_available": bool(stored_password) and credential_valid,
+            "credential_recoverable": bool(stored_password),
             "password_updated_at": vm.get("password_updated_at"),
             "reveal_once": False,
         }
@@ -708,7 +749,8 @@ class DashboardService:
                         connection.execute(
                             """UPDATE stand_vms SET vmid = ?, name = ?, node = ?, ip = ?,
                             status = ?, cpu = 0, ram = 0, credential_username = ?,
-                            web_username = ?, credential_password = ?, password_updated_at = ?,
+                            web_username = ?, credential_password = ?, credential_valid = 1,
+                            password_updated_at = ?,
                             last_snapshot = ?, has_start_snapshot = ? WHERE id = ?""",
                             values + (stand_vm_id,),
                         )
@@ -716,9 +758,9 @@ class DashboardService:
                         cursor = connection.execute(
                             """INSERT INTO stand_vms
                             (stand_id, vmid, name, node, ip, status, cpu, ram,
-                             credential_username, web_username, credential_password,
+                             credential_username, web_username, credential_password, credential_valid,
                              password_updated_at, last_snapshot, has_start_snapshot)
-                            VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?)""",
+                            VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 1, ?, ?, ?)""",
                             (stand_id,) + values,
                         )
                         stand_vm_id = int(cursor.lastrowid)
@@ -779,12 +821,104 @@ class DashboardService:
                 self._jobs.pop(stand_id, None)
 
     def stand_action(self, stand_id: int, action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        with self._stand_operation_lock(stand_id):
+            return self._stand_action_locked(stand_id, action, payload)
+
+    def _stand_action_locked(self, stand_id: int, action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = payload or {}
         stand = self.get_stand(stand_id)
         vmids = [int(vm["vmid"]) for vm in stand["vms"] if vm.get("vmid") is not None]
+        if stand["status"] in {"provisioning", "resetting"}:
+            label = "развёртывания" if stand["status"] == "provisioning" else "возврата к исходному состоянию"
+            raise ConflictError(f"Действие недоступно во время {label}")
+        with self._job_lock:
+            if stand_id in self._jobs:
+                raise ConflictError("Для стенда уже выполняется фоновая операция")
+        if action == "rollback_start":
+            if stand.get("check_status") == "running" or any(
+                vm.get("check_status") == "running" for vm in stand["vms"]
+            ):
+                raise ConflictError("Сначала дождитесь завершения автопроверки")
+            if not vmids:
+                raise ConflictError("В стенде нет VM для возврата к исходному состоянию")
+            missing = [
+                str(vm.get("vmid") or vm.get("name") or "неизвестная VM")
+                for vm in stand["vms"]
+                if vm.get("vmid") is None or not vm.get("has_start_snapshot")
+            ]
+            if missing:
+                raise ConflictError(
+                    "Возврат недоступен: snapshot start отсутствует у VM " + ", ".join(missing)
+                )
+            raw_vms = self.store.query_all(
+                "SELECT * FROM stand_vms WHERE stand_id = ? ORDER BY id", (stand_id,),
+            )
+            missing_credentials = [
+                str(vm.get("vmid") or vm.get("name") or "неизвестная VM")
+                for vm in raw_vms
+                if not str(vm.get("credential_password") or "")
+            ]
+            if missing_credentials:
+                raise ConflictError(
+                    "Возврат недоступен: dashboard не хранит пароль VM "
+                    + ", ".join(missing_credentials)
+                    + ". Сначала задайте пароль для этих VM."
+                )
+            thread = threading.Thread(
+                target=self._rollback_start_job,
+                args=(stand_id, str(stand["name"]), raw_vms),
+                name=f"rollback-start-{stand_id}",
+                daemon=True,
+            )
+            with self._job_lock:
+                if stand_id in self._jobs:
+                    raise ConflictError("Для стенда уже выполняется фоновая операция")
+                now = utc_now()
+                with self.store.transaction() as connection:
+                    connection.execute(
+                        """UPDATE stands SET status = 'resetting', progress = 5, last_error = '',
+                        updated_at = ? WHERE id = ?""",
+                        (now, stand_id),
+                    )
+                    connection.execute(
+                        """UPDATE stand_vms SET status = 'resetting', credential_valid = 0
+                        WHERE stand_id = ?""",
+                        (stand_id,),
+                    )
+                self._jobs[stand_id] = thread
+            try:
+                try:
+                    self.store.add_activity(
+                        "rollback", "Возврат к исходному состоянию запущен",
+                        f"{stand['name']} · {len(vmids)} VM · snapshot start", "progress",
+                    )
+                except Exception:
+                    # Audit logging must not leave a registered job without a worker.
+                    pass
+                thread.start()
+            except Exception:
+                with self._job_lock:
+                    self._jobs.pop(stand_id, None)
+                with self.store.transaction() as connection:
+                    connection.execute(
+                        "UPDATE stands SET status = ?, progress = 100, updated_at = ? WHERE id = ?",
+                        (str(stand["status"]), utc_now(), stand_id),
+                    )
+                    for vm in raw_vms:
+                        connection.execute(
+                            "UPDATE stand_vms SET status = ?, credential_valid = ? WHERE id = ?",
+                            (
+                                str(vm.get("status") or "stopped"),
+                                1 if vm.get("credential_valid", 1) else 0,
+                                int(vm["id"]),
+                            ),
+                        )
+                raise
+            return {
+                "stand": self.get_stand(stand_id),
+                "message": "Возврат всех VM к snapshot start запущен",
+            }
         if action in {"start", "stop", "restart"}:
-            if stand["status"] == "provisioning":
-                raise ConflictError("Действие недоступно во время развёртывания")
             if not vmids:
                 raise ConflictError("В стенде нет VM для управления питанием")
             self.gateway.power_action(vmids, action)
@@ -826,7 +960,8 @@ class DashboardService:
             changed_at = utc_now()
             self.store.execute(
                 """UPDATE stand_vms SET credential_username = ?, web_username = ?,
-                credential_password = ?, password_updated_at = ? WHERE stand_id = ?""",
+                credential_password = ?, credential_valid = 1,
+                password_updated_at = ? WHERE stand_id = ?""",
                 (username, web_username, password, changed_at, stand_id),
             )
             self.store.execute(
@@ -844,6 +979,113 @@ class DashboardService:
             return {"stand": self.get_stand(stand_id), "message": "Автопроверка запущена", "run": run}
         raise ValidationError("Неизвестное действие")
 
+    def _rollback_start_job(
+        self,
+        stand_id: int,
+        stand_name: str,
+        raw_vms: list[dict[str, Any]],
+    ) -> None:
+        vmids = [int(vm["vmid"]) for vm in raw_vms if vm.get("vmid") is not None]
+        rollback_applied = False
+        restored_vmids: set[int] = set()
+        try:
+            announced: set[int] = set()
+
+            def progress(value: int, message: str) -> None:
+                safe_value = max(5, min(int(value), 90))
+                try:
+                    self.store.execute(
+                        "UPDATE stands SET progress = ?, updated_at = ? WHERE id = ?",
+                        (safe_value, utc_now(), stand_id),
+                    )
+                    milestone = 20 if safe_value >= 20 else 0
+                    milestone = 70 if safe_value >= 70 else milestone
+                    milestone = 90 if safe_value >= 90 else milestone
+                    if milestone and milestone not in announced:
+                        announced.add(milestone)
+                        self.store.add_activity("rollback", message, stand_name, "progress", "Система")
+                except Exception:
+                    # A visual progress/audit write must never interrupt a
+                    # destructive Proxmox operation that is already running.
+                    pass
+
+            self.gateway.rollback_snapshot(vmids, "start", start=True, progress=progress)
+            rollback_applied = True
+            self.store.execute(
+                "UPDATE stands SET progress = 92, updated_at = ? WHERE id = ?",
+                (utc_now(), stand_id),
+            )
+            credentials = [
+                {
+                    "vmid": int(vm["vmid"]),
+                    "username": str(vm.get("credential_username") or "root"),
+                    "password": str(vm.get("credential_password") or ""),
+                }
+                for vm in raw_vms
+                if vm.get("vmid") is not None and str(vm.get("credential_password") or "")
+            ]
+            restored = self.gateway.restore_credentials(credentials)
+            restored_vmids = {
+                int(vmid) for vmid in (restored if restored is not None else [item["vmid"] for item in credentials])
+            }
+            now = utc_now()
+            with self.store.transaction() as connection:
+                connection.execute(
+                    """UPDATE stands SET status = 'running', progress = 100, cpu = 0, ram = 0,
+                    check_score = NULL, check_status = 'idle', last_check = NULL,
+                    last_error = '', updated_at = ? WHERE id = ?""",
+                    (now, stand_id),
+                )
+                connection.execute(
+                    """UPDATE stand_vms SET status = 'running', cpu = 0, ram = 0,
+                    last_snapshot = 'start', has_start_snapshot = 1, credential_valid = 1,
+                    check_score = NULL, check_status = 'idle', last_check = NULL
+                    WHERE stand_id = ?""",
+                    (stand_id,),
+                )
+            try:
+                self.store.add_activity(
+                    "rollback", "Стенд возвращён к исходному состоянию",
+                    f"{stand_name} · snapshot start · текущие пароли восстановлены", "success", "Система",
+                )
+            except Exception:
+                # The state transition above is authoritative; audit failure
+                # must not turn a completed rollback into an operational error.
+                pass
+        except Exception as exc:
+            detail = str(exc)[-1200:]
+            affected_vmids = (
+                set(exc.affected_vmids) if isinstance(exc, RollbackSnapshotError) else set()
+            )
+            if isinstance(exc, CredentialRestoreError):
+                restored_vmids.update(exc.restored_vmids)
+            with self.store.transaction() as connection:
+                connection.execute(
+                    """UPDATE stands SET status = 'error', last_error = ?, updated_at = ?
+                    WHERE id = ?""",
+                    (f"Ошибка возврата к snapshot start: {detail}", utc_now(), stand_id),
+                )
+                for vm in raw_vms:
+                    vmid = int(vm["vmid"]) if vm.get("vmid") is not None else None
+                    original_valid = 1 if vm.get("credential_valid", 1) else 0
+                    if isinstance(exc, CredentialRestoreError) or rollback_applied:
+                        credential_valid = 1 if vmid in restored_vmids else 0
+                    elif isinstance(exc, RollbackSnapshotError):
+                        credential_valid = 0 if vmid in affected_vmids else original_valid
+                    else:
+                        credential_valid = original_valid
+                    connection.execute(
+                        "UPDATE stand_vms SET status = 'error', credential_valid = ? WHERE id = ?",
+                        (credential_valid, int(vm["id"])),
+                    )
+            self.store.add_activity(
+                "rollback", "Ошибка возврата к исходному состоянию",
+                f"{stand_name}: {detail}", "error", "Система",
+            )
+        finally:
+            with self._job_lock:
+                self._jobs.pop(stand_id, None)
+
     @staticmethod
     def _snapshot_label(value: Any) -> str:
         label = str(value or "").strip()
@@ -860,8 +1102,23 @@ class DashboardService:
         action: str,
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        with self._stand_operation_lock(stand_id):
+            return self._vm_action_locked(stand_id, vmid, action, payload)
+
+    def _vm_action_locked(
+        self,
+        stand_id: int,
+        vmid: int,
+        action: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         payload = payload or {}
         stand = self.get_stand(stand_id)
+        if stand["status"] in {"provisioning", "resetting"}:
+            raise ConflictError("Действие VM недоступно во время фоновой операции стенда")
+        with self._job_lock:
+            if stand_id in self._jobs:
+                raise ConflictError("Для стенда уже выполняется фоновая операция")
         vm = next((item for item in stand["vms"] if int(item.get("vmid") or -1) == vmid), None)
         if not vm:
             raise NotFoundError("VM не найдена в этом стенде")
@@ -900,7 +1157,7 @@ class DashboardService:
             changed_at = utc_now()
             self.store.execute(
                 """UPDATE stand_vms SET credential_username = ?, web_username = ?,
-                credential_password = ?, password_updated_at = ?
+                credential_password = ?, credential_valid = 1, password_updated_at = ?
                 WHERE stand_id = ? AND vmid = ?""",
                 (guest_username, web_username or "root@pam", password, changed_at, stand_id, vmid),
             )
@@ -942,9 +1199,16 @@ class DashboardService:
                 return value
 
     def delete_stand(self, stand_id: int) -> None:
+        with self._stand_operation_lock(stand_id):
+            self._delete_stand_locked(stand_id)
+
+    def _delete_stand_locked(self, stand_id: int) -> None:
         stand = self.get_stand(stand_id)
-        if stand["status"] == "provisioning":
-            raise ConflictError("Нельзя удалить стенд во время развёртывания")
+        if stand["status"] in {"provisioning", "resetting"}:
+            raise ConflictError("Нельзя удалить стенд во время фоновой операции")
+        with self._job_lock:
+            if stand_id in self._jobs:
+                raise ConflictError("Нельзя удалить стенд во время фоновой операции")
         if stand["check_status"] == "running":
             raise ConflictError("Нельзя удалить стенд во время автопроверки")
         if any(vm.get("check_status") == "running" for vm in stand["vms"]):
@@ -1062,6 +1326,10 @@ class DashboardService:
         )
 
     def start_check(self, stand_id: int) -> dict[str, Any]:
+        with self._stand_operation_lock(stand_id):
+            return self._start_check_locked(stand_id)
+
+    def _start_check_locked(self, stand_id: int) -> dict[str, Any]:
         started = utc_now()
         with self.store.transaction() as connection:
             stand = connection.execute(
@@ -1111,6 +1379,10 @@ class DashboardService:
         return self.store.query_one("SELECT * FROM check_runs WHERE id = ?", (run_id,)) or {}
 
     def start_vm_check(self, stand_id: int, vmid: int) -> dict[str, Any]:
+        with self._stand_operation_lock(stand_id):
+            return self._start_vm_check_locked(stand_id, vmid)
+
+    def _start_vm_check_locked(self, stand_id: int, vmid: int) -> dict[str, Any]:
         started = utc_now()
         with self.store.transaction() as connection:
             row = connection.execute(
@@ -1241,7 +1513,7 @@ class DashboardService:
 
     def overview(self) -> dict[str, Any]:
         stands = self.list_stands()
-        running = [stand for stand in stands if stand["status"] == "running"]
+        running = [stand for stand in stands if stand["status"] in {"running", "resetting"}]
         scores = [int(stand["check_score"]) for stand in stands if stand["check_score"] is not None]
         return {
             "active_stands": len(running), "total_stands": len(stands),

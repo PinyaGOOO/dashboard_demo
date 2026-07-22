@@ -541,7 +541,8 @@ code { padding: 2px 5px; color: #365d86; background: rgba(255,255,255,.6); borde
 .overview-stand__state { display: grid; width: 34px; height: 34px; color: #737b86; background: var(--surface-strong); border-radius: 9px; place-items: center; }
 .overview-stand__state svg { width: 16px; height: 16px; }
 .overview-stand__state--running { color: var(--green); background: var(--green-soft); }
-.overview-stand__state--provisioning { color: var(--blue); background: var(--blue-soft); }
+.overview-stand__state--provisioning,
+.overview-stand__state--resetting { color: var(--blue); background: var(--blue-soft); }
 .overview-stand__identity { min-width: 0; }
 .overview-stand__identity strong, .overview-stand__identity small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .overview-stand__identity strong { font-size: 11px; font-weight: 680; }
@@ -825,6 +826,8 @@ code { padding: 2px 5px; color: #365d86; background: rgba(255,255,255,.6); borde
 .vm-row:last-child { border-bottom: 0; }
 .vm-state { width: 9px; height: 9px; background: #aab0b8; border-radius: 50%; }
 .vm-state--running { background: var(--green); box-shadow: 0 0 0 3px var(--green-soft); }
+.vm-state--resetting { background: var(--blue); box-shadow: 0 0 0 3px var(--blue-soft); }
+.vm-state--error { background: var(--red); box-shadow: 0 0 0 3px var(--red-soft); }
 .vm-main { min-width: 0; }
 .vm-main__title { display: flex; min-width: 0; align-items: center; gap: 8px; }
 .vm-main__title strong { overflow: hidden; font-size: 14px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
