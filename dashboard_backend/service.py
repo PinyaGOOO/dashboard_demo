@@ -17,6 +17,7 @@ from .proxmox_gateway import (
     DemoProxmoxGateway,
     LiveProxmoxGateway,
     RollbackSnapshotError,
+    existing_pool_vm_name,
 )
 
 
@@ -541,7 +542,21 @@ class DashboardService:
         name = str(payload.get("name", "")).strip()
         if not name:
             raise ValidationError("Укажите название стенда")
-        pool_id = self._pool_id(str(payload.get("pool_id", "")) or f"exam-{int(time.time())}")
+        use_existing_value = payload.get("use_existing_pool", False)
+        use_existing_pool = use_existing_value is True or str(use_existing_value).strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        raw_pool_id = str(payload.get("pool_id", "")).strip()
+        if use_existing_pool and not raw_pool_id:
+            raise ValidationError("Выберите существующий Proxmox pool")
+        pool_id = self._pool_id(raw_pool_id or f"exam-{int(time.time())}")
+        if use_existing_pool:
+            existing_pool_ids = {
+                str(pool.get("pool_id") or "").strip()
+                for pool in self.gateway.list_pools()
+            }
+            if pool_id not in existing_pool_ids:
+                raise ValidationError(f"Существующий Proxmox pool {pool_id} не найден")
         try:
             vm_count = int(payload.get("vm_count", 1))
         except (TypeError, ValueError) as exc:
@@ -582,22 +597,27 @@ class DashboardService:
                 """INSERT INTO stands
                 (name, blueprint_id, status, progress, node, pool_id, owner,
                  vm_count, cpu, ram, disk, ip_range, ip_start, check_status,
-                 expires_at, created_at, updated_at)
-                VALUES (?, ?, 'provisioning', 4, ?, ?, ?, ?, 0, 0, 0, ?, ?, 'idle', ?, ?, ?)""",
+                 expires_at, origin, created_at, updated_at)
+                VALUES (?, ?, 'provisioning', 4, ?, ?, ?, ?, 0, 0, 0, ?, ?, 'idle', ?, ?, ?, ?)""",
                 (name, blueprint_id, requested_node, pool_id, owner, vm_count,
-                 subnet, canonical_start, None, now, now),
+                 subnet, canonical_start, None,
+                 "existing" if use_existing_pool else "deployed", now, now),
             )
             stand_id = int(cursor.lastrowid)
             for index in range(1, vm_count + 1):
                 ip = allocated_ips[index - 1] if index <= len(allocated_ips) else ""
                 credential = credentials[index - 1]
+                vm_name = (
+                    existing_pool_vm_name(pool_id, stand_id, index)
+                    if use_existing_pool else f"{pool_id}-{index}"
+                )
                 vm_cursor = connection.execute(
                     """INSERT INTO stand_vms
                     (stand_id, vmid, name, node, ip, status, cpu, ram,
                      credential_username, web_username, credential_password,
                      password_updated_at, check_status)
                     VALUES (?, NULL, ?, ?, ?, 'provisioning', 0, 0, ?, ?, ?, NULL, 'idle')""",
-                    (stand_id, f"{pool_id}-{index}", requested_node, ip,
+                    (stand_id, vm_name, requested_node, ip,
                      credential["guest_username"], credential["web_username"],
                      credential["password"]),
                 )
@@ -620,6 +640,7 @@ class DashboardService:
             "clone_type": "linked",
             "storage": "",
             "credentials": credentials,
+            "use_existing_pool": use_existing_pool,
         })
         self.store.add_activity("deploy", "Развёртывание запущено", f"{name} · {blueprint['name']} · {vm_count} VM", "progress")
         thread = threading.Thread(

@@ -21,6 +21,13 @@ from .passwords import generate_password
 ProgressCallback = Callable[[int, str], None]
 
 
+def existing_pool_vm_name(pool_id: str, stand_id: int, index: int) -> str:
+    """Build a unique PVE-compatible VM name without exceeding its 63-char limit."""
+    suffix = f"-deployer-{int(stand_id)}-{int(index)}"
+    prefix = str(pool_id)[:max(1, 63 - len(suffix))]
+    return f"{prefix}{suffix}"
+
+
 class RollbackSnapshotError(RuntimeError):
     """A rollback failed after one or more VM snapshots may have been applied."""
 
@@ -236,7 +243,11 @@ class DemoProxmoxGateway:
                 # A stand can contain up to 50 VM.  Keep a 100-ID stride so
                 # neighbouring demo stands never receive the same VMID.
                 "vmid": 2000 + int(stand["id"]) * 100 + index,
-                "name": f"{stand['pool_id']}-{index}",
+                "name": (
+                    existing_pool_vm_name(stand["pool_id"], stand["id"], index)
+                    if str(stand.get("origin") or "deployed") == "existing"
+                    else f"{stand['pool_id']}-{index}"
+                ),
                 "node": nodes[(int(stand["id"]) + index) % len(nodes)],
                 "ip": str(allocated_ips[index - 1]) if index <= len(allocated_ips) else self._ip_for(blueprint.get("subnet", ""), index),
                 "status": "running",
@@ -980,9 +991,13 @@ class LiveProxmoxGateway:
         created: list[tuple[str, int]],
         pool_id: str,
         expected_marker: str,
+        *,
+        preserve_pool: bool = False,
+        expected_names: dict[int, str] | None = None,
     ) -> tuple[list[tuple[str, int]], list[str]]:
         attempt_errors: list[str] = []
         candidate_ids = {int(vmid) for _, vmid in created}
+        expected_names = expected_names or {}
 
         # Never stop or delete a VM merely because its numeric ID was returned
         # by nextid.  An external creator can win the same ID.  Only resources
@@ -994,7 +1009,7 @@ class LiveProxmoxGateway:
                 pool = self.client.pools(pool_id).get()
             except Exception as exc:
                 return [], [f"не удалось проверить пул {pool_id}; он сохранён: {exc}"]
-            if str(pool.get("comment") or "").strip() != expected_marker:
+            if not preserve_pool and str(pool.get("comment") or "").strip() != expected_marker:
                 return [], [f"метка владельца пула {pool_id} изменилась; автоочистка отменена"]
             member_ids = {
                 int(member["vmid"])
@@ -1013,16 +1028,26 @@ class LiveProxmoxGateway:
             for member in pool.get("members", [])
             if member.get("type") == "qemu" and member.get("vmid") is not None
         }
+        pool_member_names = {
+            int(member["vmid"]): str(member.get("name") or "")
+            for member in pool.get("members", [])
+            if member.get("type") == "qemu" and member.get("vmid") is not None
+        }
         unknown_pool_ids = sorted(set(pool_members) - candidate_ids)
-        if unknown_pool_ids:
+        if unknown_pool_ids and not preserve_pool:
             ids = ", ".join(str(vmid) for vmid in unknown_pool_ids)
             return [
                 (pool_members[vmid], vmid) for vmid in unknown_pool_ids
             ], [f"в пуле {pool_id} есть VMID {ids}, не создававшиеся этим запуском; автоочистка отменена"]
 
+        mismatched_candidate_ids = sorted(
+            vmid for vmid in candidate_ids & set(pool_members)
+            if preserve_pool and pool_member_names.get(vmid) != expected_names.get(vmid)
+        )
         owned = [
             (pool_members[vmid], vmid)
             for vmid in sorted(candidate_ids & set(pool_members))
+            if not preserve_pool or pool_member_names.get(vmid) == expected_names.get(vmid)
         ]
         unconfirmed_ids = sorted(candidate_ids - set(pool_members))
         stop_tasks: list[tuple[str, str]] = []
@@ -1079,12 +1104,22 @@ class LiveProxmoxGateway:
             errors.extend(attempt_errors[-3:])
             return remaining, errors
 
-        if unconfirmed_ids:
+        if mismatched_candidate_ids:
+            ids = ", ".join(str(vmid) for vmid in mismatched_candidate_ids)
+            return [], [
+                f"VMID {ids} в существующем пуле {pool_id} не принадлежат этому развёртыванию; "
+                "автоочистка этих VM отменена"
+            ]
+
+        if unconfirmed_ids and not preserve_pool:
             ids = ", ".join(str(vmid) for vmid in unconfirmed_ids)
             return [], [
                 f"VMID {ids} не подтверждены как члены пула {pool_id}; "
                 "пул сохранён для безопасной повторной проверки"
             ]
+
+        if preserve_pool:
+            return [], []
 
         try:
             latest_pool = self.client.pools(pool_id).get()
@@ -1132,13 +1167,18 @@ class LiveProxmoxGateway:
     def deploy(self, stand: dict[str, Any], blueprint: dict[str, Any], progress: ProgressCallback) -> list[dict[str, Any]]:
         pool_id = stand["pool_id"]
         pools = {pool["poolid"] for pool in self.client.pools.get()}
-        if pool_id in pools:
+        use_existing_pool = str(stand.get("origin") or "deployed") == "existing"
+        if use_existing_pool and pool_id not in pools:
+            raise RuntimeError(f"Существующий пул Proxmox {pool_id} не найден")
+        if not use_existing_pool and pool_id in pools:
             raise RuntimeError(f"Пул Proxmox {pool_id} уже существует")
         expected_marker = f"DEMOEXAM dashboard stand_id={stand['id']}"
-        self.client.pools.post(poolid=pool_id, comment=expected_marker)
+        if not use_existing_pool:
+            self.client.pools.post(poolid=pool_id, comment=expected_marker)
         created: list[tuple[str, int]] = []
+        expected_names: dict[int, str] = {}
         try:
-            progress(12, "Пул создан")
+            progress(12, "Выбран существующий пул" if use_existing_pool else "Пул создан")
             template_vmid = int(blueprint["template_vmid"])
             if template_vmid <= 0:
                 raise RuntimeError("Не указан VMID шаблона")
@@ -1179,7 +1219,10 @@ class LiveProxmoxGateway:
             # nextid reports availability but does not reserve the number.
             for index in range(1, vm_count + 1):
                 target_node = target_nodes[(index - 1) % len(target_nodes)]
-                name = f"{pool_id}-{index}"
+                name = (
+                    existing_pool_vm_name(pool_id, stand["id"], index)
+                    if use_existing_pool else f"{pool_id}-{index}"
+                )
                 vm_ip = (
                     str(allocated_ips[index - 1])
                     if index <= len(allocated_ips)
@@ -1196,6 +1239,7 @@ class LiveProxmoxGateway:
                     # with a lost HTTP response can be recovered from the pool.
                     # Rollback still verifies pool ownership before deletion.
                     created.append((target_node, new_vmid))
+                    expected_names[new_vmid] = name
                     params: dict[str, Any] = {
                         "newid": new_vmid, "name": name, "full": 0,
                         "target": target_node, "pool": pool_id,
@@ -1371,6 +1415,8 @@ class LiveProxmoxGateway:
         except Exception as exc:
             remaining, cleanup_errors = self._cleanup_failed_deploy(
                 created, pool_id, expected_marker,
+                preserve_pool=use_existing_pool,
+                expected_names=expected_names,
             )
             if remaining or cleanup_errors:
                 raise RuntimeError(
@@ -1818,6 +1864,7 @@ class LiveProxmoxGateway:
 
     def delete_stand(self, stand: dict[str, Any], vmids: list[int]) -> None:
         pool_id = str(stand["pool_id"])
+        preserve_pool = str(stand.get("origin") or "deployed") == "existing"
         try:
             pool = self.client.pools(pool_id).get()
         except Exception as exc:
@@ -1844,8 +1891,8 @@ class LiveProxmoxGateway:
                 return
             raise RuntimeError(f"Управляемый пул {pool_id} не найден; удаление отменено") from exc
         expected_marker = f"DEMOEXAM dashboard stand_id={stand['id']}"
-        if str(pool.get("comment", "")).strip() != expected_marker:
-            raise RuntimeError("Пул не имеет метки владельца DemoOps; удаление отменено")
+        if not preserve_pool and str(pool.get("comment", "")).strip() != expected_marker:
+            raise RuntimeError("Пул не имеет метки владельца Deployer; удаление отменено")
         pool_members = [
             member
             for member in pool.get("members", [])
@@ -1855,7 +1902,27 @@ class LiveProxmoxGateway:
             int(member["vmid"])
             for member in pool_members
         }
-        if str(stand.get("status") or "") == "error":
+        if preserve_pool:
+            expected_vm_names = {
+                int(vm["vmid"]): str(vm.get("name") or "")
+                for vm in stand.get("vms", [])
+                if vm.get("vmid") is not None
+            }
+            pool_names = {
+                int(member["vmid"]): str(member.get("name") or "")
+                for member in pool_members
+            }
+            mismatched_vmids = sorted(
+                vmid for vmid in set(vmids) & pool_vmids
+                if pool_names.get(vmid) != expected_vm_names.get(vmid)
+            )
+            if mismatched_vmids:
+                raise RuntimeError(
+                    "VM из существующего пула больше не совпадают с объектами Deployer; "
+                    "удаление отменено: " + ", ".join(str(vmid) for vmid in mismatched_vmids)
+                )
+            existing_vmids = sorted(set(vmids) & pool_vmids)
+        elif str(stand.get("status") or "") == "error":
             # A failed deploy can leave clones in the pool before their VMIDs
             # are committed to SQLite.  Recover only the names generated by
             # this deploy; an unrelated/manual member still blocks deletion.
@@ -1880,7 +1947,7 @@ class LiveProxmoxGateway:
             untracked_vmids = sorted(pool_vmids - set(vmids))
             if untracked_vmids:
                 raise RuntimeError(
-                    "В пуле обнаружены VM, отсутствующие в учёте DemoOps; удаление отменено: "
+                    "В пуле обнаружены VM, отсутствующие в учёте Deployer; удаление отменено: "
                     + ", ".join(str(vmid) for vmid in untracked_vmids)
                 )
             existing_vmids = sorted(pool_vmids & set(vmids))
@@ -1916,6 +1983,8 @@ class LiveProxmoxGateway:
                 self._wait_tasks(delete_tasks, timeout=1800)
                 delete_tasks.clear()
         self._wait_tasks(delete_tasks, timeout=1800)
+        if preserve_pool:
+            return
         # Close the window where an ambiguous clone request could attach a VM
         # after the first pool read but before pool deletion.
         latest_pool = self.client.pools(pool_id).get()

@@ -794,7 +794,7 @@ exit 75`;
         resolve(value);
       };
       pendingAdminTokenFinish = finish;
-      showModal({ title: manual ? "Настройка доступа" : "Требуется административный токен", subtitle: "Защищённый режим DemoOps", body, footer });
+      showModal({ title: manual ? "Настройка доступа" : "Требуется административный токен", subtitle: "Защищённый режим Deployer", body, footer });
       modalRoot.querySelector("#admin-token-form").addEventListener("submit", event => {
         event.preventDefault();
         const token = modalRoot.querySelector("#admin-token-input").value.trim();
@@ -855,10 +855,13 @@ exit 75`;
   function openDeployWizard(preselectedId = null) {
     if (!state.data) { toast("Данные ещё загружаются. Повторите через несколько секунд", "warning"); return; }
     const available = state.data.blueprints.filter(item => item.status === "active");
+    const existingPools = (state.data.pools || []).filter(pool => !pool.imported);
     if (!available.length) { toast("Нет опубликованных сценариев для развёртывания", "warning"); return; }
+    const defaultPoolId = `exam-${new Date().toISOString().slice(5, 10).replace("-", "")}-${String(Date.now()).slice(-3)}`;
     const model = {
       step: 1, blueprint_id: Number(preselectedId) || available[0].id,
-      name: "", pool_id: `exam-${new Date().toISOString().slice(5, 10).replace("-", "")}-${String(Date.now()).slice(-3)}`,
+      name: "", pool_id: defaultPoolId, new_pool_id: defaultPoolId,
+      use_existing_pool: false, existing_pool_id: existingPools[0]?.pool_id || "",
       node: "auto", vm_count: 1, subnet: "", start_ip: "", bridge: "",
       owner: "Администратор",
     };
@@ -868,7 +871,8 @@ exit 75`;
       let body = `<div class="wizard-steps">${steps.map((label, index) => `<div class="wizard-step ${model.step === index + 1 ? "is-active" : model.step > index + 1 ? "is-done" : ""}"><span>${model.step > index + 1 ? icon("check") : index + 1}</span><small>${label}</small></div>`).join("")}</div>`;
       if (model.step === 1) {
         body += `<div class="wizard-section"><h3>Выберите сценарий</h3><p>Шаблон и проверочный код будут закреплены за новым стендом.</p><div class="scenario-picker">${available.map(item => `<button type="button" class="scenario-option ${item.id === Number(model.blueprint_id) ? "is-selected" : ""}" data-wizard-blueprint="${item.id}"><span>${icon(item.category === "Безопасность" ? "shield" : "server")}</span><div><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.code)} · шаблон VMID ${item.template_vmid}</small></div><i>${icon("check")}</i></button>`).join("")}</div>
-          <div class="form-grid"><label class="field"><span class="field-label">Название стенда</span><input class="input" id="deploy-name" value="${escapeHtml(model.name)}" placeholder="Например, ДЭ-24 · Группа 4" required></label><label class="field"><span class="field-label">Pool ID</span><input class="input mono" id="deploy-pool" value="${escapeHtml(model.pool_id)}" pattern="[A-Za-z0-9_.-]+" required><small class="field-hint">Латиница, цифры, точка, дефис</small></label></div></div>`;
+          <label class="option-row"><span>${icon("server")}</span><span><strong>Добавить в существующий pool</strong><small>${existingPools.length ? "Новые VM будут добавлены в выбранный Proxmox pool; его текущие VM и сам pool останутся нетронутыми." : "Свободных существующих pools сейчас нет."}</small></span><input type="checkbox" id="deploy-use-existing-pool" ${model.use_existing_pool ? "checked" : ""} ${existingPools.length ? "" : "disabled"}></label>
+          <div class="form-grid"><label class="field"><span class="field-label">Название стенда</span><input class="input" id="deploy-name" value="${escapeHtml(model.name)}" placeholder="Например, ДЭ-24 · Группа 4" required></label><label class="field" id="deploy-new-pool-field" ${model.use_existing_pool ? "hidden" : ""}><span class="field-label">Название нового pool</span><input class="input mono" id="deploy-pool" value="${escapeHtml(model.new_pool_id)}" pattern="[A-Za-z0-9_.-]+" ${model.use_existing_pool ? "" : "required"}><small class="field-hint">Латиница, цифры, точка, дефис</small></label><label class="field" id="deploy-existing-pool-field" ${model.use_existing_pool ? "" : "hidden"}><span class="field-label">Существующий Proxmox pool</span><select class="input mono" id="deploy-existing-pool" ${model.use_existing_pool ? "required" : ""}>${existingPools.map(pool => `<option value="${escapeHtml(pool.pool_id)}" ${pool.pool_id === model.existing_pool_id ? "selected" : ""}>${escapeHtml(pool.pool_id)}${pool.vm_count == null ? "" : ` · ${pool.vm_count} VM`}</option>`).join("")}</select><small class="field-hint">Pool не будет удалён вместе со стендом</small></label></div></div>`;
       } else if (model.step === 2) {
         const preview = ipamPreview(model.subnet, model.vm_count);
         body += `<div class="wizard-section"><h3>Параметры развёртывания и IPAM</h3><p>IPAM резервирует последовательные свободные адреса, начиная именно с указанного IPv4. Все VM создаются как linked clone.</p><div class="deploy-plan-card"><div class="deploy-plan-card__icon">${icon("server")}</div><div><strong>${escapeHtml(blueprint.name)}</strong><small>Шаблон VMID ${blueprint.template_vmid} · связанные клоны</small></div><span>Linked clone</span></div>
@@ -881,10 +885,17 @@ exit 75`;
       } else {
         const preview = ipamPreview(model.subnet, model.vm_count);
         body += `<div class="wizard-section"><div class="confirm-hero"><span>${icon("check")}</span><h3>План готов к запуску</h3><p>Проверьте параметры. Развёртывание продолжится в фоне.</p></div><dl class="review-list"><div><dt>Стенд</dt><dd><strong>${escapeHtml(model.name)}</strong><small class="mono">${escapeHtml(model.pool_id)}</small></dd></div><div><dt>Сценарий</dt><dd><strong>${escapeHtml(blueprint.name)}</strong><small>${escapeHtml(blueprint.code)} · VMID ${blueprint.template_vmid}</small></dd></div><div><dt>Топология</dt><dd><strong>${model.vm_count} VM · Linked clone</strong><small>${escapeHtml(model.node === "auto" ? "Автораспределение" : model.node)}</small></dd></div><div><dt>IPAM</dt><dd><strong class="mono">${escapeHtml(model.subnet || "DHCP")}</strong><small class="mono">${preview ? `${escapeHtml(preview.first)} → ${escapeHtml(preview.last)}` : escapeHtml(model.bridge || "bridge из шаблона")}</small></dd></div><div><dt>Ответственный</dt><dd><strong>${escapeHtml(model.owner)}</strong><small>Бессрочный стенд · snapshot start автоматически</small></dd></div></dl>
-          <div class="alert alert--warning">${icon("alert")} В live-режиме будут созданы реальные VM и пул Proxmox. Операция появится в журнале аудита.</div></div>`;
+          <div class="alert alert--warning">${icon("alert")} ${model.use_existing_pool ? `Новые VM будут добавлены в существующий pool ${escapeHtml(model.pool_id)}. Текущие ресурсы pool не изменяются.` : "В live-режиме будут созданы реальные VM и новый пул Proxmox."} Операция появится в журнале аудита.</div></div>`;
       }
       const footer = `<button class="button" type="button" ${model.step === 1 ? "data-close-modal" : "data-wizard-back"}>${model.step === 1 ? "Отмена" : "Назад"}</button><button class="button button--primary" type="button" ${model.step === 4 ? "data-wizard-submit" : "data-wizard-next"}>${model.step === 4 ? `${icon("power")}Начать развёртывание` : `Продолжить ${icon("chevron")}`}</button>`;
       showModal({ title: "Развернуть новый стенд", subtitle: `Шаг ${model.step} из 4 · ${steps[model.step - 1]}`, body, footer, size: "wide", className: "deploy-modal" });
+      modalRoot.querySelector("#deploy-use-existing-pool")?.addEventListener("change", event => {
+        model.use_existing_pool = event.currentTarget.checked;
+        const newPoolField = modalRoot.querySelector("#deploy-new-pool-field");
+        const existingPoolField = modalRoot.querySelector("#deploy-existing-pool-field");
+        if (newPoolField) newPoolField.hidden = model.use_existing_pool;
+        if (existingPoolField) existingPoolField.hidden = !model.use_existing_pool;
+      });
       const updateIpamPreview = () => {
         const cidr = modalRoot.querySelector("#deploy-subnet")?.value || "";
         const vmCount = Number(modalRoot.querySelector("#deploy-vm-count")?.value || 1);
@@ -917,10 +928,18 @@ exit 75`;
     if (model.step === 1) {
       const name = modalRoot.querySelector("#deploy-name");
       const pool = modalRoot.querySelector("#deploy-pool");
+      const useExisting = Boolean(modalRoot.querySelector("#deploy-use-existing-pool")?.checked);
+      const existingPool = modalRoot.querySelector("#deploy-existing-pool");
       if (!name || !pool) return true;
       if (validate && !name.value.trim()) { name.classList.add("is-invalid"); name.focus(); toast("Укажите название стенда", "warning"); return false; }
-      if (validate && !/^[A-Za-z0-9_.-]+$/.test(pool.value.trim())) { pool.classList.add("is-invalid"); pool.focus(); toast("Pool ID содержит недопустимые символы", "warning"); return false; }
-      model.name = name.value.trim(); model.pool_id = pool.value.trim();
+      const selectedPoolId = useExisting ? existingPool?.value.trim() || "" : pool.value.trim();
+      const invalidTarget = useExisting ? existingPool : pool;
+      if (validate && !/^[A-Za-z0-9_.-]+$/.test(selectedPoolId)) { invalidTarget?.classList.add("is-invalid"); invalidTarget?.focus(); toast(useExisting ? "Выберите существующий pool" : "Название pool содержит недопустимые символы", "warning"); return false; }
+      model.name = name.value.trim();
+      model.use_existing_pool = useExisting;
+      model.existing_pool_id = useExisting ? selectedPoolId : model.existing_pool_id;
+      model.new_pool_id = useExisting ? model.new_pool_id : selectedPoolId;
+      model.pool_id = selectedPoolId;
     } else if (model.step === 2) {
       const node = modalRoot.querySelector("#deploy-node");
       const vmCount = modalRoot.querySelector("#deploy-vm-count"), subnet = modalRoot.querySelector("#deploy-subnet"), bridge = modalRoot.querySelector("#deploy-bridge");
@@ -1076,7 +1095,8 @@ exit 75`;
       <div class="detail-columns detail-columns--single"><section><div class="detail-section-title"><div><h4>Виртуальные машины</h4><small>Доступы можно копировать по одному или одной кнопкой в формате IP | логин | пароль</small></div><div class="detail-section-tools"><span class="detail-count">${stand.vms.length}</span>${credentialControl}</div></div><div class="vm-list">${stand.vms.map(vm => renderVmRow(stand, vm, credentials.get(Number(vm.vmid)), credentialState)).join("") || `<p class="muted-block">Машины ещё не созданы</p>`}</div></section></div>
       <div class="detail-meta"><span>${icon("activity")} Создан ${dateTime(stand.created_at)}</span><span>${icon("lock")} Пароль менялся ${relativeTime(stand.password_updated_at)}</span><span>${icon("users")} Ответственный: ${escapeHtml(stand.owner)}</span></div>
     </div>`;
-    const footer = `<button class="button button--danger" data-delete-stand="${stand.id}" type="button" ${standBusy ? "disabled" : ""}>${icon("trash")}Удалить стенд</button><button class="button" data-close-modal type="button">Закрыть</button>`;
+    const importedPool = stand.origin === "imported";
+    const footer = `<button class="button button--danger" data-delete-stand="${stand.id}" type="button" ${standBusy ? "disabled" : ""}>${icon("trash")}${importedPool ? "Убрать pool из списка" : "Удалить стенд"}</button><button class="button" data-close-modal type="button">Закрыть</button>`;
     const existing = updateExisting ? modalRoot.querySelector(`.modal[data-stand-detail-id="${Number(stand.id)}"]`) : null;
     if (existing) {
       const bodyNode = existing.querySelector(".modal__body");
@@ -1096,7 +1116,7 @@ exit 75`;
       if (focusSelector) existing.querySelector(focusSelector)?.focus({ preventScroll: true });
     } else {
       activeStandDetailId = Number(stand.id);
-      showModal({ title: "Карточка стенда", subtitle: `ID ${stand.id} · управляется DemoOps`, body, footer, size: "large", className: "stand-detail-modal" });
+      showModal({ title: importedPool ? `Пул ${stand.pool_id}` : "Карточка стенда", subtitle: importedPool ? `Подключён к Deployer · ID ${stand.id}` : `ID ${stand.id} · управляется Deployer`, body, footer, size: "large", className: "stand-detail-modal" });
       modalRoot.querySelector(".modal")?.setAttribute("data-stand-detail-id", String(stand.id));
     }
   }
@@ -1468,13 +1488,15 @@ exit 75`;
   async function confirmDeleteStand(id) {
     const stand = state.data.stands.find(item => item.id === Number(id));
     const imported = stand?.origin === "imported";
-    const body = `<div class="danger-confirm"><span>${icon(imported ? "info" : "trash")}</span><h3>${imported ? "Отключить pool от дашборда?" : "Удалить стенд безвозвратно?"}</h3><p>${imported ? `Pool <strong class="mono">${escapeHtml(stand?.pool_id)}</strong> и его ${stand?.vm_count || 0} VM останутся в Proxmox. Удалится только связь с дашбордом и история проверок.` : `Будут удалены пул <strong class="mono">${escapeHtml(stand?.pool_id)}</strong>, ${stand?.vm_count || 0} VM, их диски и история проверок.`}</p><label class="field"><span class="field-label">Введите название стенда для подтверждения</span><input class="input" id="delete-confirm-name" autocomplete="off" placeholder="${escapeHtml(stand?.name)}"></label></div>`;
-    showModal({ title: imported ? "Отключение pool" : "Удаление стенда", subtitle: imported ? "Ресурсы Proxmox сохранятся" : "Необратимая операция", body, footer: `<button class="button" data-close-modal type="button">Отмена</button><button class="button ${imported ? "" : "button--danger"}" id="delete-stand-confirm" type="button" disabled>${icon(imported ? "info" : "trash")}${imported ? "Отключить" : "Удалить навсегда"}</button>` });
+    const existingPool = stand?.origin === "existing";
+    const confirmationTarget = imported ? stand?.pool_id : stand?.name;
+    const body = `<div class="danger-confirm"><span>${icon(imported ? "info" : "trash")}</span><h3>${imported ? "Убрать pool из списка?" : "Удалить стенд безвозвратно?"}</h3><p>${imported ? `Pool <strong class="mono">${escapeHtml(stand?.pool_id)}</strong> и все его VM останутся в Proxmox. Из Deployer удалится только подключение и история проверок.` : existingPool ? `Будут удалены только ${stand?.vm_count || 0} VM этого стенда и их диски. Существующий pool <strong class="mono">${escapeHtml(stand?.pool_id)}</strong> и остальные его ресурсы сохранятся.` : `Будут удалены пул <strong class="mono">${escapeHtml(stand?.pool_id)}</strong>, ${stand?.vm_count || 0} VM, их диски и история проверок.`}</p><label class="field"><span class="field-label">${imported ? "Введите название pool" : "Введите название стенда"} для подтверждения</span><input class="input" id="delete-confirm-name" autocomplete="off" placeholder="${escapeHtml(confirmationTarget)}"></label></div>`;
+    showModal({ title: imported ? "Удаление pool из списка" : "Удаление стенда", subtitle: imported || existingPool ? "Сам Proxmox pool сохранится" : "Необратимая операция", body, footer: `<button class="button" data-close-modal type="button">Отмена</button><button class="button ${imported ? "" : "button--danger"}" id="delete-stand-confirm" type="button" disabled>${icon(imported ? "info" : "trash")}${imported ? "Убрать из списка" : "Удалить навсегда"}</button>` });
     const input = modalRoot.querySelector("#delete-confirm-name"), button = modalRoot.querySelector("#delete-stand-confirm");
-    input.addEventListener("input", () => { button.disabled = input.value !== stand?.name; });
+    input.addEventListener("input", () => { button.disabled = input.value !== confirmationTarget; });
     button.addEventListener("click", async () => {
       button.disabled = true;
-      try { await api(`/api/stands/${id}`, { method: "DELETE" }); state.ipam = null; closeModal(); toast(imported ? "Pool отключён; ресурсы Proxmox сохранены" : "Стенд удалён", imported ? "info" : "warning"); await loadData(); }
+      try { await api(`/api/stands/${id}`, { method: "DELETE" }); state.ipam = null; closeModal(); toast(imported ? "Pool убран из списка; ресурсы Proxmox сохранены" : existingPool ? "Стенд удалён; существующий pool сохранён" : "Стенд удалён", imported ? "info" : "warning"); await loadData(); }
       catch (error) { button.disabled = false; toast(error.message, "error"); }
     });
   }

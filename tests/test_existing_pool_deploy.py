@@ -1,0 +1,150 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+from dashboard_backend.database import DashboardStore
+from dashboard_backend.proxmox_gateway import LiveProxmoxGateway
+from dashboard_backend.service import DashboardService, ValidationError
+
+
+class ExistingPoolServiceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.store = DashboardStore(Path(self.tempdir.name) / "dashboard.db")
+        self.gateway = MagicMock()
+        self.gateway.mode = "live"
+        self.gateway.list_pools.return_value = [
+            {"pool_id": "shared-lab", "comment": "Общий pool", "vm_count": 3},
+        ]
+        self.service = DashboardService(self.store, self.gateway)
+        self.blueprint = next(
+            item for item in self.service.list_blueprints() if item["status"] == "active"
+        )
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def test_create_in_existing_pool_marks_origin_and_uses_unique_names(self) -> None:
+        with patch("dashboard_backend.service.threading.Thread") as thread:
+            stand = self.service.create_stand({
+                "blueprint_id": self.blueprint["id"],
+                "name": "Новая группа",
+                "pool_id": "shared-lab",
+                "use_existing_pool": True,
+                "vm_count": 2,
+            })
+
+        self.assertEqual(stand["origin"], "existing")
+        self.assertEqual(stand["pool_id"], "shared-lab")
+        self.assertEqual(
+            [vm["name"] for vm in stand["vms"]],
+            [
+                f"shared-lab-deployer-{stand['id']}-1",
+                f"shared-lab-deployer-{stand['id']}-2",
+            ],
+        )
+        thread.return_value.start.assert_called_once_with()
+
+    def test_unknown_existing_pool_is_rejected_before_job_creation(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "не найден"):
+            self.service.create_stand({
+                "blueprint_id": self.blueprint["id"],
+                "name": "Новая группа",
+                "pool_id": "missing-pool",
+                "use_existing_pool": True,
+            })
+
+
+class ExistingPoolGatewaySafetyTests(unittest.TestCase):
+    def test_failed_deploy_cleanup_removes_only_matching_new_vm(self) -> None:
+        gateway = LiveProxmoxGateway.__new__(LiveProxmoxGateway)
+        gateway.client = MagicMock()
+        gateway._wait_tasks = MagicMock()
+        pool_endpoint = MagicMock()
+        pool_endpoint.get.return_value = {
+            "members": [
+                {"type": "qemu", "vmid": 100, "name": "shared-lab-deployer-7-1", "node": "pve-1"},
+                {"type": "qemu", "vmid": 200, "name": "legacy-vm", "node": "pve-2"},
+            ],
+        }
+        gateway.client.pools.return_value = pool_endpoint
+        managed_api = MagicMock()
+        gateway.client.nodes.return_value.qemu.return_value = managed_api
+        gateway.client.cluster.resources.get.return_value = [
+            {"type": "qemu", "vmid": 200, "name": "legacy-vm", "node": "pve-2"},
+        ]
+
+        remaining, errors = gateway._cleanup_failed_deploy(
+            [("pve-1", 100)],
+            "shared-lab",
+            "unused-marker",
+            preserve_pool=True,
+            expected_names={100: "shared-lab-deployer-7-1"},
+        )
+
+        self.assertEqual(remaining, [])
+        self.assertEqual(errors, [])
+        managed_api.delete.assert_called_once_with(purge=1)
+        pool_endpoint.delete.assert_not_called()
+
+    def test_delete_removes_only_tracked_vm_and_preserves_pool(self) -> None:
+        gateway = LiveProxmoxGateway.__new__(LiveProxmoxGateway)
+        gateway.client = MagicMock()
+        gateway._wait_tasks = MagicMock()
+        pool_endpoint = MagicMock()
+        pool_endpoint.get.return_value = {
+            "comment": "Чужой существующий pool",
+            "members": [
+                {"type": "qemu", "vmid": 100, "name": "shared-lab-deployer-7-1", "node": "pve-1"},
+                {"type": "qemu", "vmid": 200, "name": "legacy-vm", "node": "pve-2"},
+            ],
+        }
+        gateway.client.pools.return_value = pool_endpoint
+        managed_api = MagicMock()
+        gateway.client.nodes.return_value.qemu.return_value = managed_api
+        gateway._vm_inventory = MagicMock(return_value={
+            100: {"node": "pve-1", "status": "running"},
+        })
+
+        gateway.delete_stand({
+            "id": 7,
+            "pool_id": "shared-lab",
+            "origin": "existing",
+            "status": "running",
+            "vms": [{"vmid": 100, "name": "shared-lab-deployer-7-1"}],
+        }, [100])
+
+        managed_api.status.stop.post.assert_called_once_with()
+        managed_api.delete.assert_called_once_with(purge=1)
+        pool_endpoint.delete.assert_not_called()
+        gateway._vm_inventory.assert_called_once_with([100])
+
+    def test_delete_refuses_reused_vmid_with_different_name(self) -> None:
+        gateway = LiveProxmoxGateway.__new__(LiveProxmoxGateway)
+        gateway.client = MagicMock()
+        pool_endpoint = MagicMock()
+        pool_endpoint.get.return_value = {
+            "members": [
+                {"type": "qemu", "vmid": 100, "name": "someone-elses-vm", "node": "pve-1"},
+            ],
+        }
+        gateway.client.pools.return_value = pool_endpoint
+
+        with self.assertRaisesRegex(RuntimeError, "удаление отменено"):
+            gateway.delete_stand({
+                "id": 7,
+                "pool_id": "shared-lab",
+                "origin": "existing",
+                "status": "running",
+                "vms": [{"vmid": 100, "name": "shared-lab-deployer-7-1"}],
+            }, [100])
+
+        gateway.client.nodes.assert_not_called()
+        pool_endpoint.delete.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()
