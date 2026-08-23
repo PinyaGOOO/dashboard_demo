@@ -119,15 +119,24 @@ class DashboardService:
         return self.gateway.list_templates()
 
     def list_pools(self) -> list[dict[str, Any]]:
-        imported = {
-            str(row["pool_id"]): int(row["id"])
-            for row in self.store.query_all("SELECT id, pool_id FROM stands WHERE pool_id != ''")
-        }
+        tracked: dict[str, list[dict[str, Any]]] = {}
+        for row in self.store.query_all(
+            "SELECT id, pool_id, origin FROM stands WHERE pool_id != '' ORDER BY id"
+        ):
+            tracked.setdefault(str(row["pool_id"]), []).append(row)
         pools = self.gateway.list_pools()
         for pool in pools:
-            stand_id = imported.get(str(pool["pool_id"]))
-            pool["imported"] = stand_id is not None
-            pool["stand_id"] = stand_id
+            stands = tracked.get(str(pool["pool_id"]), [])
+            stand_ids = [int(row["id"]) for row in stands]
+            origins = {str(row.get("origin") or "deployed") for row in stands}
+            pool["imported"] = bool(stands)
+            pool["stand_id"] = stand_ids[0] if stand_ids else None
+            pool["stand_ids"] = stand_ids
+            pool["stand_count"] = len(stand_ids)
+            # A pool selected explicitly as an external/shared destination may
+            # hold multiple independent Deployer stands. Pools wholly imported
+            # into one card or created/owned by Deployer remain exclusive.
+            pool["available_for_deploy"] = not (origins & {"imported", "deployed"})
         return pools
 
     @staticmethod
@@ -595,7 +604,15 @@ class DashboardService:
         # The stand, placeholder VM rows and addresses are committed together.
         # Concurrent requests therefore cannot reserve the same address.
         with self.store.transaction() as connection:
-            if connection.execute("SELECT id FROM stands WHERE pool_id = ?", (pool_id,)).fetchone():
+            tracked_pool_rows = connection.execute(
+                "SELECT id, origin FROM stands WHERE pool_id = ?", (pool_id,),
+            ).fetchall()
+            if use_existing_pool:
+                if any(str(row["origin"] or "deployed") != "existing" for row in tracked_pool_rows):
+                    raise ConflictError(
+                        "Этот pool целиком подключён к другому стенду или управляется Deployer"
+                    )
+            elif tracked_pool_rows:
                 raise ConflictError("Pool ID уже используется")
             canonical_start, prefix_length, allocated_ips = self._ipam_plan(
                 connection, subnet, start_ip, vm_count,

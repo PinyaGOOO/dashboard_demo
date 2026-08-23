@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 from dashboard_backend.database import DashboardStore
 from dashboard_backend.proxmox_gateway import LiveProxmoxGateway
-from dashboard_backend.service import DashboardService, ValidationError
+from dashboard_backend.service import ConflictError, DashboardService, ValidationError
 
 
 class ExistingPoolServiceTests(unittest.TestCase):
@@ -65,6 +65,49 @@ class ExistingPoolServiceTests(unittest.TestCase):
             f"Templates-MDK-02-01-deployer-{stand['id']}-1",
         )
         thread.return_value.start.assert_called_once_with()
+
+    def test_multiple_stands_can_share_explicit_existing_pool(self) -> None:
+        with patch("dashboard_backend.service.threading.Thread"):
+            first = self.service.create_stand({
+                "blueprint_id": self.blueprint["id"],
+                "name": "Первая группа",
+                "pool_id": "shared-lab",
+                "use_existing_pool": True,
+                "vm_count": 1,
+            })
+            second = self.service.create_stand({
+                "blueprint_id": self.blueprint["id"],
+                "name": "Вторая группа",
+                "pool_id": "shared-lab",
+                "use_existing_pool": True,
+                "vm_count": 1,
+            })
+
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertEqual(first["pool_id"], second["pool_id"])
+        self.assertNotEqual(first["vms"][0]["name"], second["vms"][0]["name"])
+        pool = next(item for item in self.service.list_pools() if item["pool_id"] == "shared-lab")
+        self.assertTrue(pool["available_for_deploy"])
+        self.assertEqual(pool["stand_count"], 2)
+        self.assertEqual(pool["stand_ids"], [first["id"], second["id"]])
+
+    def test_dashboard_owned_pool_cannot_be_reused_as_shared_destination(self) -> None:
+        self.store.execute(
+            """INSERT INTO stands
+            (name, status, pool_id, origin, created_at, updated_at)
+            VALUES ('Managed', 'running', 'shared-lab', 'deployed', '', '')"""
+        )
+
+        with patch("dashboard_backend.service.threading.Thread"), self.assertRaisesRegex(
+            ConflictError, "управляется Deployer",
+        ):
+            self.service.create_stand({
+                "blueprint_id": self.blueprint["id"],
+                "name": "Нельзя добавить",
+                "pool_id": "shared-lab",
+                "use_existing_pool": True,
+                "vm_count": 1,
+            })
 
     def test_unknown_existing_pool_is_rejected_before_job_creation(self) -> None:
         with self.assertRaisesRegex(ValidationError, "не найден"):
