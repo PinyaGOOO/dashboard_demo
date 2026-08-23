@@ -1056,7 +1056,7 @@ exit 75`;
       ? "Повторите возврат к snapshot start: пароль скрыт до подтверждения QEMU Guest Agent."
       : "Смените пароль этой VM или загрузите защищённые доступы.";
     const accessButton = accessUrl && hasVmid && !standBusy
-      ? `<a class="button button--primary vm-open-button" href="${escapeHtml(accessUrl)}">${icon("external")}Перейти к стенду</a>`
+      ? `<a class="button button--primary vm-open-button" href="${escapeHtml(accessUrl)}" target="_blank" rel="noopener noreferrer">${icon("external")}Перейти к стенду</a>`
       : `<button class="button button--primary vm-open-button" type="button" disabled title="Web URL ещё не получен">${icon("chevron")}Перейти к стенду</button>`;
     return `<article class="vm-row">
       <span class="vm-state vm-state--${escapeHtml(vm.status)}"></span>
