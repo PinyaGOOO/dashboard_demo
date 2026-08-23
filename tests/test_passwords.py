@@ -24,7 +24,7 @@ class PasswordGenerationTests(unittest.TestCase):
         for _ in range(1_000):
             password = generate_password()
 
-            self.assertEqual(len(password), 16)
+            self.assertEqual(len(password), 8)
             self.assertTrue(ambiguous.isdisjoint(password), password)
             self.assertTrue(any(character in PASSWORD_UPPER for character in password), password)
             self.assertTrue(any(character in PASSWORD_LOWER for character in password), password)
@@ -104,6 +104,26 @@ class LongCustomPasswordTests(unittest.TestCase):
                 call([self.vmid], "root", vm_password),
             ]
         )
+
+    def test_single_character_custom_password_has_no_dashboard_minimum(self) -> None:
+        stand_result = self.service.stand_action(
+            self.stand_id,
+            "rotate_password",
+            {"username": "root", "web_username": "root@pam", "password": "x"},
+        )
+        vm_result = self.service.vm_action(
+            self.stand_id,
+            self.vmid,
+            "rotate_password",
+            {"username": "root", "web_username": "root@pam", "password": "y"},
+        )
+
+        self.assertEqual(stand_result["credential"]["password"], "x")
+        self.assertEqual(vm_result["credential"]["password"], "y")
+        self.gateway.rotate_password.assert_has_calls([
+            call([self.vmid], "root", "x"),
+            call([self.vmid], "root", "y"),
+        ])
 
     def test_password_beyond_native_proxmox_limit_is_rejected_before_gateway(self) -> None:
         password = "A2!b" * (PROXMOX_PASSWORD_MAX_LENGTH // 4) + "x"

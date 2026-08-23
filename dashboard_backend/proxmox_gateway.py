@@ -1230,7 +1230,7 @@ class LiveProxmoxGateway:
                 )
                 credential = dict(credentials[index - 1]) if index <= len(credentials) and isinstance(credentials[index - 1], dict) else {}
                 if not credential.get("password"):
-                    credential["password"] = generate_password(18)
+                    credential["password"] = generate_password()
                 credential.setdefault("guest_username", "root")
                 credential.setdefault("web_username", "root@pam")
                 with self._clone_submit_lock:

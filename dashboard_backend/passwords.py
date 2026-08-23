@@ -13,7 +13,7 @@ PASSWORD_ALPHABET = PASSWORD_UPPER + PASSWORD_LOWER + PASSWORD_DIGITS + PASSWORD
 PROXMOX_PASSWORD_MAX_LENGTH = 1024
 
 
-def generate_password(length: int = 16) -> str:
+def generate_password(length: int = 8) -> str:
     """Generate a readable password without commonly confused characters."""
     if length < 4:
         raise ValueError("Password length must be at least 4")

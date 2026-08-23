@@ -927,8 +927,6 @@ class DashboardService:
                 raise ValidationError("Укажите имя пользователя")
             if not re.fullmatch(r"[^\x00-\x1f\x7f]{1,128}", web_username):
                 raise ValidationError("Некорректный логин веб-интерфейса VM")
-            if len(password) < 10:
-                raise ValidationError("Пароль должен содержать не менее 10 символов")
             if len(password) > PROXMOX_PASSWORD_MAX_LENGTH:
                 raise ValidationError(
                     f"Proxmox принимает пароль длиной не более {PROXMOX_PASSWORD_MAX_LENGTH} символов"
@@ -1405,8 +1403,6 @@ class DashboardService:
                 raise ValidationError("Укажите имя пользователя")
             if not re.fullmatch(r"[^\x00-\x1f\x7f]{1,128}", web_username):
                 raise ValidationError("Некорректный логин веб-интерфейса VM")
-            if len(password) < 10:
-                raise ValidationError("Пароль должен содержать не менее 10 символов")
             if len(password) > PROXMOX_PASSWORD_MAX_LENGTH:
                 raise ValidationError(
                     f"Proxmox принимает пароль длиной не более {PROXMOX_PASSWORD_MAX_LENGTH} символов"
@@ -1449,7 +1445,7 @@ class DashboardService:
         raise ValidationError("Неизвестное действие VM")
 
     @staticmethod
-    def _password(length: int = 16) -> str:
+    def _password(length: int = 8) -> str:
         return generate_password(length)
 
     def delete_stand(self, stand_id: int) -> None:
