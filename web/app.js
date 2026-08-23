@@ -1056,7 +1056,7 @@ exit 75`;
       ? "Повторите возврат к snapshot start: пароль скрыт до подтверждения QEMU Guest Agent."
       : "Смените пароль этой VM или загрузите защищённые доступы.";
     const accessButton = accessUrl && hasVmid && !standBusy
-      ? `<button class="button button--primary vm-open-button" type="button" data-open-vm-stand data-url="${escapeHtml(accessUrl)}" data-user="${escapeHtml(username)}" data-password="${escapeHtml(password)}" data-vm-name="${escapeHtml(vm.name)}" data-vmid="${numericVmid}">${icon("external")}Перейти к стенду</button>`
+      ? `<a class="button button--primary vm-open-button" href="${escapeHtml(accessUrl)}">${icon("external")}Перейти к стенду</a>`
       : `<button class="button button--primary vm-open-button" type="button" disabled title="Web URL ещё не получен">${icon("chevron")}Перейти к стенду</button>`;
     return `<article class="vm-row">
       <span class="vm-state vm-state--${escapeHtml(vm.status)}"></span>
@@ -1562,27 +1562,6 @@ exit 75`;
     return { text: lines.join("\n"), complete, total: lines.length };
   }
 
-  async function openVmWeb(button) {
-    const accessUrl = safeAccessUrl(button.dataset.url);
-    if (!accessUrl) {
-      toast("Web URL этой VM ещё не получен", "warning");
-      return;
-    }
-    const username = button.dataset.user || "root@pam";
-    const password = button.dataset.password || "";
-    const windowName = `demoops_vm_${String(button.dataset.vmid || Date.now()).replace(/[^0-9A-Za-z_]/g, "")}`;
-    const ticketUrl = new URL("/api2/html/access/ticket", accessUrl).href;
-    const body = `<div class="tls-access-guide">
-      <div class="tls-access-guide__head">${icon("shield")}<div><h3>${escapeHtml(button.dataset.vmName || "Web-интерфейс стенда")}</h3><p class="mono">${escapeHtml(accessUrl)}</p></div></div>
-      <div class="alert alert--warning">${icon("alert")}<div><strong>Первое открытие может остановиться на предупреждении сертификата.</strong><br>Эту системную страницу браузера нельзя нажать из дашборда автоматически.</div></div>
-      <ol class="tls-steps"><li><span>1</span><div><strong>Откройте адрес и примите риск</strong><small>Firefox: «Дополнительно» → «Принять риск и продолжить». Chrome/Edge: «Дополнительные» → «Перейти на сайт (небезопасно)».</small></div></li><li><span>2</span><div><strong>${password ? "Вернитесь сюда и нажмите «Войти автоматически»" : "Войдите вручную"}</strong><small>${password ? "Дашборд отправит логин и пароль штатной HTML-формой Proxmox в ту же вкладку." : `Используйте логин ${escapeHtml(username)}. Сначала загрузите пароль в карточке VM.`}</small></div></li><li><span>3</span><div><strong>Нажмите «Открыть интерфейс»</strong><small>Вкладка откроется повторно уже с установленной сессией. Если политика браузера заблокировала cookie, используйте кнопки копирования ниже.</small></div></li></ol>
-      <div class="tls-credentials"><div><span>Логин web UI</span><strong class="mono">${escapeHtml(username)}</strong><button class="button button--small" type="button" data-copy-vm-login data-value="${escapeHtml(username)}">${icon("copy")}Копировать логин</button></div><div><span>Пароль</span><strong class="mono" data-vm-secret>${password ? "••••••••••••" : "Не загружен"}</strong>${password ? `<div><button class="button button--small" type="button" data-reveal-vm-password data-password="${escapeHtml(password)}">${icon("eye")}Показать</button><button class="button button--small" type="button" data-copy-vm-password data-value="${escapeHtml(password)}">${icon("copy")}Копировать пароль</button></div>` : ""}</div></div>
-      ${password ? `<button class="button tls-copy-pair" type="button" data-copy-vm-credential data-user="${escapeHtml(username)}" data-password="${escapeHtml(password)}">${icon("copy")}Скопировать логин и пароль</button>` : ""}
-    </div>`;
-    const footer = `<button class="button" type="button" data-launch-vm-web data-url="${escapeHtml(accessUrl)}" data-window="${escapeHtml(windowName)}" data-password="${escapeHtml(password)}">1. Открыть и принять риск</button>${password ? `<button class="button button--primary" type="button" data-auto-login-vm data-url="${escapeHtml(ticketUrl)}" data-window="${escapeHtml(windowName)}" data-user="${escapeHtml(username)}" data-password="${escapeHtml(password)}">${icon("lock")}2. Войти автоматически</button>` : ""}<button class="button" type="button" data-launch-vm-web data-url="${escapeHtml(accessUrl)}" data-window="${escapeHtml(windowName)}" data-copy-password="false">${icon("external")}3. Открыть интерфейс</button>`;
-    showModal({ title: "Переход к стенду", subtitle: "Вход через web-интерфейс Proxmox", body, footer, size: "wide", className: "vm-access-modal" });
-  }
-
   document.addEventListener("click", async event => {
     const target = event.target.closest("button, a, tr");
     if (!target) return;
@@ -1597,23 +1576,6 @@ exit 75`;
     else if (target.dataset.standFilter) { state.standFilter = target.dataset.standFilter; renderStands(); }
     else if (target.dataset.standDetail) openStandDetail(Number(target.dataset.standDetail));
     else if (target.dataset.loadStandCredentials) openStandDetail(Number(target.dataset.loadStandCredentials), { requestCredentials: true });
-    else if (target.matches("[data-open-vm-stand]")) await openVmWeb(target);
-    else if (target.matches("[data-launch-vm-web]")) {
-      const url = safeAccessUrl(target.dataset.url);
-      if (url) window.open(url, target.dataset.window || "_blank");
-      if (target.dataset.password && target.dataset.copyPassword !== "false") { await copyText(target.dataset.password); toast("Web UI открыт, пароль также скопирован. Примите риск сертификата и вернитесь к шагу 2.", "info"); }
-    }
-    else if (target.matches("[data-auto-login-vm]")) {
-      const ticketUrl = safeAccessUrl(target.dataset.url);
-      if (!ticketUrl || !target.dataset.user || !target.dataset.password) { toast("Нет данных для автоматического входа", "warning"); return; }
-      const form = document.createElement("form");
-      form.method = "POST"; form.action = ticketUrl; form.target = target.dataset.window || "_blank"; form.hidden = true;
-      [["username", target.dataset.user], ["password", target.dataset.password]].forEach(([name, value]) => {
-        const input = document.createElement("input"); input.type = "hidden"; input.name = name; input.value = value; form.append(input);
-      });
-      document.body.append(form); form.submit(); form.remove();
-      toast("Данные отправлены в Proxmox. После ответа нажмите шаг 3 — «Открыть интерфейс».", "info");
-    }
     else if (target.dataset.vmAction) {
       if (target.dataset.busy === "true") return;
       target.dataset.busy = "true"; target.disabled = true;
@@ -1662,7 +1624,7 @@ exit 75`;
       await copyText(access.text);
       toast(access.complete === access.total ? `Скопированы доступы ${access.total} VM` : `Скопировано ${access.total} строк; пароли есть у ${access.complete} VM`, access.complete === access.total ? "success" : "warning");
     }
-    else if (target.matches("[data-reveal-vm-password]")) { const secret = target.closest(".vm-access, .tls-credentials")?.querySelector("[data-vm-secret]"); if (secret) secret.textContent = target.dataset.password; target.remove(); }
+    else if (target.matches("[data-reveal-vm-password]")) { const secret = target.closest(".vm-access")?.querySelector("[data-vm-secret]"); if (secret) secret.textContent = target.dataset.password; target.remove(); }
     else if (target.matches("[data-copy-vm-login]")) { await copyText(target.dataset.value || ""); toast("Логин скопирован"); }
     else if (target.matches("[data-copy-vm-password]")) { await copyText(target.dataset.value || ""); toast("Пароль скопирован"); }
     else if (target.matches("[data-copy-vm-credential]")) { await copyText(`${target.dataset.user}\n${target.dataset.password}`); toast("Логин и пароль VM скопированы"); }
