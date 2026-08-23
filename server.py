@@ -135,7 +135,12 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 body = self._body()
                 if str(body.get("action", "")) != "rollback_start_all":
                     raise ValidationError("Неизвестное массовое действие")
-                self._json(self.service.rollback_all_stands(), HTTPStatus.ACCEPTED)
+                result = (
+                    self.service.rollback_all_stands(body["workspace"])
+                    if body.get("workspace") is not None
+                    else self.service.rollback_all_stands()
+                )
+                self._json(result, HTTPStatus.ACCEPTED)
             elif parts == ["api", "pools"] and method == "GET":
                 self._json(self.service.list_pools())
             elif parts == ["api", "ipam"] and method == "GET":

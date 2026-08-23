@@ -1054,7 +1054,8 @@ class DashboardService:
             return {"stand": self.get_stand(stand_id), "message": "Автопроверка запущена", "run": run}
         raise ValidationError("Неизвестное действие")
 
-    def rollback_all_stands(self) -> dict[str, Any]:
+    def rollback_all_stands(self, workspace: str | None = None) -> dict[str, Any]:
+        selected_workspace = self._workspace(workspace) if workspace is not None else None
         with self._bulk_rollback_lock:
             if self._bulk_rollback_job and self._bulk_rollback_job.is_alive():
                 raise ConflictError("Массовый возврат стендов уже выполняется")
@@ -1064,6 +1065,8 @@ class DashboardService:
             with self._job_lock:
                 busy_ids = set(self._jobs)
             for summary in self.list_stands():
+                if selected_workspace and str(summary.get("workspace") or "demoexam") != selected_workspace:
+                    continue
                 stand_id = int(summary["id"])
                 stand = self.get_stand(stand_id)
                 reason = ""

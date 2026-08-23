@@ -490,7 +490,7 @@ exit 75`;
       attention: workspaceItems.filter(item => item.status === "error" || ["warning", "failed"].includes(item.check_status)).length,
     };
     app.innerHTML = `<section class="page">
-      ${pageHeader("Стенды", "Управляйте пулами, виртуальными машинами, доступами и автопроверками.", `<button class="button button--danger" data-rollback-all-stands ${state.data.stands.length ? "" : "disabled"}>${icon("refresh")}Вернуть все стенды к start</button><button class="button" data-import-pool>${icon("plus")}Добавить существующий pool</button><button class="button button--primary" data-open-deploy>${icon("plus")}Развернуть стенд</button>`)}
+      ${pageHeader("Стенды", "Управляйте пулами, виртуальными машинами, доступами и автопроверками.", `<button class="button button--danger" data-rollback-all-stands ${workspaceItems.length ? "" : "disabled"}>${icon("refresh")}Вернуть все стенды к start</button><button class="button" data-import-pool>${icon("plus")}Добавить существующий pool</button><button class="button button--primary" data-open-deploy>${icon("plus")}Развернуть стенд</button>`)}
       <div class="toolbar"><div class="toolbar__primary"><label class="search-field">${icon("search")}<input id="stand-search" type="search" value="${escapeHtml(state.standSearch)}" placeholder="Название, pool ID, владелец…"></label>
         <div class="filter-tabs" role="tablist">${[["all", "Все"], ["running", "Работают"], ["provisioning", "В процессе"], ["stopped", "Остановлены"], ["attention", "Требуют внимания"]].map(([key, label]) => `<button class="filter-tab ${state.standFilter === key ? "is-active" : ""}" data-stand-filter="${key}" type="button">${label}<span>${counts[key]}</span></button>`).join("")}</div></div>
         <div class="toolbar-actions"><button class="button" data-refresh>${icon("refresh")}Обновить</button></div></div>
@@ -1380,11 +1380,12 @@ exit 75`;
   }
 
   function openRollbackAllStandsModal() {
-    const managed = (state.data?.stands || []).filter(stand => stand.origin !== "imported");
+    const managed = workspaceStands().filter(stand => stand.origin !== "imported");
+    const workspaceName = (workspaces.find(item => item.id === state.workspace) || workspaces[0]).name;
     const body = `<div class="danger-confirm compact"><span>${icon("refresh")}</span><h3>Вернуть все стенды к snapshot start?</h3><p>Dashboard последовательно сбросит все подготовленные управляемые стенды. Все изменения после первоначальных snapshots будут безвозвратно потеряны.</p><div class="alert alert--warning">${icon("alert")}<div><strong>Проверка выполняется на сервере.</strong><br>Занятые стенды, импортированные pools, стенды без snapshot start или сохранённого пароля будут пропущены. Подходящих по текущему состоянию: до ${managed.length}.</div></div><label class="field"><span class="field-label">Для подтверждения введите СБРОСИТЬ</span><input class="input mono" id="rollback-all-confirm-text" autocomplete="off" spellcheck="false" placeholder="СБРОСИТЬ"></label></div>`;
     showModal({
       title: "Массовый возврат стендов",
-      subtitle: "Необратимая операция",
+      subtitle: `${workspaceName} · необратимая операция`,
       body,
       footer: `<button class="button button--danger" id="rollback-all-confirm" type="button" disabled>${icon("refresh")}Вернуть все стенды</button>`,
     });
@@ -1397,7 +1398,7 @@ exit 75`;
       button.disabled = true;
       button.innerHTML = `${icon("refresh")}Формируем очередь…`;
       try {
-        const result = await api("/api/stands/actions", { method: "POST", body: { action: "rollback_start_all" } });
+        const result = await api("/api/stands/actions", { method: "POST", body: { action: "rollback_start_all", workspace: state.workspace } });
         (result.scheduled || []).forEach(id => {
           const baseline = state.data?.stands?.find(stand => Number(stand.id) === Number(id));
           state.bulkRollbackPending.set(Number(id), {
