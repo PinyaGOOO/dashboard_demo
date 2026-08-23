@@ -549,14 +549,21 @@ class DashboardService:
         raw_pool_id = str(payload.get("pool_id", "")).strip()
         if use_existing_pool and not raw_pool_id:
             raise ValidationError("Выберите существующий Proxmox pool")
-        pool_id = self._pool_id(raw_pool_id or f"exam-{int(time.time())}")
         if use_existing_pool:
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", raw_pool_id):
+                raise ValidationError("Выберите существующий Proxmox pool")
+            # Proxmox pool IDs are case-sensitive. Existing IDs come from the
+            # API and must not pass through _pool_id(), which intentionally
+            # normalizes newly-created pool names to lowercase.
+            pool_id = raw_pool_id
             existing_pool_ids = {
                 str(pool.get("pool_id") or "").strip()
                 for pool in self.gateway.list_pools()
             }
             if pool_id not in existing_pool_ids:
                 raise ValidationError(f"Существующий Proxmox pool {pool_id} не найден")
+        else:
+            pool_id = self._pool_id(raw_pool_id or f"exam-{int(time.time())}")
         try:
             vm_count = int(payload.get("vm_count", 1))
         except (TypeError, ValueError) as exc:

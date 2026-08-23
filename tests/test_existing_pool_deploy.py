@@ -18,6 +18,7 @@ class ExistingPoolServiceTests(unittest.TestCase):
         self.gateway.mode = "live"
         self.gateway.list_pools.return_value = [
             {"pool_id": "shared-lab", "comment": "Общий pool", "vm_count": 3},
+            {"pool_id": "Templates-MDK-02-01", "comment": "Шаблоны", "vm_count": 1},
         ]
         self.service = DashboardService(self.store, self.gateway)
         self.blueprint = next(
@@ -45,6 +46,23 @@ class ExistingPoolServiceTests(unittest.TestCase):
                 f"shared-lab-deployer-{stand['id']}-1",
                 f"shared-lab-deployer-{stand['id']}-2",
             ],
+        )
+        thread.return_value.start.assert_called_once_with()
+
+    def test_existing_pool_id_preserves_proxmox_letter_case(self) -> None:
+        with patch("dashboard_backend.service.threading.Thread") as thread:
+            stand = self.service.create_stand({
+                "blueprint_id": self.blueprint["id"],
+                "name": "Стенд со смешанным регистром",
+                "pool_id": "Templates-MDK-02-01",
+                "use_existing_pool": True,
+                "vm_count": 1,
+            })
+
+        self.assertEqual(stand["pool_id"], "Templates-MDK-02-01")
+        self.assertEqual(
+            stand["vms"][0]["name"],
+            f"Templates-MDK-02-01-deployer-{stand['id']}-1",
         )
         thread.return_value.start.assert_called_once_with()
 
