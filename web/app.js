@@ -1157,6 +1157,18 @@ exit 75`;
       || state.bulkRollbackPending.has(Number(stand?.id));
   }
 
+  function updateStandInStateAndView(stand) {
+    const index = state.data?.stands?.findIndex(item => Number(item.id) === Number(stand.id)) ?? -1;
+    if (index < 0) return;
+    state.data.stands[index] = { ...state.data.stands[index], ...stand };
+    if (state.route !== "stands") return;
+    const currentRow = document.querySelector(`tr[data-stand-detail="${Number(stand.id)}"]`);
+    if (!currentRow) return;
+    const container = document.createElement("tbody");
+    container.innerHTML = standRow(state.data.stands[index]);
+    currentRow.replaceWith(container.firstElementChild);
+  }
+
   function settleBulkRollbackPending(stand) {
     const id = Number(stand?.id);
     const pending = state.bulkRollbackPending.get(id);
@@ -1195,20 +1207,11 @@ exit 75`;
     operationPollBusy = true;
     try {
       const updates = await Promise.allSettled(targets.map(stand => api(`/api/stands/${stand.id}`, { promptAdmin: false })));
-      updates.forEach((result, index) => {
+      updates.forEach(result => {
         if (result.status !== "fulfilled") return;
         const stand = result.value;
         settleBulkRollbackPending(stand);
-        const stateIndex = state.data.stands.findIndex(item => Number(item.id) === Number(stand.id));
-        if (stateIndex >= 0) state.data.stands[stateIndex] = { ...state.data.stands[stateIndex], ...stand };
-        if (stateIndex >= 0 && state.route === "stands") {
-          const currentRow = document.querySelector(`tr[data-stand-detail="${Number(stand.id)}"]`);
-          if (currentRow) {
-            const container = document.createElement("tbody");
-            container.innerHTML = standRow(state.data.stands[stateIndex]);
-            currentRow.replaceWith(container.firstElementChild);
-          }
-        }
+        updateStandInStateAndView(stand);
       });
       updateShell();
     } finally {
@@ -1243,8 +1246,7 @@ exit 75`;
             nextCredentialError = error.message;
           }
         }
-        const index = state.data?.stands?.findIndex(item => Number(item.id) === Number(id)) ?? -1;
-        if (index >= 0) state.data.stands[index] = { ...state.data.stands[index], ...stand };
+        updateStandInStateAndView(stand);
         renderStandDetailModal(stand, nextCredentials, nextCredentialState, nextCredentialError, { updateExisting: true });
         if (standNeedsLivePolling(stand)) {
           scheduleStandDetailPoll(id, nextCredentials, nextCredentialState, nextCredentialError);

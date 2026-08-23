@@ -701,6 +701,8 @@ class DashboardService:
         return self.get_stand(stand_id)
 
     def _deploy_job(self, stand_id: int, blueprint: dict[str, Any]) -> None:
+        heartbeat_stop = threading.Event()
+        heartbeat_thread: threading.Thread | None = None
         try:
             stand = self.get_stand(stand_id)
             blueprint = dict(blueprint)
@@ -720,12 +722,46 @@ class DashboardService:
                     )
                 ]
 
+            progress_lock = threading.Lock()
+            progress_value = max(1, min(int(stand.get("progress") or 1), 99))
+
             def progress(value: int, message: str) -> None:
-                self.store.execute("UPDATE stands SET progress = ?, updated_at = ? WHERE id = ?", (value, utc_now(), stand_id))
+                nonlocal progress_value
+                with progress_lock:
+                    progress_value = max(progress_value, min(int(value), 100))
+                    stored_value = progress_value
+                self.store.execute("UPDATE stands SET progress = ?, updated_at = ? WHERE id = ?", (stored_value, utc_now(), stand_id))
                 if value in {31, 72}:
                     self.store.add_activity("deploy", message, stand["name"], "progress", "Система")
 
-            vms = self.gateway.deploy(stand, blueprint, progress)
+            def keep_progress_alive() -> None:
+                # Some Proxmox discovery and task endpoints are synchronous
+                # and can take tens of seconds without an intermediate UPID.
+                # Keep the estimated UI progress moving, but leave the final
+                # four percent to confirmed gateway stages and completion.
+                nonlocal progress_value
+                while not heartbeat_stop.wait(3):
+                    with progress_lock:
+                        if progress_value >= 96:
+                            continue
+                        progress_value += 1
+                        stored_value = progress_value
+                    self.store.execute(
+                        "UPDATE stands SET progress = ?, updated_at = ? WHERE id = ? AND status = 'provisioning'",
+                        (stored_value, utc_now(), stand_id),
+                    )
+
+            heartbeat_thread = threading.Thread(
+                target=keep_progress_alive,
+                name=f"deploy-progress-{stand_id}",
+                daemon=True,
+            )
+            heartbeat_thread.start()
+            try:
+                vms = self.gateway.deploy(stand, blueprint, progress)
+            finally:
+                heartbeat_stop.set()
+                heartbeat_thread.join(timeout=1)
             validation_error = ""
             normalized_vms: list[dict[str, Any]] = []
             if not isinstance(vms, list):
@@ -869,6 +905,9 @@ class DashboardService:
                 "deploy", "Стенд развёрнут", f"{stand['name']} · {vm_count} VM", "success", "Система",
             )
         except Exception as exc:
+            heartbeat_stop.set()
+            if heartbeat_thread and heartbeat_thread.is_alive():
+                heartbeat_thread.join(timeout=1)
             self.store.execute(
                 "UPDATE stands SET status = 'error', last_error = ?, updated_at = ? WHERE id = ?",
                 (str(exc)[-1000:], utc_now(), stand_id),
