@@ -61,6 +61,12 @@ class ProxmoxOperationQueue:
         "delete", "destroy", "qmdestroy", "migrate", "qmigrate", "qmmigrate",
         "backup", "vzdump", "restore", "qmrestore", "move", "qmmove",
     }
+    # Long-lived console proxy workers represent interactive sessions, not
+    # mutating Proxmox jobs. Counting them would permanently consume scheduler
+    # capacity merely because an operator has a console tab open.
+    _IGNORED_TASK_TYPES = {
+        "vncproxy", "vncshell", "termproxy", "spiceproxy", "spiceshell",
+    }
 
     def __init__(
         self,
@@ -333,6 +339,8 @@ class ProxmoxOperationQueue:
         kind = str(
             raw.get("kind") or raw.get("type") or raw.get("worker_type") or "external"
         ).strip().lower()
+        if kind in cls._IGNORED_TASK_TYPES:
+            return None
         explicit_lane = str(raw.get("lane") or "").strip().lower()
         if explicit_lane in {"control", "heavy"}:
             lane = explicit_lane

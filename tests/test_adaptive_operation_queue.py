@@ -105,6 +105,32 @@ class AdaptiveOperationQueueTests(unittest.TestCase):
             self.assertEqual(queue.snapshot()["used"], 1)
         self.assertLess(time.monotonic() - started, 0.2)
 
+    def test_console_proxy_tasks_do_not_consume_scheduler_capacity(self) -> None:
+        queue = ProxmoxOperationQueue(10)
+        queue.update_pressure({
+            "sources": {"resources": True, "tasks": True},
+            "nodes": [{"node": "fuji1", "status": "online"}],
+            "tasks": [
+                {
+                    "upid": f"UPID:fuji1:{kind}",
+                    "node": "fuji1",
+                    "type": kind,
+                }
+                for kind in (
+                    "vncproxy", "vncshell", "termproxy", "spiceproxy", "spiceshell",
+                )
+            ] + [{
+                "upid": "UPID:fuji1:clone",
+                "node": "fuji1",
+                "type": "qmclone",
+            }],
+        })
+
+        snapshot = queue.snapshot()
+        self.assertEqual(snapshot["external_tasks_count"], 1)
+        self.assertEqual(snapshot["external_used"], 2)
+        self.assertEqual(snapshot["external_tasks"][0]["kind"], "qmclone")
+
     def test_control_reserve_does_not_bypass_hard_zero_capacity(self) -> None:
         global_queue = ProxmoxOperationQueue(
             10, control_reserve=2, node_control_reserve=1,
