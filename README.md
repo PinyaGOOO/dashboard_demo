@@ -105,6 +105,7 @@ Live-развёртывание:
 | `PROXMOX_TOKEN_VALUE` | секрет API-токена | нет; обязательна в live |
 | `PROXMOX_VERIFY_SSL` | проверка TLS-сертификата (`true`/`false`) | `true` |
 | `PROXMOX_HOSTS` | список нод через запятую для совместимости с legacy-интеграциями | пусто; dashboard сейчас не использует |
+| `PROXMOX_OPERATION_CAPACITY` | общий взвешенный лимит изменяющих операций Proxmox; свободный кластер запускает их без задержки | `10` |
 | `PROXMOX_CLONE_BATCH` | одновременно запущенные задачи linked clone, от 1 до 12 | `6` |
 | `PROXMOX_DEPLOY_WORKERS` | параллельные bootstrap/QGA-операции, от 1 до 12 | `6` |
 | `PROXMOX_SNAPSHOT_BATCH` | одновременно создаваемые snapshots, от 1 до 12 | `6` |

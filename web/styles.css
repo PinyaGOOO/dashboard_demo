@@ -714,6 +714,29 @@ code { padding: 2px 5px; color: #365d86; background: rgba(255,255,255,.6); borde
 .gauge-grid > div { border-right: 1px solid var(--line); }
 .gauge-grid > div:last-child { border-right: 0; }
 .gauge-grid .gauge svg { width: 140px; }
+.queue-capacity { min-width: 105px; text-align: right; }
+.queue-capacity strong, .queue-capacity small { display: block; }
+.queue-capacity strong { color: var(--ink); font-size: 17px; font-variant-numeric: tabular-nums; }
+.queue-capacity small { margin-top: 3px; color: var(--ink-muted); font-size: 10px; }
+.operation-queue-card .card__body { display: grid; gap: 18px; }
+.queue-load > div:first-child { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; color: var(--ink-muted); font-size: 11px; }
+.queue-load strong { color: var(--ink); font-size: 12px; }
+.queue-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+.queue-columns > section { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 9px; }
+.queue-columns h4 { display: flex; min-height: 39px; align-items: center; justify-content: space-between; margin: 0; padding: 0 12px; background: var(--surface-muted); border-bottom: 1px solid var(--line); font-size: 11px; }
+.queue-columns h4 span { display: grid; min-width: 22px; height: 22px; padding: 0 6px; color: var(--ink-muted); background: #fff; border: 1px solid var(--line); border-radius: 6px; font-size: 10px; place-items: center; }
+.queue-list { display: grid; }
+.queue-operation { display: grid; min-height: 58px; grid-template-columns: 30px minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 8px 11px; border-bottom: 1px solid var(--line); }
+.queue-operation:last-child { border-bottom: 0; }
+.queue-operation__icon { display: grid; width: 30px; height: 30px; color: var(--blue); background: var(--blue-soft); border-radius: 8px; place-items: center; }
+.queue-operation__icon--waiting { color: #a36a00; background: var(--yellow-soft); }
+.queue-operation__icon svg { width: 14px; height: 14px; }
+.queue-operation strong, .queue-operation small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.queue-operation strong { font-size: 11px; }
+.queue-operation small { margin-top: 3px; color: var(--ink-muted); font-size: 9.5px; }
+.queue-operation__meta { color: var(--ink-soft); font-size: 10px; font-weight: 700; text-align: right; }
+.queue-operation__meta small { font-weight: 500; }
+.queue-empty { min-height: 58px; margin: 0; padding: 20px 14px; color: var(--ink-muted); font-size: 10.5px; text-align: center; }
 .infra-node-list { display: grid; }
 .infra-node { padding: 17px 19px; border-bottom: 1px solid var(--line); }
 .infra-node:last-child { border-bottom: 0; }
@@ -1048,6 +1071,7 @@ code { padding: 2px 5px; color: #365d86; background: rgba(255,255,255,.6); borde
   .infra-hero { grid-template-columns: 1fr; }
   .infra-hero__copy { padding: 22px; }
   .infra-hero__share { display: none; }
+  .queue-columns { grid-template-columns: 1fr; }
   .gauge-grid { grid-template-columns: 1fr 1fr; }
   .gauge-grid .gauge { min-height: 145px; }
   .gauge-grid .gauge svg { width: 120px; }

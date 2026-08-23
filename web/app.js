@@ -149,6 +149,8 @@ exit 75`;
   let standDetailRequestToken = 0;
   let operationPollTimer = null;
   let operationPollBusy = false;
+  let queuePollTimer = null;
+  let queuePollBusy = false;
   let checkPollTimer = null;
   let checkPollBusy = false;
   let webActivityPollTimer = null;
@@ -613,6 +615,7 @@ exit 75`;
         <div class="infra-tags"><span>${icon("server")} ${metrics.nodes.reduce((sum, node) => sum + node.running_vms, 0)} VM работают</span><span>${icon("activity")} ${100 - Math.round(cluster.cpu)}% CPU в резерве</span><span>${icon("shield")} TLS ${integration.mode === "live" ? "проверяется" : "не требуется"}</span></div></div>
         <div class="infra-hero__share">${gauge(cluster.exam_cpu, "вклад стендов", "#ed6c23")}</div></div>
       <div class="gauge-grid card"><div>${gauge(cluster.cpu, "CPU кластера", "#ed6c23")}</div><div>${gauge(cluster.ram, "RAM кластера", "#397fbc")}</div><div>${gauge(cluster.disk, "Хранилище", "#7b61a8")}</div><div>${gauge(cluster.exam_ram, "RAM стендов", "#2a9d69")}</div></div>
+      ${operationQueueCard(state.data.operation_queue)}
       <article class="card"><div class="card__header"><div class="card__heading"><h3 class="card__title">Динамика использования CPU</h3><p class="card__subtitle">${historySubtitle}</p></div><div class="chart-legend"><span class="chart-legend__item"><i class="chart-legend__dot chart-legend__dot--muted"></i>Кластер</span><span class="chart-legend__item"><i class="chart-legend__dot"></i>Демоэкзамен</span></div></div><div class="card__body">${lineChart(metrics.history, 270)}</div></article>
       <div class="content-grid content-grid--infra">
         <article class="card"><div class="card__header"><div class="card__heading"><h3 class="card__title">Ноды Proxmox</h3><p class="card__subtitle">Распределение нагрузки и экзаменационных VM</p></div></div><div class="infra-node-list">${metrics.nodes.map(infraNode).join("")}</div></article>
@@ -623,6 +626,16 @@ exit 75`;
     </section>`;
     if (!state.webActivity) window.setTimeout(() => loadWebActivity({ background: true }), 0);
     else scheduleWebActivityRefresh();
+  }
+
+  function operationQueueCard(queue = {}) {
+    const capacity = Math.max(1, Number(queue.capacity) || 10);
+    const used = clamp(Number(queue.used) || 0, 0, capacity);
+    const active = Array.isArray(queue.active) ? queue.active : [];
+    const queued = Array.isArray(queue.queued) ? queue.queued : [];
+    const labels = { deploy: "Развёртывание", rollback: "Возврат к start", delete: "Удаление", snapshot: "Снимок", power: "Питание", password: "Смена пароля" };
+    const row = (item, waiting = false) => `<div class="queue-operation"><span class="queue-operation__icon queue-operation__icon--${waiting ? "waiting" : "active"}">${icon(waiting ? "clock" : "activity")}</span><span><strong>${escapeHtml(labels[item.kind] || item.kind)}</strong><small>${escapeHtml(item.label)}${item.vm_count ? ` · ${Number(item.vm_count)} VM` : ""}</small></span><span class="queue-operation__meta">${waiting ? `№ ${Number(item.position)}` : `${Number(item.weight)} ед.`}<small>${waiting ? `${formatNumber(item.wait_seconds || 0)} с` : `${formatNumber(item.duration_seconds || 0)} с`}</small></span></div>`;
+    return `<article class="card operation-queue-card" id="operation-queue-card"><div class="card__header"><div class="card__heading"><h3 class="card__title">Очередь операций Proxmox</h3><p class="card__subtitle">Тяжёлые операции ограничиваются, лёгкие используют свободный резерв</p></div><div class="queue-capacity"><strong>${used} / ${capacity}</strong><small>единиц нагрузки</small></div></div><div class="card__body"><div class="queue-load"><div><span>Расчётная занятость</span><strong>${formatNumber(used / capacity * 100)}%</strong></div><div class="progress"><div class="progress__bar progress__bar--blue" style="width:${clamp(used / capacity * 100)}%"></div></div></div><div class="queue-columns"><section><h4>Выполняются <span>${active.length}</span></h4><div class="queue-list">${active.map(item => row(item)).join("") || `<p class="queue-empty">Кластер свободен — новая операция запустится сразу.</p>`}</div></section><section><h4>Ожидают <span>${queued.length}</span></h4><div class="queue-list">${queued.map(item => row(item, true)).join("") || `<p class="queue-empty">Операций в ожидании нет.</p>`}</div></section></div></div></article>`;
   }
 
   function infraNode(node) {
@@ -742,6 +755,7 @@ exit 75`;
     const renderers = { overview: renderOverview, stands: renderStands, blueprints: renderBlueprints, checks: renderChecks, ipam: renderIpam, infrastructure: renderInfrastructure };
     renderers[state.route]();
     updateShell();
+    syncQueuePolling();
   }
 
   function updateShell() {
@@ -1260,6 +1274,39 @@ exit 75`;
     }
     if (hasActiveOperations && !operationPollTimer && !operationPollBusy) {
       operationPollTimer = window.setTimeout(pollActiveOperations, 1400);
+    }
+  }
+
+  function syncQueuePolling() {
+    const shouldPoll = state.route === "infrastructure" && Boolean(state.data);
+    if (!shouldPoll && queuePollTimer) {
+      window.clearTimeout(queuePollTimer);
+      queuePollTimer = null;
+      return;
+    }
+    if (shouldPoll && !queuePollTimer && !queuePollBusy) {
+      queuePollTimer = window.setTimeout(pollOperationQueue, 1800);
+    }
+  }
+
+  async function pollOperationQueue() {
+    queuePollTimer = null;
+    if (document.hidden || state.route !== "infrastructure" || !state.data) {
+      syncQueuePolling();
+      return;
+    }
+    if (queuePollBusy) { syncQueuePolling(); return; }
+    queuePollBusy = true;
+    try {
+      const queue = await api("/api/operation-queue", { promptAdmin: false });
+      state.data.operation_queue = queue;
+      const current = document.querySelector("#operation-queue-card");
+      if (current) current.outerHTML = operationQueueCard(queue);
+    } catch {
+      // The next lightweight poll will retry without disturbing the page.
+    } finally {
+      queuePollBusy = false;
+      syncQueuePolling();
     }
   }
 

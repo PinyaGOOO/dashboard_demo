@@ -110,6 +110,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self._json(self.service.overview())
             elif parts == ["api", "metrics"] and method == "GET":
                 self._json(self.service.metrics())
+            elif parts == ["api", "operation-queue"] and method == "GET":
+                self._json(self.service.operation_queue())
             elif parts == ["api", "web-activity"] and method == "GET":
                 force = query.get("force", ["0"])[0] in {"1", "true", "yes"}
                 self._json(self.service.web_activity(force=force))

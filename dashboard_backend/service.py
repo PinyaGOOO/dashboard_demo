@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .database import DashboardStore, utc_now
+from .operation_queue import ProxmoxOperationQueue
 from .passwords import PROXMOX_PASSWORD_MAX_LENGTH, generate_password
 from .proxmox_gateway import (
     CredentialRestoreError,
@@ -42,6 +43,11 @@ class DashboardService:
     def __init__(self, store: DashboardStore, gateway: Gateway):
         self.store = store
         self.gateway = gateway
+        try:
+            queue_capacity = int(os.environ.get("PROXMOX_OPERATION_CAPACITY", "10"))
+        except ValueError:
+            queue_capacity = 10
+        self._operation_queue = ProxmoxOperationQueue(queue_capacity)
         self._jobs: dict[int, threading.Thread] = {}
         self._job_lock = threading.Lock()
         self._stand_operation_locks: dict[int, threading.RLock] = {}
@@ -107,6 +113,23 @@ class DashboardService:
         with self._bulk_rollback_lock:
             if int(stand_id) in self._bulk_rollback_pending:
                 raise ConflictError("Стенд уже поставлен в очередь массового возврата к snapshot start")
+
+    def operation_queue(self) -> dict[str, Any]:
+        return self._operation_queue.snapshot()
+
+    def _operation_weight(self, kind: str, vm_count: int) -> int:
+        count = max(1, int(vm_count or 1))
+        if kind == "deploy":
+            weight = 3 + (count + 5) // 6
+        elif kind == "rollback":
+            weight = 3 + (count + 7) // 8
+        elif kind == "delete":
+            weight = 2 + (count + 7) // 8
+        elif kind == "snapshot":
+            weight = 2 + (count + 9) // 10
+        else:
+            weight = 1
+        return max(1, min(weight, self._operation_queue.capacity))
 
     def integration(self) -> dict[str, Any]:
         info = self.gateway.integration_info()
@@ -863,12 +886,26 @@ class DashboardService:
                 name=f"deploy-progress-{stand_id}",
                 daemon=True,
             )
-            heartbeat_thread.start()
-            try:
-                vms = self.gateway.deploy(stand, blueprint, progress)
-            finally:
-                heartbeat_stop.set()
-                heartbeat_thread.join(timeout=1)
+            def queued(position: int) -> None:
+                self.store.execute(
+                    "UPDATE stands SET progress = ?, updated_at = ? WHERE id = ?",
+                    (max(2, min(progress_value, 5)), utc_now(), stand_id),
+                )
+                self.store.add_activity(
+                    "queue", "Развёртывание ожидает ресурсов Proxmox",
+                    f"{stand['name']} · позиция {position}", "progress", "Система",
+                )
+
+            with self._operation_queue.reserve(
+                "deploy", str(stand["name"]), self._operation_weight("deploy", vm_count),
+                vm_count=vm_count, on_queued=queued,
+            ):
+                heartbeat_thread.start()
+                try:
+                    vms = self.gateway.deploy(stand, blueprint, progress)
+                finally:
+                    heartbeat_stop.set()
+                    heartbeat_thread.join(timeout=1)
             validation_error = ""
             normalized_vms: list[dict[str, Any]] = []
             if not isinstance(vms, list):
@@ -915,7 +952,12 @@ class DashboardService:
                 cleanup_vmids.sort()
                 cleanup_error = ""
                 try:
-                    self.gateway.delete_stand(stand, cleanup_vmids)
+                    with self._operation_queue.reserve(
+                        "delete", f"{stand['name']} · очистка неудачного развёртывания",
+                        self._operation_weight("delete", len(cleanup_vmids)),
+                        vm_count=len(cleanup_vmids),
+                    ):
+                        self.gateway.delete_stand(stand, cleanup_vmids)
                 except Exception as exc:
                     cleanup_error = f"; автоматический откат также завершился ошибкой: {exc}"
                 raise RuntimeError(f"Неполный результат развёртывания: {validation_error}{cleanup_error}")
@@ -1059,7 +1101,11 @@ class DashboardService:
         if action in {"start", "stop", "restart"}:
             if not vmids:
                 raise ConflictError("В стенде нет VM для управления питанием")
-            self.gateway.power_action(vmids, action)
+            with self._operation_queue.reserve(
+                "power", f"{stand['name']} · {action}", self._operation_weight("power", len(vmids)),
+                vm_count=len(vmids),
+            ):
+                self.gateway.power_action(vmids, action)
             new_status = "stopped" if action == "stop" else "running"
             self.store.execute("UPDATE stands SET status = ?, cpu = ?, updated_at = ? WHERE id = ?", (new_status, 0 if new_status == "stopped" else max(float(stand["cpu"]), 7.2), utc_now(), stand_id))
             self.store.execute("UPDATE stand_vms SET status = ? WHERE stand_id = ?", (new_status, stand_id))
@@ -1071,7 +1117,11 @@ class DashboardService:
             if not vmids:
                 raise ConflictError("В стенде нет VM для создания снимка")
             description = str(payload.get("description", ""))[:255]
-            self.gateway.create_snapshot(vmids, label, description)
+            with self._operation_queue.reserve(
+                "snapshot", f"{stand['name']} · {label}", self._operation_weight("snapshot", len(vmids)),
+                vm_count=len(vmids),
+            ):
+                self.gateway.create_snapshot(vmids, label, description)
             self.store.execute(
                 """UPDATE stand_vms SET last_snapshot = ?,
                 has_start_snapshot = CASE WHEN ? = 'start' THEN 1 ELSE has_start_snapshot END
@@ -1096,7 +1146,11 @@ class DashboardService:
             if not current_vmids:
                 raise ConflictError("В pool нет VM для удаления")
             deletion_scope = {**stand, "origin": "existing", "vms": current_vms}
-            self.gateway.delete_stand(deletion_scope, current_vmids)
+            with self._operation_queue.reserve(
+                "delete", f"{stand['pool_id']} · удалить все VM",
+                self._operation_weight("delete", len(current_vmids)), vm_count=len(current_vmids),
+            ):
+                self.gateway.delete_stand(deletion_scope, current_vmids)
             self.store.execute("DELETE FROM stand_vms WHERE stand_id = ?", (stand_id,))
             self.store.execute(
                 """UPDATE stands SET status = 'stopped', progress = 100, vm_count = 0,
@@ -1128,7 +1182,11 @@ class DashboardService:
                 )
             if not vmids:
                 raise ConflictError("В стенде нет VM для смены пароля")
-            self.gateway.rotate_password(vmids, username, password)
+            with self._operation_queue.reserve(
+                "password", f"{stand['name']} · смена пароля",
+                self._operation_weight("password", len(vmids)), vm_count=len(vmids),
+            ):
+                self.gateway.rotate_password(vmids, username, password)
             changed_at = utc_now()
             self.store.execute(
                 """UPDATE stand_vms SET credential_username = ?, web_username = ?,
@@ -1416,22 +1474,36 @@ class DashboardService:
                     # destructive Proxmox operation that is already running.
                     pass
 
-            self.gateway.rollback_snapshot(vmids, "start", start=True, progress=progress)
-            rollback_applied = True
-            self.store.execute(
-                "UPDATE stands SET progress = 92, updated_at = ? WHERE id = ?",
-                (utc_now(), stand_id),
-            )
-            credentials = [
-                {
-                    "vmid": int(vm["vmid"]),
-                    "username": str(vm.get("credential_username") or "root"),
-                    "password": str(vm.get("credential_password") or ""),
-                }
-                for vm in raw_vms
-                if vm.get("vmid") is not None and str(vm.get("credential_password") or "")
-            ]
-            restored = self.gateway.restore_credentials(credentials)
+            def queued(position: int) -> None:
+                try:
+                    self.store.add_activity(
+                        "queue", "Возврат ожидает ресурсов Proxmox",
+                        f"{stand_name} · позиция {position}", "progress", "Система",
+                    )
+                except Exception:
+                    pass
+
+            with self._operation_queue.reserve(
+                "rollback", f"{stand_name} · snapshot start",
+                self._operation_weight("rollback", len(vmids)), vm_count=len(vmids),
+                on_queued=queued,
+            ):
+                self.gateway.rollback_snapshot(vmids, "start", start=True, progress=progress)
+                rollback_applied = True
+                self.store.execute(
+                    "UPDATE stands SET progress = 92, updated_at = ? WHERE id = ?",
+                    (utc_now(), stand_id),
+                )
+                credentials = [
+                    {
+                        "vmid": int(vm["vmid"]),
+                        "username": str(vm.get("credential_username") or "root"),
+                        "password": str(vm.get("credential_password") or ""),
+                    }
+                    for vm in raw_vms
+                    if vm.get("vmid") is not None and str(vm.get("credential_password") or "")
+                ]
+                restored = self.gateway.restore_credentials(credentials)
             restored_vmids = {
                 int(vmid) for vmid in (restored if restored is not None else [item["vmid"] for item in credentials])
             }
@@ -1575,7 +1647,11 @@ class DashboardService:
         if action == "snapshot":
             label = self._snapshot_label(payload.get("name"))
             description = str(payload.get("description", ""))[:255]
-            self.gateway.create_snapshot([vmid], label, description)
+            with self._operation_queue.reserve(
+                "snapshot", f"{stand['name']} · VM {vmid} · {label}",
+                self._operation_weight("snapshot", 1), vm_count=1,
+            ):
+                self.gateway.create_snapshot([vmid], label, description)
             self.store.execute(
                 """UPDATE stand_vms SET last_snapshot = ?,
                 has_start_snapshot = CASE WHEN ? = 'start' THEN 1 ELSE has_start_snapshot END
@@ -1605,7 +1681,11 @@ class DashboardService:
                 raise ValidationError(
                     f"Proxmox принимает пароль длиной не более {PROXMOX_PASSWORD_MAX_LENGTH} символов"
                 )
-            self.gateway.rotate_password([vmid], guest_username, password)
+            with self._operation_queue.reserve(
+                "password", f"{stand['name']} · VM {vmid} · смена пароля",
+                self._operation_weight("password", 1), vm_count=1,
+            ):
+                self.gateway.rotate_password([vmid], guest_username, password)
             changed_at = utc_now()
             self.store.execute(
                 """UPDATE stand_vms SET credential_username = ?, web_username = ?,
@@ -1668,7 +1748,11 @@ class DashboardService:
         # live gateway to inspect the owned pool.  This makes a second cleanup
         # attempt possible if the automatic rollback only partially succeeded.
         if not imported:
-            self.gateway.delete_stand(stand, vmids)
+            with self._operation_queue.reserve(
+                "delete", f"{stand['name']} · удаление",
+                self._operation_weight("delete", len(vmids)), vm_count=len(vmids),
+            ):
+                self.gateway.delete_stand(stand, vmids)
         self.store.execute("DELETE FROM stands WHERE id = ?", (stand_id,))
         self.store.add_activity(
             "import" if imported else "delete",
@@ -2025,5 +2109,6 @@ class DashboardService:
             "integration": self.integration(), "overview": self.overview(), "stands": self.list_stands(),
             "blueprints": self.list_blueprints(), "templates": self.list_templates(), "pools": self.list_pools(),
             "checks": self.list_checks(),
-            "metrics": self.metrics(), "activity": self.activity(), "server_time": utc_now(),
+            "metrics": self.metrics(), "activity": self.activity(),
+            "operation_queue": self.operation_queue(), "server_time": utc_now(),
         }
