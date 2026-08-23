@@ -571,7 +571,7 @@ exit 75`;
         </div>
       </div>
       <article class="card"><div class="card__header"><div class="card__heading"><h3 class="card__title">История запусков</h3><p class="card__subtitle">${escapeHtml(selected.name)}</p></div><button class="button button--small" data-run-check>${icon("power")}Новый запуск</button></div>
-        ${runs.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>Стенд</th><th>Результат</th><th>Проверки</th><th>Время</th><th>Длительность</th><th></th></tr></thead><tbody>${runs.slice(0, 8).map(run => `<tr><td><strong class="cell-title">${escapeHtml(run.stand_name)}</strong><small class="cell-subtitle">${escapeHtml(run.blueprint_code || "")}${run.vmid ? ` · VM ${Number(run.vmid)}` : " · весь стенд"}</small></td><td>${run.status === "running" ? statusChip("checking", "Выполняется") : statusChip(run.status)}</td><td><strong>${run.score == null ? "—" : `${run.score}%`}</strong><small class="cell-subtitle">${run.total ? `${run.passed} из ${run.total}` : "Ожидание результатов"}</small></td><td>${dateTime(run.started_at)}</td><td>${run.duration_ms ? `${formatNumber(run.duration_ms / 1000, 1)} c` : "—"}</td><td class="cell-actions"><button class="icon-button" data-check-detail="${run.id}" title="Результаты">${icon("chevron")}</button></td></tr>`).join("")}</tbody></table></div>` : emptyState("check", "Запусков пока нет", "Запустите автопроверку на совместимом стенде.")}</article>
+        ${runs.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>Стенд</th><th>Результат</th><th>Проверки</th><th>Время</th><th>Длительность</th><th></th></tr></thead><tbody>${runs.slice(0, 8).map(run => `<tr><td><strong class="cell-title">${escapeHtml(run.stand_name)}</strong><small class="cell-subtitle">${escapeHtml(run.blueprint_code || "")}${run.vmid ? ` · VM ${Number(run.vmid)}` : " · весь стенд"}</small></td><td>${run.status === "running" ? statusChip("checking", "Выполняется") : statusChip(run.status)}</td><td><strong>${run.score == null ? "—" : `${run.score}%`}</strong><small class="cell-subtitle">${run.total ? `${run.passed} из ${run.total}` : "Ожидание результатов"}</small></td><td>${dateTime(run.started_at)}</td><td>${run.duration_ms ? `${formatNumber(run.duration_ms / 1000, 1)} c` : "—"}</td><td class="cell-actions"><button class="button table-check-button" data-check-detail="${run.id}" type="button">${icon("external")}Посмотреть результаты</button></td></tr>`).join("")}</tbody></table></div>` : emptyState("check", "Запусков пока нет", "Запустите автопроверку на совместимом стенде.")}</article>
     </section>`;
     const editor = document.querySelector("#autocheck-editor");
     editor?.addEventListener("input", () => {
@@ -1091,7 +1091,6 @@ exit 75`;
     const standBusy = ["provisioning", "resetting"].includes(stand.status) || Boolean(stand.bulk_rollback_pending);
     const canRollbackVm = hasVmid && hasStartSnapshot && Boolean(vm.credential_recoverable)
       && !standBusy && stand.check_status !== "running" && vm.check_status !== "running";
-    const checkLabel = vm.check_status === "running" ? "автопроверка идёт" : vm.check_score == null ? "не проверялась" : `автопроверка ${formatNumber(vm.check_score)}%`;
     const passwordUnverified = credentialState === "loaded" && !password
       && Boolean(credential?.credential_recoverable || vm.credential_recoverable);
     const passwordText = password ? "••••••••••••" : credentialState === "locked" ? "Нужен токен" : credentialState === "error" ? "Ошибка загрузки" : passwordUnverified ? "Не подтверждён" : "Не выдан";
@@ -1103,8 +1102,8 @@ exit 75`;
       : `<button class="button button--primary vm-open-button" type="button" disabled title="Web URL ещё не получен">${icon("chevron")}Перейти к стенду</button>`;
     return `<article class="vm-row">
       <span class="vm-state vm-state--${escapeHtml(vm.status)}"></span>
-      <div class="vm-main"><div class="vm-main__title"><strong>${escapeHtml(vm.name)}</strong>${statusChip(vm.status)}</div><small class="mono">${hasVmid ? `VMID ${numericVmid}` : "VM создаётся"} · ${escapeHtml(vm.ip || "IP резервируется")}</small><div class="vm-meta"><span>${icon("server")}${escapeHtml(vm.node || stand.node || "авто")}</span><span class="${hasStartSnapshot ? "is-ready" : ""}">${icon("copy")}${hasStartSnapshot ? "snapshot start готов" : "snapshot start"}</span><span class="${vm.check_status === "running" ? "is-checking" : vm.check_score == null ? "" : vm.check_score >= 90 ? "is-ready" : vm.check_score >= 70 ? "is-warning" : "is-failed"}">${icon("check")}${escapeHtml(checkLabel)}</span></div></div>
-      <div class="vm-access"><div class="vm-access__hint">${icon("lock")}Доступ к веб-интерфейсу</div><div class="vm-credentials"><div><span>Логин</span><strong class="mono">${escapeHtml(username)}</strong><button type="button" data-copy-vm-login data-value="${escapeHtml(username)}">${icon("copy")}Копировать</button></div><div><span>Пароль</span><strong class="mono" data-vm-secret>${escapeHtml(passwordText)}</strong>${password ? `<div class="vm-secret-actions"><button type="button" data-reveal-vm-password data-password="${escapeHtml(password)}">${icon("eye")}Показать</button><button type="button" data-copy-vm-password data-value="${escapeHtml(password)}">${icon("copy")}Копировать</button></div>` : ""}</div></div>${password ? `<button class="vm-copy-access" type="button" data-copy-vm-credential data-user="${escapeHtml(username)}" data-password="${escapeHtml(password)}">${icon("copy")}Скопировать парой</button>` : `<small class="vm-access__empty">${escapeHtml(passwordHint)}</small>`}</div>
+      <div class="vm-main"><div class="vm-main__title"><strong>${escapeHtml(vm.name)}</strong>${statusChip(vm.status)}</div><small class="mono">${hasVmid ? `VMID ${numericVmid}` : "VM создаётся"} · ${escapeHtml(vm.ip || "IP резервируется")}</small><div class="vm-meta"><span>${icon("server")}${escapeHtml(vm.node || stand.node || "авто")}</span></div></div>
+      <div class="vm-access"><div class="vm-access__hint">${icon("lock")}Доступ к веб-интерфейсу</div><div class="vm-credentials"><div><span>Логин</span><strong class="mono">${escapeHtml(username)}</strong><button type="button" data-copy-vm-login data-value="${escapeHtml(username)}">${icon("copy")}Копировать</button></div><div><span>Пароль</span><strong class="mono" data-vm-secret>${escapeHtml(passwordText)}</strong>${password ? `<div class="vm-secret-actions"><button type="button" data-reveal-vm-password data-password="${escapeHtml(password)}">${icon("eye")}Показать</button><button type="button" data-copy-vm-password data-value="${escapeHtml(password)}">${icon("copy")}Копировать</button></div>` : ""}</div></div>${password ? "" : `<small class="vm-access__empty">${escapeHtml(passwordHint)}</small>`}</div>
       <div class="vm-actions">${accessButton}<div><button class="button button--small" type="button" data-vm-action="snapshot" data-stand-id="${stand.id}" data-vmid="${hasVmid ? numericVmid : ""}" data-vm-name="${escapeHtml(vm.name)}" ${!hasVmid || standBusy ? "disabled" : ""}>${icon("copy")}Снимок</button><button class="button button--small" type="button" data-vm-action="rollback_start" data-stand-id="${stand.id}" data-vmid="${hasVmid ? numericVmid : ""}" data-vm-name="${escapeHtml(vm.name)}" title="Вернуть эту VM к snapshot start" ${canRollbackVm ? "" : "disabled"}>${icon("refresh")}Вернуть к start</button><button class="button button--small" type="button" data-vm-action="password" data-stand-id="${stand.id}" data-vmid="${hasVmid ? numericVmid : ""}" data-vm-name="${escapeHtml(vm.name)}" ${!hasVmid || vm.status !== "running" || standBusy ? "disabled" : ""}>${icon("lock")}Пароль</button><button class="button button--small" type="button" data-vm-action="run_check" data-stand-id="${stand.id}" data-vmid="${hasVmid ? numericVmid : ""}" data-vm-name="${escapeHtml(vm.name)}" ${!hasVmid || vm.status !== "running" || standBusy ? "disabled" : ""}>${icon("check")}Автопроверка</button></div></div>
     </article>`;
   }
@@ -1123,19 +1122,19 @@ exit 75`;
     standCredentialCache.set(Number(stand.id), { stand, credentials });
     const credentialCount = stand.vms.filter(vm => credentials.get(Number(vm.vmid))?.password || credentials.get(Number(vm.vmid))?.access_password).length;
     const credentialControl = credentialState === "loaded"
-      ? `<span class="credential-state credential-state--ready">${icon("check")}Доступы загружены: ${credentialCount}</span><button class="button button--small" type="button" data-copy-stand-access="${stand.id}" ${credentialCount ? "" : "disabled"}>${icon("copy")}Все IP, логины и пароли</button>`
+      ? `<button class="button button--small" type="button" data-copy-stand-access="${stand.id}" ${credentialCount ? "" : "disabled"}>${icon("copy")}Все IP, логины и пароли</button>`
       : `<button class="button button--small" type="button" data-load-stand-credentials="${stand.id}">${icon("lock")}Показать логины и пароли</button><button class="button button--small" type="button" data-copy-stand-access="${stand.id}" ${stand.vms.some(vm => Number(vm.vmid) > 0) ? "" : "disabled"}>${icon("copy")}Скопировать все доступы</button>`;
     const credentialNotice = credentialState === "locked"
       ? `<div class="alert alert--info">${icon("info")}<div><strong>Пароли защищены административным токеном.</strong><br>Нажмите «Показать логины и пароли», чтобы загрузить их для этого стенда.</div></div>`
       : credentialState === "error" ? `<div class="alert alert--warning">${icon("alert")}<div><strong>Не удалось получить сохранённые доступы.</strong><br>${escapeHtml(credentialError || "Можно сменить пароль отдельно у нужной VM.")}</div></div>` : "";
     const body = `<div class="stand-detail">
-      <div class="stand-detail__hero"><div class="stand-detail__icon">${icon("server")}</div><div><div class="stand-detail__title"><h3>${escapeHtml(stand.name)}</h3>${statusChip(stand.status)}</div><p class="mono">${escapeHtml(stand.pool_id)} · ${escapeHtml(stand.blueprint_name || "Без сценария")} · ${escapeHtml(stand.node)}</p></div><div class="stand-detail__score"><strong>${stand.check_score == null ? "—" : `${stand.check_score}%`}</strong><small>автопроверка</small></div></div>
+      <div class="stand-detail__hero"><div class="stand-detail__icon">${icon("server")}</div><div><div class="stand-detail__title"><h3>${escapeHtml(stand.name)}</h3>${statusChip(stand.status)}</div><p class="mono">${escapeHtml(stand.pool_id)} · ${escapeHtml(stand.blueprint_name || "Без сценария")} · ${escapeHtml(stand.node)}</p></div></div>
       ${standBusy ? `<div class="deploy-detail"><div><strong>${stand.status === "resetting" ? "Возврат к исходному состоянию" : "Развёртывание выполняется"}</strong><span>${stand.progress}%</span></div><div class="progress"><div class="progress__bar progress__bar--blue" style="width:${stand.progress}%"></div></div><small>${stand.status === "resetting" ? "VM откатываются к snapshot start и запускаются заново." : "Мастер продолжает работу в фоне."} Окно можно закрыть крестиком.</small></div>` : ""}
       ${stand.status === "error" && stand.last_error ? `<div class="alert alert--error">${icon("alert")}<div><strong>Причина ошибки операции</strong><br><span class="mono">${escapeHtml(stand.last_error)}</span></div></div>` : ""}
       <div class="detail-stat-grid"><div><span>Машины</span><strong>${runCount} / ${stand.vm_count}</strong><small>запущено</small></div><div><span>CPU</span><strong>${formatNumber(stand.cpu, 1)}%</strong><small>текущая оценка</small></div><div><span>RAM</span><strong>${formatNumber(stand.ram, 1)}%</strong><small>на ноде</small></div><div><span>Режим работы</span><strong>Бессрочно</strong><small>автоотключение выключено</small></div></div>
       <div class="detail-actions"><button class="button" data-stand-action="${stand.status === "stopped" ? "start" : "stop"}" data-stand-id="${stand.id}" ${!["running", "stopped"].includes(stand.status) || !stand.vms.length ? "disabled" : ""}>${icon("power")}${stand.status === "stopped" ? "Запустить" : "Остановить"}</button><button class="button" data-stand-action="restart" data-stand-id="${stand.id}" ${stand.status !== "running" ? "disabled" : ""}>${icon("refresh")}Перезапустить</button><button class="button" data-stand-action="snapshot" data-stand-id="${stand.id}" ${!stand.vms.length || standBusy ? "disabled" : ""}>${icon("copy")}Снимок всех VM</button><button class="button" data-stand-action="rollback_start" data-stand-id="${stand.id}" title="${escapeHtml(rollbackTitle)}" ${canRollbackStart ? "" : "disabled"}>${icon("refresh")}Вернуть к изначальному состоянию</button><button class="button" data-stand-action="password" data-stand-id="${stand.id}" ${stand.status !== "running" ? "disabled" : ""}>${icon("lock")}Пароль всех VM</button><button class="button" data-edit-stand="${stand.id}" ${standBusy ? "disabled" : ""}>${icon("edit")}Параметры</button><button class="button button--dark" data-stand-action="run_check" data-stand-id="${stand.id}" ${stand.status !== "running" ? "disabled" : ""}>${icon("check")}Автопроверка</button></div>
       ${credentialNotice}
-      <div class="detail-columns detail-columns--single"><section><div class="detail-section-title"><div><h4>Виртуальные машины</h4><small>Доступы можно копировать по одному или одной кнопкой в формате IP | логин | пароль</small></div><div class="detail-section-tools"><span class="detail-count">${stand.vms.length}</span>${credentialControl}</div></div><div class="vm-list">${stand.vms.map(vm => renderVmRow(stand, vm, credentials.get(Number(vm.vmid)), credentialState)).join("") || `<p class="muted-block">Машины ещё не созданы</p>`}</div></section></div>
+      <div class="detail-columns detail-columns--single"><section><div class="detail-section-title"><div><h4>Виртуальные машины</h4><small>Доступы можно копировать по одному или одной кнопкой в формате IP | логин | пароль</small></div><div class="detail-section-tools">${credentialControl}</div></div><div class="vm-list">${stand.vms.map(vm => renderVmRow(stand, vm, credentials.get(Number(vm.vmid)), credentialState)).join("") || `<p class="muted-block">Машины ещё не созданы</p>`}</div></section></div>
       <div class="detail-meta"><span>${icon("activity")} Создан ${dateTime(stand.created_at)}</span><span>${icon("lock")} Пароль менялся ${relativeTime(stand.password_updated_at)}</span><span>${icon("users")} Ответственный: ${escapeHtml(stand.owner)}</span></div>
     </div>`;
     const importedPool = stand.origin === "imported";
@@ -1143,14 +1142,7 @@ exit 75`;
     const existing = updateExisting ? modalRoot.querySelector(`.modal[data-stand-detail-id="${Number(stand.id)}"]`) : null;
     if (existing) {
       existing.querySelector(".modal__title").textContent = importedPool ? `Пул ${stand.pool_id}` : "Карточка стенда";
-      const subtitleText = importedPool ? `Подключён к Deployer · ID ${stand.id}` : `ID ${stand.id} · управляется Deployer`;
-      let subtitleNode = existing.querySelector(".modal__subtitle");
-      if (!subtitleNode) {
-        subtitleNode = document.createElement("p");
-        subtitleNode.className = "modal__subtitle";
-        existing.querySelector(".modal__header > div")?.append(subtitleNode);
-      }
-      subtitleNode.textContent = subtitleText;
+      existing.querySelector(".modal__subtitle")?.remove();
       const bodyNode = existing.querySelector(".modal__body");
       let footerNode = existing.querySelector(".modal__footer");
       if (!footerNode) {
@@ -1176,7 +1168,7 @@ exit 75`;
       }
     } else {
       activeStandDetailId = Number(stand.id);
-      showModal({ title: importedPool ? `Пул ${stand.pool_id}` : "Карточка стенда", subtitle: importedPool ? `Подключён к Deployer · ID ${stand.id}` : `ID ${stand.id} · управляется Deployer`, body, footer, size: "large", className: "stand-detail-modal" });
+      showModal({ title: importedPool ? `Пул ${stand.pool_id}` : "Карточка стенда", body, footer, size: "large", className: "stand-detail-modal" });
       modalRoot.querySelector(".modal")?.setAttribute("data-stand-detail-id", String(stand.id));
     }
   }
@@ -1485,7 +1477,7 @@ exit 75`;
     const stand = state.data.stands.find(item => item.id === Number(id));
     const singleVm = Number.isInteger(Number(vmTarget?.vmid));
     const targetName = singleVm ? (vmTarget.vmName || `VMID ${vmTarget.vmid}`) : "всех VM стенда";
-    const body = `<form id="password-form"><div class="credential-intro"><span>${icon("lock")}</span><div><h3>${singleVm ? `Только ${escapeHtml(targetName)}` : "Ротация на всех VM"}</h3><p>Новый пароль будет установлен через QEMU Guest Agent и показан только один раз.</p></div></div><div class="form-grid"><label class="field"><span class="field-label">Системный пользователь</span><input class="input mono" name="username" value="root" required><small class="field-hint">Для входа в web UI используется логин root@pam</small></label><label class="field"><span class="field-label">Режим</span><select class="input" id="password-mode"><option value="generate">Сгенерировать пароль из 8 символов</option><option value="custom">Задать вручную</option></select></label><label class="field field--full" id="custom-password-field" hidden><span class="field-label">Новый пароль</span><input class="input mono" type="password" name="password" autocomplete="new-password"><small class="field-hint">Интерфейс не ограничивает длину; технический предел API Proxmox — 1024 символа</small></label></div><div class="alert alert--warning">${icon("alert")} Новый пароль потребуется при следующей авторизации в веб-интерфейсе этой ${singleVm ? "VM" : "группы VM"}.</div></form>`;
+    const body = `<form id="password-form"><div class="credential-intro"><span>${icon("lock")}</span><div><h3>${singleVm ? `Только ${escapeHtml(targetName)}` : "Ротация на всех VM"}</h3><p>Новый пароль будет установлен через QEMU Guest Agent и показан только один раз.</p></div></div><div class="form-grid password-form-grid"><label class="field"><span class="field-label">Системный пользователь</span><input class="input mono" name="username" value="root" required><small class="field-hint">Для входа в web UI используется логин root@pam</small></label><label class="field"><span class="field-label">Режим</span><select class="input" id="password-mode"><option value="generate">Сгенерировать пароль из 8 символов</option><option value="custom">Задать вручную</option></select></label><label class="field field--full" id="custom-password-field" hidden><span class="field-label">Новый пароль</span><input class="input mono" type="password" name="password" autocomplete="new-password"><small class="field-hint">Интерфейс не ограничивает длину; технический предел API Proxmox — 1024 символа</small></label></div><div class="alert alert--warning">${icon("alert")} Новый пароль потребуется при следующей авторизации в веб-интерфейсе этой ${singleVm ? "VM" : "группы VM"}.</div></form>`;
     const footer = `<button class="button" data-close-modal type="button">Отмена</button><button class="button button--primary" type="submit" form="password-form">${icon("lock")}Сменить пароль</button>`;
     showModal({ title: singleVm ? "Сменить пароль VM" : "Сменить пароль стенда", subtitle: singleVm ? `${stand?.name || `Стенд #${id}`} · ${targetName}` : stand?.name || `Стенд #${id}`, body, footer });
     const mode = modalRoot.querySelector("#password-mode");
@@ -1527,14 +1519,54 @@ exit 75`;
     });
   }
 
-  function openCheckDetail(runId) {
+  async function openCheckDetail(runId) {
     const run = state.data.checks.find(item => item.id === Number(runId));
     if (!run) return;
-    const details = run.details || [];
+    const details = Array.isArray(run.details) ? run.details : [];
     const scoreTone = run.status === "running" ? "pending" : run.score >= 90 ? "good" : run.score >= 70 ? "warn" : "bad";
+    let stand = standCredentialCache.get(Number(run.stand_id))?.stand || null;
+    if (!stand?.vms) {
+      try { stand = await api(`/api/stands/${run.stand_id}`, { promptAdmin: false }); }
+      catch { stand = null; }
+    }
+    const requestedVmid = Number(run.vmid);
+    const targetVm = stand?.vms?.find(vm => Number.isInteger(requestedVmid) && Number(vm.vmid) === requestedVmid)
+      || stand?.vms?.find(vm => vm.status === "running") || stand?.vms?.[0] || null;
+    const targetVmid = Number(targetVm?.vmid);
+    const accessUrl = safeAccessUrl(targetVm?.access_url || targetVm?.web_url);
+    const detailOutput = details.map((item, index) => {
+      const status = item.ok ? "OK" : "ОШИБКА";
+      const vmLabel = item.vmid ? ` · VM ${item.vmid}` : targetVmid ? ` · VM ${targetVmid}` : "";
+      const duration = Number(item.duration || 0);
+      const message = String(item.message || (item.ok ? "Условие выполнено" : "Требуется исправление"));
+      return `[${status}] ${index + 1}. ${String(item.name || "Проверка")}${vmLabel} · ${duration} мс\n  ${message}`;
+    }).join("\n\n");
+    const consoleText = [run.output, detailOutput].filter(Boolean).join("\n\n") || "Проверка выполняется…";
     const body = `<div class="check-result-head"><div class="check-score-ring check-score-ring--${scoreTone}" style="--score:${clamp(run.score)}%"><strong>${run.score == null ? "…" : `${run.score}%`}</strong></div><div><h3>${escapeHtml(run.stand_name)}</h3><p>${run.status === "running" ? "Проверка выполняется" : `${run.passed} из ${run.total} проверок пройдено`}</p>${statusChip(run.status === "running" ? "checking" : run.status)}</div></div>
-      <div class="check-result-list">${details.map(item => `<div class="check-result-item ${item.ok ? "is-ok" : "is-failed"}"><span>${icon(item.ok ? "check" : "x")}</span><div><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.message || (item.ok ? "Условие выполнено" : "Требуется исправление"))}</small></div><time>${item.duration || 0} мс</time></div>`).join("") || `<div class="detail-loading"><span class="spinner"></span><p>Ожидаем результаты от VM…</p></div>`}</div><div class="console-output"><div><span class="console-prompt">$</span> demoops check --run ${run.id}</div><pre>${escapeHtml(run.output || "Проверка выполняется…")}</pre></div>`;
-    showModal({ title: "Результаты автопроверки", subtitle: `${run.blueprint_code || ""} · ${dateTime(run.started_at)}`, body, footer: `<button class="button" data-close-modal type="button">Закрыть</button>`, size: "wide" });
+      <div class="console-output console-output--check"><div><span class="console-prompt">$</span> demoops check --run ${run.id}</div><pre>${escapeHtml(consoleText)}</pre></div>`;
+    const footer = `${accessUrl ? `<a class="button button--primary" href="${escapeHtml(accessUrl)}" target="_blank" rel="noopener noreferrer">${icon("external")}Перейти к стенду</a>` : `<button class="button button--primary" type="button" disabled>${icon("external")}Перейти к стенду</button>`}<button class="button" type="button" data-copy-check-password="${Number(run.stand_id)}" data-check-vmid="${Number.isInteger(targetVmid) ? targetVmid : ""}" ${Number.isInteger(targetVmid) ? "" : "disabled"}>${icon("copy")}Скопировать пароль</button><button class="button" data-close-modal type="button">Закрыть</button>`;
+    showModal({ title: "Результаты автопроверки", subtitle: `${run.blueprint_code || ""} · ${dateTime(run.started_at)}`, body, footer, size: "wide" });
+    modalRoot.querySelector("[data-copy-check-password]")?.addEventListener("click", async event => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        let credentials = standCredentialCache.get(Number(run.stand_id))?.credentials;
+        let credential = credentials?.get(targetVmid);
+        if (!(credential?.password || credential?.access_password)) {
+          credentials = normalizeVmCredentials(await api(`/api/stands/${run.stand_id}/credentials`));
+          credential = credentials.get(targetVmid);
+          if (stand) standCredentialCache.set(Number(run.stand_id), { stand, credentials });
+        }
+        const password = credential?.password || credential?.access_password || "";
+        if (!password) throw new Error("Сохранённый пароль этой VM не найден");
+        await copyText(password);
+        toast(`Пароль VM ${targetVmid} скопирован`);
+      } catch (error) {
+        toast(error.message, "error");
+      } finally {
+        if (button.isConnected) button.disabled = false;
+      }
+    });
   }
 
   async function saveAutocheck() {
