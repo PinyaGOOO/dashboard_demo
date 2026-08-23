@@ -902,7 +902,7 @@ exit 75`;
       const steps = ["Сценарий", "VM и сеть", "Доступ", "Проверка"];
       let body = `<div class="wizard-steps">${steps.map((label, index) => `<div class="wizard-step ${model.step === index + 1 ? "is-active" : model.step > index + 1 ? "is-done" : ""}"><span>${model.step > index + 1 ? icon("check") : index + 1}</span><small>${label}</small></div>`).join("")}</div>`;
       if (model.step === 1) {
-        body += `<div class="wizard-section"><h3>Выберите сценарий</h3><p>Шаблон и проверочный код будут закреплены за новым стендом.</p><div class="scenario-picker">${available.map(item => `<button type="button" class="scenario-option ${item.id === Number(model.blueprint_id) ? "is-selected" : ""}" data-wizard-blueprint="${item.id}"><span>${icon(item.category === "Безопасность" ? "shield" : "server")}</span><div><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.code)} · шаблон VMID ${item.template_vmid}</small></div><i>${icon("check")}</i></button>`).join("")}</div>
+        body += `<div class="wizard-section"><h3>Выберите сценарий</h3><p>Шаблон и проверочный код будут закреплены за новым стендом.</p><div class="scenario-picker">${available.map(item => `<button type="button" class="scenario-option ${item.id === Number(model.blueprint_id) ? "is-selected" : ""}" data-wizard-blueprint="${item.id}" aria-pressed="${item.id === Number(model.blueprint_id)}"><span>${icon(item.category === "Безопасность" ? "shield" : "server")}</span><div><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.code)} · шаблон VMID ${item.template_vmid}</small></div><i>${icon("check")}</i></button>`).join("")}</div>
           <section class="deploy-target-card"><label class="option-row deploy-pool-toggle"><span>${icon("server")}</span><span><strong>Добавить в существующий pool</strong><small>${existingPools.length ? "Новые VM будут добавлены в выбранный Proxmox pool; его текущие VM и сам pool останутся нетронутыми." : "Свободных существующих pools сейчас нет."}</small></span><input type="checkbox" id="deploy-use-existing-pool" ${model.use_existing_pool ? "checked" : ""} ${existingPools.length ? "" : "disabled"}></label>
           <div class="form-grid deploy-target-fields"><label class="field"><span class="field-label">Название стенда</span><input class="input" id="deploy-name" value="${escapeHtml(model.name)}" placeholder="Например, ДЭ-24 · Группа 4" required></label><label class="field" id="deploy-new-pool-field" ${model.use_existing_pool ? "hidden" : ""}><span class="field-label">Название нового pool</span><input class="input mono" id="deploy-pool" value="${escapeHtml(model.new_pool_id)}" pattern="[A-Za-z0-9_.-]+" ${model.use_existing_pool ? "" : "required"}><small class="field-hint">Латиница, цифры, точка, дефис</small></label><label class="field" id="deploy-existing-pool-field" ${model.use_existing_pool ? "" : "hidden"}><span class="field-label">Существующий Proxmox pool</span><select class="input mono" id="deploy-existing-pool" ${model.use_existing_pool ? "required" : ""}>${existingPools.map(pool => `<option value="${escapeHtml(pool.pool_id)}" ${pool.pool_id === model.existing_pool_id ? "selected" : ""}>${escapeHtml(pool.pool_id)}${pool.vm_count == null ? "" : ` · ${pool.vm_count} VM`}${pool.stand_count ? ` · стендов Deployer: ${pool.stand_count}` : ""}</option>`).join("")}</select><small class="field-hint">В один общий pool можно добавить несколько стендов; удаляются только VM выбранного стенда</small></label></div></section></div>`;
       } else if (model.step === 2) {
@@ -936,7 +936,17 @@ exit 75`;
       };
       modalRoot.querySelector("#deploy-subnet")?.addEventListener("input", updateIpamPreview);
       modalRoot.querySelector("#deploy-vm-count")?.addEventListener("input", updateIpamPreview);
-      modalRoot.querySelectorAll("[data-wizard-blueprint]").forEach(button => button.addEventListener("click", () => { commitDeployStep(model, false); model.blueprint_id = Number(button.dataset.wizardBlueprint); draw(); }));
+      modalRoot.querySelectorAll("[data-wizard-blueprint]").forEach(button => button.addEventListener("click", () => {
+        const selectedId = Number(button.dataset.wizardBlueprint);
+        if (selectedId === Number(model.blueprint_id)) return;
+        commitDeployStep(model, false);
+        model.blueprint_id = selectedId;
+        modalRoot.querySelectorAll("[data-wizard-blueprint]").forEach(option => {
+          const selected = option === button;
+          option.classList.toggle("is-selected", selected);
+          option.setAttribute("aria-pressed", String(selected));
+        });
+      }));
       modalRoot.querySelector("[data-wizard-back]")?.addEventListener("click", () => { commitDeployStep(model, false); model.step -= 1; draw(); });
       modalRoot.querySelector("[data-wizard-next]")?.addEventListener("click", () => {
         if (!commitDeployStep(model)) return;
