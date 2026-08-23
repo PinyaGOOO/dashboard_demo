@@ -480,11 +480,15 @@ class DashboardService:
             raise ValidationError("Выберите существующий Proxmox pool")
         if self.store.query_one("SELECT id FROM stands WHERE pool_id = ?", (pool_id,)):
             raise ConflictError("Этот pool уже добавлен в дашборд")
-        try:
-            blueprint_id = int(payload.get("blueprint_id"))
-        except (TypeError, ValueError) as exc:
-            raise ValidationError("Выберите сценарий для импортируемого pool") from exc
-        blueprint = self.get_blueprint(blueprint_id)
+        raw_blueprint_id = payload.get("blueprint_id")
+        blueprint_id: int | None = None
+        blueprint: dict[str, Any] | None = None
+        if raw_blueprint_id not in (None, ""):
+            try:
+                blueprint_id = int(raw_blueprint_id)
+            except (TypeError, ValueError) as exc:
+                raise ValidationError("Некорректный сценарий импортируемого pool") from exc
+            blueprint = self.get_blueprint(blueprint_id)
         members = self.gateway.pool_members(pool_id)
         if not members:
             raise ConflictError("В выбранном pool нет QEMU VM, доступных для добавления")
@@ -546,7 +550,10 @@ class DashboardService:
                         (stand_id, int(vm_cursor.lastrowid), address, f"{address}/32",
                          index, now, now),
                     )
-        self.store.add_activity("import", "Существующий pool добавлен", f"{pool_id} · {len(members)} VM · {blueprint['name']}", "success")
+        activity_detail = f"{pool_id} · {len(members)} VM"
+        if blueprint:
+            activity_detail += f" · {blueprint['name']}"
+        self.store.add_activity("import", "Существующий pool добавлен", activity_detail, "success")
         return self.get_stand(stand_id)
 
     def create_stand(self, payload: dict[str, Any]) -> dict[str, Any]:

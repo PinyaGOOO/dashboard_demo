@@ -164,6 +164,18 @@ class ExistingPoolServiceTests(unittest.TestCase):
         self.assertEqual(vmids, [410, 411])
         self.assertEqual(self.service.get_stand(stand["id"])["pool_id"], "shared-lab")
 
+    def test_import_pool_does_not_require_display_metadata_or_blueprint(self) -> None:
+        self.gateway.pool_members.return_value = [
+            {"vmid": 412, "name": "existing-vm", "node": "pve-1", "status": "running"},
+        ]
+
+        stand = self.service.import_pool({"pool_id": "monitor-only", "workspace": "mdk02.01"})
+
+        self.assertEqual(stand["name"], "monitor-only")
+        self.assertEqual(stand["owner"], "Администратор")
+        self.assertEqual(stand["workspace"], "mdk02.01")
+        self.assertIsNone(stand["blueprint_id"])
+
 
 class ExistingPoolGatewaySafetyTests(unittest.TestCase):
     def test_failed_deploy_cleanup_removes_only_matching_new_vm(self) -> None:

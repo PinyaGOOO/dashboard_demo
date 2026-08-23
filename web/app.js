@@ -854,25 +854,16 @@ exit 75`;
 
   function openImportPoolModal() {
     const pools = workspacePools().filter(pool => !pool.imported);
-    const blueprints = state.data.blueprints.filter(item => item.status !== "archived");
     if (!pools.length) { toast("Нет свободных Proxmox pools для добавления", "warning"); return; }
-    if (!blueprints.length) { toast("Сначала создайте сценарий для привязки pool", "warning"); return; }
     const poolOptions = pools.map(pool => `<option value="${escapeHtml(pool.pool_id)}">${escapeHtml(pool.pool_id)}${pool.vm_count == null ? "" : ` · ${pool.vm_count} VM`}${pool.comment ? ` · ${escapeHtml(pool.comment)}` : ""}</option>`).join("");
-    const blueprintOptions = blueprints.map(item => `<option value="${item.id}">${escapeHtml(item.name)} · ${escapeHtml(item.code)}</option>`).join("");
-    const body = `<form id="pool-import-form"><div class="alert alert--info">${icon("info")} Pool и его VM не создаются заново. Дашборд только подключит их к мониторингу и выбранному сценарию.</div><div class="form-grid"><label class="field field--full"><span class="field-label">Существующий Proxmox pool</span><select class="input mono" name="pool_id" id="import-pool-select" required>${poolOptions}</select></label><label class="field"><span class="field-label">Название стенда</span><input class="input" name="name" id="import-pool-name" value="${escapeHtml(pools[0].pool_id)}" required></label><label class="field"><span class="field-label">Сценарий и автопроверка</span><select class="input" name="blueprint_id" required>${blueprintOptions}</select></label><label class="field field--full"><span class="field-label">Ответственный</span><input class="input" name="owner" value="Администратор"></label></div><div class="alert alert--warning">${icon("shield")} При удалении подключённого стенда из дашборда исходный pool и его VM останутся в Proxmox.</div></form>`;
+    const body = `<form id="pool-import-form"><div class="alert alert--info">${icon("info")} Pool и его VM не создаются заново. Дашборд подключит их к мониторингу в текущей рабочей области.</div><div class="form-grid"><label class="field field--full"><span class="field-label">Существующий Proxmox pool</span><select class="input mono" name="pool_id" id="import-pool-select" required>${poolOptions}</select></label></div><div class="alert alert--warning">${icon("shield")} При удалении подключённого pool из дашборда исходный pool и его VM останутся в Proxmox.</div></form>`;
     showModal({ title: "Добавить существующий pool", subtitle: "Подключение ресурсов без клонирования", body, footer: `<button class="button" data-close-modal type="button">Отмена</button><button class="button button--primary" type="submit" form="pool-import-form">${icon("plus")}Добавить pool</button>`, size: "wide" });
     const form = modalRoot.querySelector("#pool-import-form");
-    const select = modalRoot.querySelector("#import-pool-select");
-    const nameInput = modalRoot.querySelector("#import-pool-name");
-    let nameTouched = false;
-    nameInput.addEventListener("input", () => { nameTouched = true; });
-    select.addEventListener("change", () => { if (!nameTouched) nameInput.value = select.value; });
     form.addEventListener("submit", async event => {
       event.preventDefault();
       const submit = modalRoot.querySelector('button[type="submit"]');
       submit.disabled = true;
       const values = Object.fromEntries(new FormData(form).entries());
-      values.blueprint_id = Number(values.blueprint_id);
       values.workspace = state.workspace;
       try {
         const stand = await api("/api/pools/import", { method: "POST", body: values });
