@@ -66,6 +66,31 @@ class ExistingPoolServiceTests(unittest.TestCase):
         )
         thread.return_value.start.assert_called_once_with()
 
+    def test_existing_pool_stand_is_assigned_to_selected_workspace(self) -> None:
+        with patch("dashboard_backend.service.threading.Thread"):
+            stand = self.service.create_stand({
+                "blueprint_id": self.blueprint["id"],
+                "name": "МДК 02.01",
+                "pool_id": "shared-lab",
+                "use_existing_pool": True,
+                "workspace": "mdk02.01",
+                "vm_count": 1,
+            })
+
+        self.assertEqual(stand["workspace"], "mdk02.01")
+        pool = next(item for item in self.service.list_pools() if item["pool_id"] == "shared-lab")
+        self.assertEqual(pool["workspaces"], ["mdk02.01"])
+
+    def test_unknown_workspace_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "рабочая область"):
+            self.service.create_stand({
+                "blueprint_id": self.blueprint["id"],
+                "name": "Неизвестный раздел",
+                "pool_id": "shared-lab",
+                "use_existing_pool": True,
+                "workspace": "other",
+            })
+
     def test_multiple_stands_can_share_explicit_existing_pool(self) -> None:
         with patch("dashboard_backend.service.threading.Thread"):
             first = self.service.create_stand({

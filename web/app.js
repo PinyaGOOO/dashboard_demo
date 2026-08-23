@@ -5,6 +5,11 @@
   const modalRoot = document.querySelector("#modal-root");
   const toastRoot = document.querySelector("#toast-root");
   const routes = ["overview", "stands", "blueprints", "checks", "ipam", "infrastructure"];
+  const workspaces = [
+    { id: "demoexam", name: "Демоэкзамен" },
+    { id: "mdk02.01", name: "МДК02.01" },
+    { id: "mdk.03.02", name: "МДК.03.02" },
+  ];
   const VKLVIKL_BOOTSTRAP_SCRIPT = `#!/usr/bin/env bash
 set -euo pipefail
 
@@ -123,6 +128,7 @@ exit 75`;
   const state = {
     data: null,
     route: getRoute(),
+    workspace: workspaces.some(item => item.id === localStorage.getItem("deployer.workspace")) ? localStorage.getItem("deployer.workspace") : "demoexam",
     standFilter: "all",
     standSearch: "",
     selectedBlueprintId: null,
@@ -167,6 +173,17 @@ exit 75`;
     } catch {
       return "";
     }
+  }
+
+  function workspaceStands() {
+    return (state.data?.stands || []).filter(stand => String(stand.workspace || "demoexam") === state.workspace);
+  }
+
+  function workspacePools() {
+    return (state.data?.pools || []).filter(pool => {
+      const assigned = Array.isArray(pool.workspaces) ? pool.workspaces : [];
+      return !pool.stand_count || assigned.includes(state.workspace);
+    });
   }
 
   function parseIpv4Cidr(value) {
@@ -380,7 +397,15 @@ exit 75`;
   }
 
   function renderOverview() {
-    const { overview, stands, metrics, activity, integration } = state.data;
+    const { metrics, activity, integration } = state.data;
+    const stands = workspaceStands();
+    const scores = stands.filter(stand => stand.check_score != null).map(stand => Number(stand.check_score));
+    const overview = {
+      active_stands: stands.filter(stand => ["running", "resetting"].includes(stand.status)).length,
+      total_stands: stands.length,
+      total_vms: stands.reduce((total, stand) => total + Number(stand.actual_vm_count || 0), 0),
+      average_score: Math.round(scores.reduce((total, score) => total + score, 0) / Math.max(scores.length, 1)),
+    };
     const active = stands.filter(stand => ["running", "provisioning", "resetting"].includes(stand.status));
     const cluster = metrics.cluster;
     const modeLabel = integration.mode === "live" ? "Данные Proxmox в реальном времени" : "Безопасный демонстрационный контур";
@@ -446,7 +471,8 @@ exit 75`;
   }
 
   function renderStands() {
-    let stands = state.data.stands;
+    const workspaceItems = workspaceStands();
+    let stands = workspaceItems;
     if (state.standFilter !== "all") {
       if (state.standFilter === "attention") stands = stands.filter(stand => stand.status === "error" || ["warning", "failed"].includes(stand.check_status));
       else if (state.standFilter === "provisioning") stands = stands.filter(stand => ["provisioning", "resetting"].includes(stand.status));
@@ -457,11 +483,11 @@ exit 75`;
       stands = stands.filter(stand => [stand.name, stand.pool_id, stand.owner, stand.blueprint_name, stand.node].some(value => String(value || "").toLocaleLowerCase("ru").includes(needle)));
     }
     const counts = {
-      all: state.data.stands.length,
-      running: state.data.stands.filter(item => item.status === "running").length,
-      provisioning: state.data.stands.filter(item => ["provisioning", "resetting"].includes(item.status)).length,
-      stopped: state.data.stands.filter(item => item.status === "stopped").length,
-      attention: state.data.stands.filter(item => item.status === "error" || ["warning", "failed"].includes(item.check_status)).length,
+      all: workspaceItems.length,
+      running: workspaceItems.filter(item => item.status === "running").length,
+      provisioning: workspaceItems.filter(item => ["provisioning", "resetting"].includes(item.status)).length,
+      stopped: workspaceItems.filter(item => item.status === "stopped").length,
+      attention: workspaceItems.filter(item => item.status === "error" || ["warning", "failed"].includes(item.check_status)).length,
     };
     app.innerHTML = `<section class="page">
       ${pageHeader("Стенды", "Управляйте пулами, виртуальными машинами, доступами и автопроверками.", `<button class="button button--danger" data-rollback-all-stands ${state.data.stands.length ? "" : "disabled"}>${icon("refresh")}Вернуть все стенды к start</button><button class="button" data-import-pool>${icon("plus")}Добавить существующий pool</button><button class="button button--primary" data-open-deploy>${icon("plus")}Развернуть стенд</button>`)}
@@ -711,7 +737,8 @@ exit 75`;
 
   function updateShell() {
     if (!state.data) return;
-    const count = state.data.stands.filter(stand => ["running", "resetting"].includes(stand.status)).length;
+    const scopedStands = workspaceStands();
+    const count = scopedStands.filter(stand => ["running", "resetting"].includes(stand.status)).length;
     const countNode = document.querySelector("#nav-stands-count");
     countNode.textContent = count;
     countNode.hidden = count === 0;
@@ -723,6 +750,11 @@ exit 75`;
     const sync = document.querySelector("#sync-state .sync-state__copy");
     if (sync) sync.textContent = state.lastUpdated ? `Обновлено ${relativeTime(state.lastUpdated)}` : "Данные актуальны";
     document.querySelector(".notification-dot").hidden = state.data.overview.attention === 0;
+    const selectedWorkspace = workspaces.find(item => item.id === state.workspace) || workspaces[0];
+    const poolCount = new Set(scopedStands.map(stand => stand.pool_id).filter(Boolean)).size;
+    document.querySelector("#workspace-name").textContent = selectedWorkspace.name;
+    document.querySelector("#workspace-meta").textContent = `${poolCount} pool${poolCount === 1 ? "" : "s"} · Proxmox`;
+    document.querySelectorAll("[data-workspace]").forEach(button => button.classList.toggle("is-active", button.dataset.workspace === state.workspace));
   }
 
   async function loadData({ silent = false } = {}) {
@@ -758,7 +790,7 @@ exit 75`;
   function showModal({ title, subtitle = "", body, footer = "", size = "", className = "" }) {
     if (activeStandDetailId !== null && !className.includes("stand-detail-modal")) stopStandDetailPolling();
     activeModalToken += 1;
-    if (!modalRoot.innerHTML) modalReturnFocus = document.activeElement;
+    if (!modalRoot.innerHTML || modalRoot.querySelector(".modal-backdrop.is-closing")) modalReturnFocus = document.activeElement;
     modalRoot.innerHTML = `<div class="modal-backdrop"><section class="modal ${size ? `modal--${size}` : ""} ${className}" role="dialog" aria-modal="true" aria-labelledby="modal-title">
       <header class="modal__header"><div><h2 class="modal__title" id="modal-title">${escapeHtml(title)}</h2>${subtitle ? `<p class="modal__subtitle">${escapeHtml(subtitle)}</p>` : ""}</div><button class="icon-button modal__close" type="button" data-close-modal aria-label="Закрыть">${icon("x")}</button></header>
       <div class="modal__body">${body}</div>${footer ? `<footer class="modal__footer">${footer}</footer>` : ""}</section></div>`;
@@ -774,10 +806,17 @@ exit 75`;
     }
     stopStandDetailPolling();
     activeModalToken += 1;
-    modalRoot.innerHTML = "";
-    document.body.classList.remove("is-modal-open");
-    if (modalReturnFocus?.isConnected) modalReturnFocus.focus();
-    modalReturnFocus = null;
+    const closeToken = activeModalToken;
+    const backdrop = modalRoot.querySelector(".modal-backdrop");
+    const returnFocus = modalReturnFocus;
+    backdrop?.classList.add("is-closing");
+    window.setTimeout(() => {
+      if (activeModalToken !== closeToken) return;
+      modalRoot.innerHTML = "";
+      document.body.classList.remove("is-modal-open");
+      if (returnFocus?.isConnected) returnFocus.focus();
+      modalReturnFocus = null;
+    }, backdrop ? 180 : 0);
   }
 
   function requestAdminToken(manual = false) {
@@ -814,7 +853,7 @@ exit 75`;
   }
 
   function openImportPoolModal() {
-    const pools = (state.data.pools || []).filter(pool => !pool.imported);
+    const pools = workspacePools().filter(pool => !pool.imported);
     const blueprints = state.data.blueprints.filter(item => item.status !== "archived");
     if (!pools.length) { toast("Нет свободных Proxmox pools для добавления", "warning"); return; }
     if (!blueprints.length) { toast("Сначала создайте сценарий для привязки pool", "warning"); return; }
@@ -834,6 +873,7 @@ exit 75`;
       submit.disabled = true;
       const values = Object.fromEntries(new FormData(form).entries());
       values.blueprint_id = Number(values.blueprint_id);
+      values.workspace = state.workspace;
       try {
         const stand = await api("/api/pools/import", { method: "POST", body: values });
         closeModal(); toast(`Pool ${stand.pool_id} добавлен`); await loadData();
@@ -855,7 +895,7 @@ exit 75`;
   function openDeployWizard(preselectedId = null) {
     if (!state.data) { toast("Данные ещё загружаются. Повторите через несколько секунд", "warning"); return; }
     const available = state.data.blueprints.filter(item => item.status === "active");
-    const existingPools = (state.data.pools || []).filter(pool => pool.available_for_deploy == null ? !pool.imported : pool.available_for_deploy);
+    const existingPools = workspacePools().filter(pool => pool.available_for_deploy == null ? !pool.imported : pool.available_for_deploy);
     if (!available.length) { toast("Нет опубликованных сценариев для развёртывания", "warning"); return; }
     const defaultPoolId = `exam-${new Date().toISOString().slice(5, 10).replace("-", "")}-${String(Date.now()).slice(-3)}`;
     const model = {
@@ -864,6 +904,7 @@ exit 75`;
       use_existing_pool: false, existing_pool_id: existingPools[0]?.pool_id || "",
       node: "auto", vm_count: 1, subnet: "", start_ip: "", bridge: "",
       owner: "Администратор",
+      workspace: state.workspace,
     };
     const draw = () => {
       const blueprint = available.find(item => item.id === Number(model.blueprint_id)) || available[0];
@@ -1099,8 +1140,22 @@ exit 75`;
     const footer = `${importedPool ? `<button class="button button--danger" data-delete-pool-stands="${stand.id}" type="button" ${standBusy || !stand.vms.length ? "disabled" : ""}>${icon("trash")}Удалить все стенды</button>` : ""}<button class="button ${importedPool ? "" : "button--danger"}" data-delete-stand="${stand.id}" type="button" ${standBusy ? "disabled" : ""}>${icon(importedPool ? "info" : "trash")}${importedPool ? "Убрать pool из списка" : "Удалить стенд"}</button><button class="button" data-close-modal type="button">Закрыть</button>`;
     const existing = updateExisting ? modalRoot.querySelector(`.modal[data-stand-detail-id="${Number(stand.id)}"]`) : null;
     if (existing) {
+      existing.querySelector(".modal__title").textContent = importedPool ? `Пул ${stand.pool_id}` : "Карточка стенда";
+      const subtitleText = importedPool ? `Подключён к Deployer · ID ${stand.id}` : `ID ${stand.id} · управляется Deployer`;
+      let subtitleNode = existing.querySelector(".modal__subtitle");
+      if (!subtitleNode) {
+        subtitleNode = document.createElement("p");
+        subtitleNode.className = "modal__subtitle";
+        existing.querySelector(".modal__header > div")?.append(subtitleNode);
+      }
+      subtitleNode.textContent = subtitleText;
       const bodyNode = existing.querySelector(".modal__body");
-      const footerNode = existing.querySelector(".modal__footer");
+      let footerNode = existing.querySelector(".modal__footer");
+      if (!footerNode) {
+        footerNode = document.createElement("footer");
+        footerNode.className = "modal__footer";
+        existing.append(footerNode);
+      }
       const scrollTop = bodyNode?.scrollTop || 0;
       const focused = document.activeElement;
       const focusSelector = focused?.dataset?.vmAction
@@ -1114,6 +1169,9 @@ exit 75`;
       if (footerNode) footerNode.innerHTML = footer;
       if (bodyNode) bodyNode.scrollTop = scrollTop;
       if (focusSelector) existing.querySelector(focusSelector)?.focus({ preventScroll: true });
+      if (!existing.dataset.hydrated) {
+        window.setTimeout(() => { if (existing.isConnected) existing.dataset.hydrated = "true"; }, 340);
+      }
     } else {
       activeStandDetailId = Number(stand.id);
       showModal({ title: importedPool ? `Пул ${stand.pool_id}` : "Карточка стенда", subtitle: importedPool ? `Подключён к Deployer · ID ${stand.id}` : `ID ${stand.id} · управляется Deployer`, body, footer, size: "large", className: "stand-detail-modal" });
@@ -1125,6 +1183,7 @@ exit 75`;
     stopStandDetailPolling();
     activeStandDetailId = Number(id);
     showModal({ title: "Загрузка стенда…", body: `<div class="detail-loading"><span class="spinner"></span><p>Получаем машины и доступы</p></div>`, size: "large", className: "stand-detail-modal" });
+    modalRoot.querySelector(".modal")?.setAttribute("data-stand-detail-id", String(id));
     const requestToken = activeModalToken;
     try {
       const stand = await api(`/api/stands/${id}`);
@@ -1140,7 +1199,7 @@ exit 75`;
         credentialError = error.message;
       }
       if (!requestCredentials && (requestToken !== activeModalToken || activeStandDetailId !== Number(id) || !modalRoot.innerHTML)) return;
-      renderStandDetailModal(stand, credentials, credentialState, credentialError);
+      renderStandDetailModal(stand, credentials, credentialState, credentialError, { updateExisting: true });
       if (standNeedsLivePolling(stand)) scheduleStandDetailPoll(Number(id), credentials, credentialState, credentialError);
     } catch (error) {
       if (!requestCredentials && requestToken !== activeModalToken) return;
@@ -1593,6 +1652,13 @@ exit 75`;
   }
 
   document.addEventListener("click", async event => {
+    if (!event.target.closest(".sidebar__context")) {
+      const workspaceMenu = document.querySelector("#workspace-menu");
+      const workspaceSwitcher = document.querySelector("#workspace-switcher");
+      if (workspaceMenu) workspaceMenu.hidden = true;
+      workspaceSwitcher?.classList.remove("is-open");
+      workspaceSwitcher?.setAttribute("aria-expanded", "false");
+    }
     const target = event.target.closest("button, a, tr");
     if (!target) return;
     if (target.matches(".nav-link[data-route], .brand[data-route]")) { event.preventDefault(); navigate(target.dataset.route); }
@@ -1673,6 +1739,25 @@ exit 75`;
   document.querySelector("#quick-create")?.addEventListener("click", () => openDeployWizard());
   document.querySelector("#global-refresh")?.addEventListener("click", () => loadData());
   document.querySelector("#operator-settings")?.addEventListener("click", () => requestAdminToken(true));
+  document.querySelector("#workspace-switcher")?.addEventListener("click", event => {
+    const menu = document.querySelector("#workspace-menu");
+    const opening = menu.hidden;
+    menu.hidden = !opening;
+    event.currentTarget.classList.toggle("is-open", opening);
+    event.currentTarget.setAttribute("aria-expanded", String(opening));
+  });
+  document.querySelector("#workspace-menu")?.addEventListener("click", event => {
+    const option = event.target.closest("[data-workspace]");
+    if (!option) return;
+    state.workspace = option.dataset.workspace;
+    localStorage.setItem("deployer.workspace", state.workspace);
+    state.standFilter = "all";
+    state.standSearch = "";
+    document.querySelector("#workspace-menu").hidden = true;
+    document.querySelector("#workspace-switcher").classList.remove("is-open");
+    document.querySelector("#workspace-switcher").setAttribute("aria-expanded", "false");
+    render();
+  });
   document.querySelector("#sidebar-toggle")?.addEventListener("click", event => { document.body.classList.toggle("sidebar-open"); event.currentTarget.setAttribute("aria-expanded", String(document.body.classList.contains("sidebar-open"))); });
   document.querySelector("#sidebar-close")?.addEventListener("click", closeSidebar);
   document.querySelector("#sidebar-scrim")?.addEventListener("click", closeSidebar);

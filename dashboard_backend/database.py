@@ -99,6 +99,7 @@ class DashboardStore:
             progress INTEGER NOT NULL DEFAULT 0,
             node TEXT NOT NULL DEFAULT '',
             pool_id TEXT NOT NULL DEFAULT '',
+            workspace TEXT NOT NULL DEFAULT 'demoexam',
             owner TEXT NOT NULL DEFAULT '',
             participants INTEGER NOT NULL DEFAULT 0,
             max_participants INTEGER NOT NULL DEFAULT 12,
@@ -211,6 +212,8 @@ class DashboardStore:
                 connection.execute("ALTER TABLE stands ADD COLUMN last_error TEXT NOT NULL DEFAULT ''")
             if "ip_start" not in stand_columns:
                 connection.execute("ALTER TABLE stands ADD COLUMN ip_start TEXT NOT NULL DEFAULT ''")
+            if "workspace" not in stand_columns:
+                connection.execute("ALTER TABLE stands ADD COLUMN workspace TEXT NOT NULL DEFAULT 'demoexam'")
             vm_columns = {row[1] for row in connection.execute("PRAGMA table_info(stand_vms)")}
             if "credential_username" not in vm_columns:
                 connection.execute("ALTER TABLE stand_vms ADD COLUMN credential_username TEXT NOT NULL DEFAULT 'root'")

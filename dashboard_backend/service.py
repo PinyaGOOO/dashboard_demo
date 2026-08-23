@@ -121,7 +121,7 @@ class DashboardService:
     def list_pools(self) -> list[dict[str, Any]]:
         tracked: dict[str, list[dict[str, Any]]] = {}
         for row in self.store.query_all(
-            "SELECT id, pool_id, origin FROM stands WHERE pool_id != '' ORDER BY id"
+            "SELECT id, pool_id, origin, workspace FROM stands WHERE pool_id != '' ORDER BY id"
         ):
             tracked.setdefault(str(row["pool_id"]), []).append(row)
         pools = self.gateway.list_pools()
@@ -133,6 +133,7 @@ class DashboardService:
             pool["stand_id"] = stand_ids[0] if stand_ids else None
             pool["stand_ids"] = stand_ids
             pool["stand_count"] = len(stand_ids)
+            pool["workspaces"] = sorted({str(row.get("workspace") or "demoexam") for row in stands})
             # A pool selected explicitly as an external/shared destination may
             # hold multiple independent Deployer stands. Pools wholly imported
             # into one card or created/owned by Deployer remain exclusive.
@@ -466,6 +467,13 @@ class DashboardService:
             value = f"exam-{int(time.time())}"
         return value[:48]
 
+    @staticmethod
+    def _workspace(value: Any) -> str:
+        workspace = str(value or "demoexam").strip().lower()
+        if workspace not in {"demoexam", "mdk02.01", "mdk.03.02"}:
+            raise ValidationError("Неизвестная рабочая область")
+        return workspace
+
     def import_pool(self, payload: dict[str, Any]) -> dict[str, Any]:
         pool_id = str(payload.get("pool_id", "")).strip()
         if not pool_id or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", pool_id):
@@ -491,6 +499,7 @@ class DashboardService:
             raise ConflictError(f"Некоторые VM уже закреплены за другим стендом: {values}")
         name = str(payload.get("name", "")).strip() or pool_id
         owner = str(payload.get("owner", "Администратор")).strip() or "Администратор"
+        workspace = self._workspace(payload.get("workspace"))
         statuses = {str(member.get("status", "stopped")) for member in members}
         status = "running" if "running" in statuses else "stopped"
         nodes = sorted({str(member.get("node", "")) for member in members if member.get("node")})
@@ -511,11 +520,11 @@ class DashboardService:
                     raise ConflictError(f"IP {address} уже зарезервирован другим стендом")
             cursor = connection.execute(
                 """INSERT INTO stands
-                (name, blueprint_id, status, progress, node, pool_id, owner,
+                (name, blueprint_id, status, progress, node, pool_id, workspace, owner,
                  vm_count, cpu, ram, disk, ip_range, check_status, origin,
                  created_at, updated_at)
-                VALUES (?, ?, ?, 100, ?, ?, ?, ?, ?, ?, 0, '', 'idle', 'imported', ?, ?)""",
-                (name, blueprint_id, status, node_label, pool_id, owner,
+                VALUES (?, ?, ?, 100, ?, ?, ?, ?, ?, ?, ?, 0, '', 'idle', 'imported', ?, ?)""",
+                (name, blueprint_id, status, node_label, pool_id, workspace, owner,
                  len(members), cpu, ram, now, now),
             )
             stand_id = int(cursor.lastrowid)
@@ -601,6 +610,7 @@ class DashboardService:
         now = utc_now()
         requested_node = str(payload.get("node", "auto"))
         owner = str(payload.get("owner", "Администратор"))
+        workspace = self._workspace(payload.get("workspace"))
         # The stand, placeholder VM rows and addresses are committed together.
         # Concurrent requests therefore cannot reserve the same address.
         with self.store.transaction() as connection:
@@ -619,11 +629,11 @@ class DashboardService:
             )
             cursor = connection.execute(
                 """INSERT INTO stands
-                (name, blueprint_id, status, progress, node, pool_id, owner,
+                (name, blueprint_id, status, progress, node, pool_id, workspace, owner,
                  vm_count, cpu, ram, disk, ip_range, ip_start, check_status,
                  expires_at, origin, created_at, updated_at)
-                VALUES (?, ?, 'provisioning', 4, ?, ?, ?, ?, 0, 0, 0, ?, ?, 'idle', ?, ?, ?, ?)""",
-                (name, blueprint_id, requested_node, pool_id, owner, vm_count,
+                VALUES (?, ?, 'provisioning', 4, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, 'idle', ?, ?, ?, ?)""",
+                (name, blueprint_id, requested_node, pool_id, workspace, owner, vm_count,
                  subnet, canonical_start, None,
                  "existing" if use_existing_pool else "deployed", now, now),
             )

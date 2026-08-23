@@ -78,11 +78,16 @@
 
       <div class="sidebar__context">
         <span class="context-label">Рабочая область</span>
-        <button class="context-switcher" type="button" aria-label="Текущий кластер">
+        <button class="context-switcher" id="workspace-switcher" type="button" aria-label="Выбрать рабочую область" aria-expanded="false">
           <span class="context-icon"><svg><use href="#icon-server"></use></svg></span>
-          <span class="context-copy"><strong>Демоэкзамен</strong><small>Proxmox Cluster</small></span>
+          <span class="context-copy"><strong id="workspace-name">Демоэкзамен</strong><small id="workspace-meta">Proxmox Cluster</small></span>
           <svg class="context-arrow"><use href="#icon-chevron"></use></svg>
         </button>
+        <div class="context-menu" id="workspace-menu" hidden>
+          <button type="button" data-workspace="demoexam"><strong>Демоэкзамен</strong><small>Основные экзаменационные pools</small></button>
+          <button type="button" data-workspace="mdk02.01"><strong>МДК02.01</strong><small>Отдельные pools модуля</small></button>
+          <button type="button" data-workspace="mdk.03.02"><strong>МДК.03.02</strong><small>Отдельные pools модуля</small></button>
+        </div>
       </div>
 
       <nav class="sidebar__nav" aria-label="Разделы панели">
