@@ -1130,8 +1130,8 @@ exit 75`;
     standCredentialCache.set(Number(stand.id), { stand, credentials });
     const credentialCount = stand.vms.filter(vm => credentials.get(Number(vm.vmid))?.password || credentials.get(Number(vm.vmid))?.access_password).length;
     const credentialControl = credentialState === "loaded"
-      ? `<button class="button button--small" type="button" data-copy-stand-access="${stand.id}" ${credentialCount ? "" : "disabled"}>${icon("copy")}Все IP, логины и пароли</button>`
-      : `<button class="button button--small" type="button" data-load-stand-credentials="${stand.id}">${icon("lock")}Показать логины и пароли</button><button class="button button--small" type="button" data-copy-stand-access="${stand.id}" ${stand.vms.some(vm => Number(vm.vmid) > 0) ? "" : "disabled"}>${icon("copy")}Скопировать все доступы</button>`;
+      ? `<button class="button button--small" type="button" data-copy-stand-access="${stand.id}" ${credentialCount ? "" : "disabled"}>${icon("copy")}Все IP, логины и пароли</button><button class="button button--small" type="button" data-print-stand-access="${stand.id}" ${credentialCount ? "" : "disabled"}>${icon("printer")}Распечатать доступы</button>`
+      : `<button class="button button--small" type="button" data-load-stand-credentials="${stand.id}">${icon("lock")}Показать логины и пароли</button><button class="button button--small" type="button" data-copy-stand-access="${stand.id}" ${stand.vms.some(vm => Number(vm.vmid) > 0) ? "" : "disabled"}>${icon("copy")}Скопировать все доступы</button><button class="button button--small" type="button" data-print-stand-access="${stand.id}" ${stand.vms.some(vm => Number(vm.vmid) > 0) ? "" : "disabled"}>${icon("printer")}Распечатать доступы</button>`;
     const credentialNotice = credentialState === "locked"
       ? `<div class="alert alert--info">${icon("info")}<div><strong>Пароли защищены административным токеном.</strong><br>Нажмите «Показать логины и пароли», чтобы загрузить их для этого стенда.</div></div>`
       : credentialState === "error" ? `<div class="alert alert--warning">${icon("alert")}<div><strong>Не удалось получить сохранённые доступы.</strong><br>${escapeHtml(credentialError || "Можно сменить пароль отдельно у нужной VM.")}</div></div>` : "";
@@ -1165,6 +1165,7 @@ exit 75`;
         : focused?.dataset?.standAction ? `[data-stand-action="${focused.dataset.standAction}"]`
         : focused?.dataset?.loadStandCredentials ? `[data-load-stand-credentials="${focused.dataset.loadStandCredentials}"]`
         : focused?.dataset?.copyStandAccess ? `[data-copy-stand-access="${focused.dataset.copyStandAccess}"]`
+        : focused?.dataset?.printStandAccess ? `[data-print-stand-access="${focused.dataset.printStandAccess}"]`
         : focused?.dataset?.deleteStand ? `[data-delete-stand="${focused.dataset.deleteStand}"]`
         : focused?.dataset?.editStand ? `[data-edit-stand="${focused.dataset.editStand}"]` : "";
       if (bodyNode) bodyNode.innerHTML = body;
@@ -1764,18 +1765,62 @@ exit 75`;
     document.querySelector("#sidebar-toggle")?.setAttribute("aria-expanded", "false");
   }
 
-  function standAccessText(standId) {
+  function standAccessRows(standId) {
     const cached = standCredentialCache.get(Number(standId));
-    if (!cached) return { text: "", complete: 0, total: 0 };
+    if (!cached) return { stand: null, rows: [], complete: 0, total: 0 };
     let complete = 0;
-    const lines = (cached.stand.vms || []).map(vm => {
+    const rows = (cached.stand.vms || []).map(vm => {
       const credential = cached.credentials.get(Number(vm.vmid));
       const username = webUsername(credential, vm);
       const password = credential?.password || credential?.access_password || "пароль не выдан";
       if (password !== "пароль не выдан") complete += 1;
-      return `${vm.ip || "IP не назначен"} | ${username} | ${password}`;
+      return {
+        name: vm.name || `VM ${vm.vmid || "—"}`,
+        vmid: vm.vmid || "—",
+        ip: vm.ip || "IP не назначен",
+        username,
+        password,
+      };
     });
-    return { text: lines.join("\n"), complete, total: lines.length };
+    return { stand: cached.stand, rows, complete, total: rows.length };
+  }
+
+  function standAccessText(standId) {
+    const access = standAccessRows(standId);
+    return {
+      text: access.rows.map(row => `${row.ip} | ${row.username} | ${row.password}`).join("\n"),
+      complete: access.complete,
+      total: access.total,
+    };
+  }
+
+  function printStandAccessSheet(standId) {
+    const access = standAccessRows(standId);
+    if (!access.stand || !access.rows.length) {
+      toast("Для этого стенда пока нет VM", "warning");
+      return;
+    }
+    const generatedAt = new Intl.DateTimeFormat("ru-RU", {
+      dateStyle: "long", timeStyle: "short",
+    }).format(new Date());
+    const rows = access.rows.map(row => `<tr><td><strong>${escapeHtml(row.name)}</strong><small>VMID ${escapeHtml(row.vmid)}</small></td><td class="mono">${escapeHtml(row.ip)}</td><td class="mono">${escapeHtml(row.username)}</td><td class="mono password">${escapeHtml(row.password)}</td></tr>`).join("");
+    const frame = document.createElement("iframe");
+    frame.className = "credential-print-frame";
+    frame.title = "Печатная форма доступов";
+    document.body.append(frame);
+    const printDocument = frame.contentDocument;
+    printDocument.open();
+    printDocument.write(`<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Доступы — ${escapeHtml(access.stand.name)}</title><style>
+      @page{size:A4 portrait;margin:14mm}*{box-sizing:border-box}body{margin:0;color:#171b21;font:12px/1.45 Arial,sans-serif}header{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;padding-bottom:14px;border-bottom:3px solid #f36b21}h1{margin:0;font-size:24px;line-height:1.15}header p{margin:5px 0 0;color:#667080}.meta{text-align:right;color:#667080}.meta strong{display:block;color:#171b21;font-size:13px}table{width:100%;margin-top:20px;border-collapse:collapse;table-layout:fixed}th{padding:9px 10px;color:#596270;background:#f1f3f5;border:1px solid #d8dde3;font-size:10px;text-align:left;text-transform:uppercase}td{padding:11px 10px;border:1px solid #d8dde3;vertical-align:top;overflow-wrap:anywhere}th:nth-child(1){width:27%}th:nth-child(2){width:20%}th:nth-child(3){width:20%}th:nth-child(4){width:33%}td strong,td small{display:block}td small{margin-top:3px;color:#7a8491;font-size:10px}.mono{font-family:"Courier New",monospace;font-size:12px}.password{font-weight:700;letter-spacing:.02em}.notice{margin-top:18px;padding:10px 12px;color:#754c00;background:#fff7df;border:1px solid #ead59b;border-radius:6px;font-size:10px}footer{margin-top:16px;color:#8a929c;font-size:9px;text-align:right}tr{break-inside:avoid}
+    </style></head><body><header><div><h1>${escapeHtml(access.stand.name)}</h1><p>Доступы к виртуальным машинам</p></div><div class="meta"><strong>Pool ${escapeHtml(access.stand.pool_id || "—")}</strong>${escapeHtml(generatedAt)}</div></header><table><thead><tr><th>Виртуальная машина</th><th>IP-адрес</th><th>Логин</th><th>Пароль</th></tr></thead><tbody>${rows}</tbody></table><div class="notice"><strong>Конфиденциально.</strong> Лист содержит пароли. Храните его в защищённом месте и уничтожьте после использования.</div><footer>Deployer · ${access.rows.length} VM</footer></body></html>`);
+    printDocument.close();
+    const cleanup = () => window.setTimeout(() => frame.remove(), 500);
+    frame.contentWindow.addEventListener("afterprint", cleanup, { once: true });
+    window.setTimeout(() => {
+      frame.contentWindow.focus();
+      frame.contentWindow.print();
+    }, 100);
+    window.setTimeout(() => { if (frame.isConnected) frame.remove(); }, 60000);
   }
 
   document.addEventListener("click", async event => {
@@ -1826,6 +1871,25 @@ exit 75`;
     else if (target.dataset.editStand) openStandEditor(Number(target.dataset.editStand));
     else if (target.dataset.deletePoolStands) confirmDeletePoolStands(Number(target.dataset.deletePoolStands));
     else if (target.dataset.deleteStand) confirmDeleteStand(Number(target.dataset.deleteStand));
+    else if (target.matches("[data-print-stand-access]")) {
+      const standId = Number(target.dataset.printStandAccess);
+      let access = standAccessRows(standId);
+      if (!access.total || access.complete < access.total) {
+        try {
+          const cached = standCredentialCache.get(standId);
+          const stand = cached?.stand || await api(`/api/stands/${standId}`, { promptAdmin: false });
+          const credentials = normalizeVmCredentials(await api(`/api/stands/${standId}/credentials`));
+          standCredentialCache.set(standId, { stand, credentials });
+          access = standAccessRows(standId);
+          if (activeStandDetailId === standId) renderStandDetailModal(stand, credentials, "loaded", "", { updateExisting: true });
+        } catch (error) {
+          toast(error.message, "error");
+          return;
+        }
+      }
+      printStandAccessSheet(standId);
+      if (access.complete < access.total) toast(`На печатном листе отсутствуют пароли ${access.total - access.complete} VM`, "warning");
+    }
     else if (target.matches("[data-copy-stand-access]")) {
       const standId = Number(target.dataset.copyStandAccess);
       let access = standAccessText(standId);

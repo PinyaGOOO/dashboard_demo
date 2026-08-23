@@ -863,6 +863,7 @@ code { padding: 2px 5px; color: #365d86; background: rgba(255,255,255,.6); borde
 .credential-state { display: inline-flex; min-height: 34px; align-items: center; gap: 6px; padding: 0 10px; color: var(--ink-muted); background: #fff; border: 1px solid var(--line); border-radius: 7px; font-size: 12px; font-weight: 650; }
 .credential-state svg { width: 14px; height: 14px; }
 .credential-state--ready { color: var(--green); background: var(--green-soft); border-color: #cde8dc; }
+.credential-print-frame { position: fixed; right: 0; bottom: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; border: 0; }
 .vm-list { display: grid; }
 .vm-row { display: grid; grid-template-columns: 9px minmax(185px, .75fr) minmax(300px, 1.15fr) minmax(235px, .8fr); min-height: 122px; align-items: center; gap: 15px; padding: 14px; border-bottom: 1px solid var(--line); animation: stand-card-in 300ms cubic-bezier(.2,.8,.2,1) both; }
 .vm-row:nth-child(2) { animation-delay: 30ms; }
