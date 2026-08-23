@@ -1499,23 +1499,45 @@ exit 75`;
     }
   }
 
-  function openStandEditor(id) {
-    const stand = state.data.stands.find(item => item.id === Number(id));
-    if (!stand) return;
-    const body = `<form id="stand-edit-form" class="form-grid">
-      <label class="field field--full"><span class="field-label">Название стенда</span><input class="input" name="name" value="${escapeHtml(stand.name)}" required></label>
-      <label class="field"><span class="field-label">Ответственный</span><input class="input" name="owner" value="${escapeHtml(stand.owner)}"></label>
-      <label class="field"><span class="field-label">Диапазон IPAM</span><input class="input mono" name="ip_range" value="${escapeHtml(stand.ip_range)}" readonly><small class="field-hint">Адреса уже зарезервированы. Для другой сети разверните новый стенд.</small></label>
-      <div class="field field--full"><div class="alert alert--info">${icon("info")} Стенд работает бессрочно. Можно изменить название и ответственного; адреса VM остаются под управлением IPAM.</div></div>
+  async function openStandEditor(id) {
+    let stand = standCredentialCache.get(Number(id))?.stand;
+    if (!stand?.vms) {
+      try { stand = await api(`/api/stands/${id}`, { promptAdmin: false }); }
+      catch (error) { toast(error.message, "error"); return; }
+    }
+    const editableVms = stand.vms.filter(vm => Number.isInteger(Number(vm.vmid)) && Number(vm.vmid) > 0);
+    const vmFields = editableVms.map(vm => `<label class="stand-ip-row"><span><strong>${escapeHtml(vm.name)}</strong><small class="mono">VMID ${Number(vm.vmid)} · ${escapeHtml(vm.node || stand.node || "авто")}</small></span><span class="field"><span class="field-label">IPv4 для Deployer</span><input class="input mono" data-stand-vm-ip data-vmid="${Number(vm.vmid)}" value="${escapeHtml(vm.ip || "")}" inputmode="decimal" placeholder="Например, 10.39.11.2"></span></label>`).join("");
+    const body = `<form id="stand-edit-form" class="stand-editor-form">
+      <div class="form-grid stand-editor-main"><label class="field"><span class="field-label">Название стенда</span><input class="input" name="name" value="${escapeHtml(stand.name)}" required></label><label class="field"><span class="field-label">Ответственный</span><input class="input" name="owner" value="${escapeHtml(stand.owner)}"></label></div>
+      <section class="stand-editor-section"><div class="stand-editor-section__head"><div><h3>Адреса виртуальных машин</h3><p>Эти адреса использует только Deployer для перехода к стенду, мониторинга и автопроверки.</p></div>${stand.ip_range ? `<span class="mono">IPAM ${escapeHtml(stand.ip_range)}</span>` : ""}</div><div class="stand-ip-list">${vmFields || `<p class="muted-block">У стенда пока нет созданных VM</p>`}</div></section>
+      <div class="alert alert--info">${icon("info")} Изменения не перенастраивают сеть внутри VM и не отправляются в Proxmox. Укажите фактический уникальный IP, по которому Deployer должен обращаться к машине.</div>
     </form>`;
-    showModal({ title: "Параметры стенда", subtitle: stand.pool_id, body, footer: `<button class="button" data-close-modal type="button">Отмена</button><button class="button button--primary" type="submit" form="stand-edit-form">${icon("check")}Сохранить</button>` });
+    showModal({ title: "Параметры стенда", subtitle: stand.pool_id, body, footer: `<button class="button" data-close-modal type="button">Отмена</button><button class="button button--primary" type="submit" form="stand-edit-form">${icon("check")}Сохранить</button>`, size: "wide" });
     modalRoot.querySelector("#stand-edit-form").addEventListener("submit", async event => {
       event.preventDefault();
-      const values = Object.fromEntries(new FormData(event.currentTarget).entries());
+      const form = event.currentTarget;
+      const values = Object.fromEntries(new FormData(form).entries());
+      values.vm_ips = {};
+      const addresses = [];
+      for (const input of form.querySelectorAll("[data-stand-vm-ip]")) {
+        const address = input.value.trim();
+        if (address && !parseIpv4Cidr(`${address}/32`)) {
+          input.classList.add("is-invalid"); input.focus(); toast(`Некорректный IPv4 для VM ${input.dataset.vmid}`, "warning"); return;
+        }
+        input.classList.remove("is-invalid");
+        values.vm_ips[input.dataset.vmid] = address;
+        if (address) addresses.push(address);
+      }
+      if (new Set(addresses).size !== addresses.length) {
+        toast("Одинаковый IP нельзя указать для нескольких VM", "warning"); return;
+      }
+      const submit = modalRoot.querySelector('button[type="submit"]');
+      submit.disabled = true;
       try {
         await api(`/api/stands/${id}`, { method: "PATCH", body: values });
-        closeModal(); toast("Параметры стенда обновлены"); await loadData();
-      } catch (error) { toast(error.message, "error"); }
+        standCredentialCache.delete(Number(id));
+        closeModal(); toast("Параметры стенда и адреса Deployer обновлены"); await loadData();
+      } catch (error) { submit.disabled = false; toast(error.message, "error"); }
     });
   }
 

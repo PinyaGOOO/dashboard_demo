@@ -176,6 +176,51 @@ class ExistingPoolServiceTests(unittest.TestCase):
         self.assertEqual(stand["workspace"], "mdk02.01")
         self.assertIsNone(stand["blueprint_id"])
 
+    def test_deployer_only_vm_ip_override_updates_metadata_and_ipam(self) -> None:
+        self.gateway.pool_members.return_value = [
+            {"vmid": 420, "name": "existing-vm", "node": "pve-1", "status": "running", "ip": "172.31.250.10"},
+        ]
+        stand = self.service.import_pool({"pool_id": "metadata-ip"})
+        gateway_calls_before_update = list(self.gateway.method_calls)
+
+        updated = self.service.update_stand(stand["id"], {
+            "name": "Новый адрес Deployer",
+            "vm_ips": {"420": "172.31.250.11"},
+        })
+
+        self.assertEqual(updated["vms"][0]["ip"], "172.31.250.11")
+        reservation = self.store.query_one(
+            "SELECT address FROM ipam_reservations WHERE stand_id = ?", (stand["id"],),
+        )
+        self.assertEqual(reservation["address"], "172.31.250.11")
+        self.assertEqual(self.gateway.method_calls, gateway_calls_before_update)
+
+    def test_deployer_only_vm_ip_override_rejects_address_from_another_stand(self) -> None:
+        self.gateway.pool_members.return_value = [
+            {"vmid": 421, "name": "first", "node": "pve-1", "status": "running", "ip": "172.31.251.10"},
+        ]
+        first = self.service.import_pool({"pool_id": "first-ip-pool"})
+        self.gateway.pool_members.return_value = [
+            {"vmid": 422, "name": "second", "node": "pve-2", "status": "running", "ip": "172.31.251.11"},
+        ]
+        second = self.service.import_pool({"pool_id": "second-ip-pool"})
+
+        with self.assertRaisesRegex(ConflictError, "уже используется"):
+            self.service.update_stand(first["id"], {
+                "vm_ips": {"421": second["vms"][0]["ip"]},
+            })
+
+        self.assertEqual(self.service.get_stand(first["id"])["vms"][0]["ip"], "172.31.251.10")
+
+    def test_deployer_only_vm_ip_override_validates_ipv4(self) -> None:
+        self.gateway.pool_members.return_value = [
+            {"vmid": 423, "name": "invalid-ip-test", "node": "pve-1", "status": "running", "ip": "172.31.252.10"},
+        ]
+        stand = self.service.import_pool({"pool_id": "invalid-ip-pool"})
+
+        with self.assertRaisesRegex(ValidationError, "некорректный IPv4"):
+            self.service.update_stand(stand["id"], {"vm_ips": {"423": "999.1.1.1"}})
+
 
 class ExistingPoolGatewaySafetyTests(unittest.TestCase):
     def test_failed_deploy_cleanup_removes_only_matching_new_vm(self) -> None:

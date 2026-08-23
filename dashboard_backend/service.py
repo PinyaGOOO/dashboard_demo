@@ -707,14 +707,104 @@ class DashboardService:
         data = {key: payload[key] for key in allowed if key in payload}
         if "name" in data and not str(data["name"]).strip():
             raise ValidationError("Название стенда не может быть пустым")
-        if not data:
+        raw_vm_ips = payload.get("vm_ips")
+        vm_ip_updates: dict[int, str] | None = None
+        if raw_vm_ips is not None:
+            if not isinstance(raw_vm_ips, dict):
+                raise ValidationError("Адреса VM должны быть переданы как объект VMID → IPv4")
+            vm_ip_updates = {}
+            for raw_vmid, raw_ip in raw_vm_ips.items():
+                try:
+                    vmid = int(raw_vmid)
+                except (TypeError, ValueError) as exc:
+                    raise ValidationError("Некорректный VMID в списке адресов") from exc
+                text = str(raw_ip or "").strip()
+                address = self._canonical_ip(text)
+                if text and not address:
+                    raise ValidationError(f"Для VM {vmid} указан некорректный IPv4-адрес")
+                vm_ip_updates[vmid] = address
+        if not data and vm_ip_updates is None:
             return stand
-        data["updated_at"] = utc_now()
-        self.store.execute(
-            f"UPDATE stands SET {', '.join(f'{key} = ?' for key in data)} WHERE id = ?",
-            tuple(data.values()) + (stand_id,),
-        )
-        self.store.add_activity("edit", "Параметры стенда обновлены", str(data.get("name", stand["name"])), "success")
+
+        now = utc_now()
+        with self.store.transaction() as connection:
+            vm_rows = connection.execute(
+                "SELECT * FROM stand_vms WHERE stand_id = ? ORDER BY id", (stand_id,),
+            ).fetchall()
+            by_vmid = {
+                int(row["vmid"]): row for row in vm_rows if row["vmid"] is not None
+            }
+            if vm_ip_updates is not None:
+                unknown = sorted(set(vm_ip_updates) - set(by_vmid))
+                if unknown:
+                    raise ValidationError(
+                        "VM не принадлежат этому стенду: " + ", ".join(map(str, unknown))
+                    )
+                desired = {
+                    vmid: self._canonical_ip(row["ip"]) for vmid, row in by_vmid.items()
+                }
+                desired.update(vm_ip_updates)
+                addresses = [address for address in desired.values() if address]
+                if len(addresses) != len(set(addresses)):
+                    raise ConflictError("В одном стенде нельзя назначить одинаковый IP нескольким VM")
+                occupied: set[str] = set()
+                for row in connection.execute(
+                    "SELECT ip FROM stand_vms WHERE stand_id != ? AND trim(ip) != ''", (stand_id,),
+                ).fetchall():
+                    address = self._canonical_ip(row["ip"])
+                    if address:
+                        occupied.add(address)
+                occupied.update(
+                    str(row["address"])
+                    for row in connection.execute(
+                        "SELECT address FROM ipam_reservations WHERE stand_id != ?", (stand_id,),
+                    ).fetchall()
+                )
+                conflicts = sorted(set(addresses) & occupied, key=ipaddress.ip_address)
+                if conflicts:
+                    raise ConflictError("IP уже используется другим стендом: " + ", ".join(conflicts))
+
+                reservations = connection.execute(
+                    "SELECT * FROM ipam_reservations WHERE stand_id = ? ORDER BY vm_index", (stand_id,),
+                ).fetchall()
+                reservations_by_vm = {
+                    int(row["stand_vm_id"]): row
+                    for row in reservations if row["stand_vm_id"] is not None
+                }
+                connection.execute("DELETE FROM ipam_reservations WHERE stand_id = ?", (stand_id,))
+                for index, row in enumerate(vm_rows, 1):
+                    if row["vmid"] is None:
+                        continue
+                    vmid = int(row["vmid"])
+                    address = desired.get(vmid, "")
+                    connection.execute(
+                        "UPDATE stand_vms SET ip = ? WHERE id = ?", (address, int(row["id"])),
+                    )
+                    if not address:
+                        continue
+                    previous = reservations_by_vm.get(int(row["id"]))
+                    requested_cidr = str(previous["requested_cidr"]) if previous else f"{address}/32"
+                    prefix_length = int(previous["prefix_length"]) if previous else 32
+                    vm_index = int(previous["vm_index"]) if previous else index
+                    created_at = str(previous["created_at"]) if previous else now
+                    connection.execute(
+                        """INSERT INTO ipam_reservations
+                        (stand_id, stand_vm_id, address, requested_cidr, prefix_length,
+                         vm_index, status, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, 'assigned', ?, ?)""",
+                        (stand_id, int(row["id"]), address, requested_cidr,
+                         prefix_length, vm_index, created_at, now),
+                    )
+
+            data["updated_at"] = now
+            connection.execute(
+                f"UPDATE stands SET {', '.join(f'{key} = ?' for key in data)} WHERE id = ?",
+                tuple(data.values()) + (stand_id,),
+            )
+        detail = str(data.get("name", stand["name"]))
+        if vm_ip_updates is not None:
+            detail += f" · адреса Deployer: {len(vm_ip_updates)} VM"
+        self.store.add_activity("edit", "Параметры стенда обновлены", detail, "success")
         return self.get_stand(stand_id)
 
     def _deploy_job(self, stand_id: int, blueprint: dict[str, Any]) -> None:

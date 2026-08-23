@@ -926,6 +926,21 @@ code { padding: 2px 5px; color: #365d86; background: rgba(255,255,255,.6); borde
 .credential-intro + .form-grid { margin-bottom: 16px; }
 .password-form-grid { align-items: start; }
 .password-form-grid > .field { align-self: start; }
+.stand-editor-form { display: grid; gap: 18px; }
+.stand-editor-main { align-items: start; }
+.stand-editor-main > .field { align-self: start; }
+.stand-editor-section { overflow: hidden; border: 1px solid var(--line); border-radius: 10px; }
+.stand-editor-section__head { display: flex; min-height: 70px; align-items: center; justify-content: space-between; gap: 18px; padding: 13px 15px; background: var(--surface-muted); border-bottom: 1px solid var(--line); }
+.stand-editor-section__head h3 { margin: 0; font-size: 13px; }
+.stand-editor-section__head p { margin: 5px 0 0; color: var(--ink-muted); font-size: 11px; line-height: 1.45; }
+.stand-editor-section__head > span { flex: 0 0 auto; padding: 6px 8px; color: var(--blue); background: var(--blue-soft); border-radius: 6px; font-size: 10px; }
+.stand-ip-list { display: grid; }
+.stand-ip-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(250px, .75fr); align-items: center; gap: 20px; padding: 12px 15px; border-bottom: 1px solid var(--line); }
+.stand-ip-row:last-child { border-bottom: 0; }
+.stand-ip-row > span:first-child { min-width: 0; }
+.stand-ip-row > span:first-child strong, .stand-ip-row > span:first-child small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stand-ip-row > span:first-child strong { font-size: 12px; }
+.stand-ip-row > span:first-child small { margin-top: 5px; color: var(--ink-muted); font-size: 10.5px; }
 .credential-result { display: grid; justify-items: center; text-align: center; }
 .credential-result__success { display: grid; width: 56px; height: 56px; color: var(--green); background: var(--green-soft); border-radius: 17px; place-items: center; }
 .credential-result__success svg { width: 25px; height: 25px; }
@@ -1038,6 +1053,8 @@ code { padding: 2px 5px; color: #365d86; background: rgba(255,255,255,.6); borde
   .scenario-picker { grid-template-columns: 1fr; }
   .deploy-target-card { padding: 13px; }
   .deploy-pool-toggle { grid-template-columns: 33px minmax(0, 1fr) auto; }
+  .stand-editor-section__head { align-items: flex-start; flex-direction: column; gap: 8px; }
+  .stand-ip-row { grid-template-columns: 1fr; gap: 10px; }
   .capacity-preview { grid-template-columns: repeat(2, 1fr); }
   .detail-stat-grid { grid-template-columns: repeat(2, 1fr); }
   .stand-detail__hero { grid-template-columns: 43px minmax(0, 1fr); }
