@@ -149,6 +149,8 @@ exit 75`;
   let standDetailRequestToken = 0;
   let operationPollTimer = null;
   let operationPollBusy = false;
+  let checkPollTimer = null;
+  let checkPollBusy = false;
   let webActivityPollTimer = null;
   const standCredentialCache = new Map();
 
@@ -545,6 +547,11 @@ exit 75`;
     </article>`;
   }
 
+  function checkHistoryMarkup(runs) {
+    if (!runs.length) return emptyState("check", "Запусков пока нет", "Запустите автопроверку на совместимом стенде.");
+    return `<div class="table-wrap"><table class="data-table"><thead><tr><th>Стенд</th><th>Результат</th><th>Проверки</th><th>Время</th><th>Длительность</th><th></th></tr></thead><tbody>${runs.slice(0, 8).map(run => `<tr data-check-run="${run.id}"><td><strong class="cell-title">${escapeHtml(run.stand_name)}</strong><small class="cell-subtitle">${escapeHtml(run.blueprint_code || "")}${run.vmid ? ` · VM ${Number(run.vmid)}` : " · весь стенд"}</small></td><td>${run.status === "running" ? statusChip("checking", "Выполняется") : statusChip(run.status)}</td><td><strong>${run.score == null ? "—" : `${run.score}%`}</strong><small class="cell-subtitle">${run.total ? `${run.passed} из ${run.total}` : "Ожидание результатов"}</small></td><td>${dateTime(run.started_at)}</td><td>${run.duration_ms ? `${formatNumber(run.duration_ms / 1000, 1)} c` : "—"}</td><td class="cell-actions"><button class="button table-check-button" data-check-detail="${run.id}" type="button">${icon("external")}Посмотреть результаты</button></td></tr>`).join("")}</tbody></table></div>`;
+  }
+
   function renderChecks() {
     const blueprints = state.data.blueprints;
     if (!state.selectedBlueprintId || !blueprints.some(item => item.id === state.selectedBlueprintId)) state.selectedBlueprintId = blueprints[0]?.id || null;
@@ -571,7 +578,7 @@ exit 75`;
         </div>
       </div>
       <article class="card"><div class="card__header"><div class="card__heading"><h3 class="card__title">История запусков</h3><p class="card__subtitle">${escapeHtml(selected.name)}</p></div><button class="button button--small" data-run-check>${icon("power")}Новый запуск</button></div>
-        ${runs.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>Стенд</th><th>Результат</th><th>Проверки</th><th>Время</th><th>Длительность</th><th></th></tr></thead><tbody>${runs.slice(0, 8).map(run => `<tr><td><strong class="cell-title">${escapeHtml(run.stand_name)}</strong><small class="cell-subtitle">${escapeHtml(run.blueprint_code || "")}${run.vmid ? ` · VM ${Number(run.vmid)}` : " · весь стенд"}</small></td><td>${run.status === "running" ? statusChip("checking", "Выполняется") : statusChip(run.status)}</td><td><strong>${run.score == null ? "—" : `${run.score}%`}</strong><small class="cell-subtitle">${run.total ? `${run.passed} из ${run.total}` : "Ожидание результатов"}</small></td><td>${dateTime(run.started_at)}</td><td>${run.duration_ms ? `${formatNumber(run.duration_ms / 1000, 1)} c` : "—"}</td><td class="cell-actions"><button class="button table-check-button" data-check-detail="${run.id}" type="button">${icon("external")}Посмотреть результаты</button></td></tr>`).join("")}</tbody></table></div>` : emptyState("check", "Запусков пока нет", "Запустите автопроверку на совместимом стенде.")}</article>
+        <div data-check-history-body>${checkHistoryMarkup(runs)}</div></article>
     </section>`;
     const editor = document.querySelector("#autocheck-editor");
     editor?.addEventListener("input", () => {
@@ -591,6 +598,7 @@ exit 75`;
         event.preventDefault(); saveAutocheck();
       }
     });
+    syncCheckPolling();
   }
 
   function renderInfrastructure() {
@@ -1276,6 +1284,44 @@ exit 75`;
     }
   }
 
+  function syncCheckPolling() {
+    const shouldPoll = state.route === "checks"
+      && (state.data?.checks || []).some(run => run.status === "running");
+    if (!shouldPoll && checkPollTimer) {
+      window.clearTimeout(checkPollTimer);
+      checkPollTimer = null;
+      return;
+    }
+    if (shouldPoll && !checkPollTimer && !checkPollBusy) {
+      checkPollTimer = window.setTimeout(pollChecks, 1000);
+    }
+  }
+
+  async function pollChecks() {
+    checkPollTimer = null;
+    if (document.hidden || state.route !== "checks" || !state.data) return;
+    if (checkPollBusy) { syncCheckPolling(); return; }
+    checkPollBusy = true;
+    try {
+      const checks = await api("/api/checks", { promptAdmin: false });
+      state.data.checks = checks;
+      const selected = state.data.blueprints.find(item => item.id === state.selectedBlueprintId);
+      const runs = checks.filter(run => !selected || run.blueprint_id === selected.id);
+      const history = document.querySelector("[data-check-history-body]");
+      if (history) history.innerHTML = checkHistoryMarkup(runs);
+      const openRunId = Number(modalRoot.querySelector(".modal[data-check-run-id]")?.dataset.checkRunId);
+      const openRun = checks.find(run => Number(run.id) === openRunId);
+      if (openRun) updateOpenCheckResult(openRun);
+      state.lastUpdated = new Date();
+      updateShell();
+    } catch {
+      // Следующая попытка выполнится автоматически, пока проверка отмечена активной.
+    } finally {
+      checkPollBusy = false;
+      syncCheckPolling();
+    }
+  }
+
   function stopStandDetailPolling() {
     if (standDetailPollTimer) window.clearTimeout(standDetailPollTimer);
     standDetailPollTimer = null;
@@ -1519,11 +1565,36 @@ exit 75`;
     });
   }
 
+  function checkResultHeadMarkup(run) {
+    const scoreTone = run.status === "running" ? "pending" : run.score >= 90 ? "good" : run.score >= 70 ? "warn" : "bad";
+    return `<div class="check-score-ring check-score-ring--${scoreTone}" style="--score:${clamp(run.score)}%"><strong>${run.score == null ? "…" : `${run.score}%`}</strong></div><div><h3>${escapeHtml(run.stand_name)}</h3><p>${run.status === "running" ? "Проверка выполняется" : `${run.passed} из ${run.total} проверок пройдено`}</p>${statusChip(run.status === "running" ? "checking" : run.status)}</div>`;
+  }
+
+  function checkConsoleText(run, targetVmid = null) {
+    const details = Array.isArray(run.details) ? run.details : [];
+    const detailOutput = details.map((item, index) => {
+      const status = item.ok ? "OK" : "ОШИБКА";
+      const vmLabel = item.vmid ? ` · VM ${item.vmid}` : targetVmid ? ` · VM ${targetVmid}` : "";
+      const duration = Number(item.duration || 0);
+      const message = String(item.message || (item.ok ? "Условие выполнено" : "Требуется исправление"));
+      return `[${status}] ${index + 1}. ${String(item.name || "Проверка")}${vmLabel} · ${duration} мс\n  ${message}`;
+    }).join("\n\n");
+    return [run.output, detailOutput].filter(Boolean).join("\n\n") || "Проверка выполняется…";
+  }
+
+  function updateOpenCheckResult(run) {
+    const modal = modalRoot.querySelector(`.modal[data-check-run-id="${Number(run.id)}"]`);
+    if (!modal) return;
+    const targetVmid = Number(modal.dataset.checkTargetVmid);
+    const head = modal.querySelector(".check-result-head");
+    if (head) head.innerHTML = checkResultHeadMarkup(run);
+    const output = modal.querySelector(".console-output--check pre");
+    if (output) output.textContent = checkConsoleText(run, Number.isInteger(targetVmid) ? targetVmid : null);
+  }
+
   async function openCheckDetail(runId) {
     const run = state.data.checks.find(item => item.id === Number(runId));
     if (!run) return;
-    const details = Array.isArray(run.details) ? run.details : [];
-    const scoreTone = run.status === "running" ? "pending" : run.score >= 90 ? "good" : run.score >= 70 ? "warn" : "bad";
     let stand = standCredentialCache.get(Number(run.stand_id))?.stand || null;
     if (!stand?.vms) {
       try { stand = await api(`/api/stands/${run.stand_id}`, { promptAdmin: false }); }
@@ -1534,18 +1605,13 @@ exit 75`;
       || stand?.vms?.find(vm => vm.status === "running") || stand?.vms?.[0] || null;
     const targetVmid = Number(targetVm?.vmid);
     const accessUrl = safeAccessUrl(targetVm?.access_url || targetVm?.web_url);
-    const detailOutput = details.map((item, index) => {
-      const status = item.ok ? "OK" : "ОШИБКА";
-      const vmLabel = item.vmid ? ` · VM ${item.vmid}` : targetVmid ? ` · VM ${targetVmid}` : "";
-      const duration = Number(item.duration || 0);
-      const message = String(item.message || (item.ok ? "Условие выполнено" : "Требуется исправление"));
-      return `[${status}] ${index + 1}. ${String(item.name || "Проверка")}${vmLabel} · ${duration} мс\n  ${message}`;
-    }).join("\n\n");
-    const consoleText = [run.output, detailOutput].filter(Boolean).join("\n\n") || "Проверка выполняется…";
-    const body = `<div class="check-result-head"><div class="check-score-ring check-score-ring--${scoreTone}" style="--score:${clamp(run.score)}%"><strong>${run.score == null ? "…" : `${run.score}%`}</strong></div><div><h3>${escapeHtml(run.stand_name)}</h3><p>${run.status === "running" ? "Проверка выполняется" : `${run.passed} из ${run.total} проверок пройдено`}</p>${statusChip(run.status === "running" ? "checking" : run.status)}</div></div>
-      <div class="console-output console-output--check"><div><span class="console-prompt">$</span> demoops check --run ${run.id}</div><pre>${escapeHtml(consoleText)}</pre></div>`;
+    const body = `<div class="check-result-head">${checkResultHeadMarkup(run)}</div>
+      <div class="console-output console-output--check"><div><span class="console-prompt">$</span> demoops check --run ${run.id}</div><pre>${escapeHtml(checkConsoleText(run, Number.isInteger(targetVmid) ? targetVmid : null))}</pre></div>`;
     const footer = `${accessUrl ? `<a class="button button--primary" href="${escapeHtml(accessUrl)}" target="_blank" rel="noopener noreferrer">${icon("external")}Перейти к стенду</a>` : `<button class="button button--primary" type="button" disabled>${icon("external")}Перейти к стенду</button>`}<button class="button" type="button" data-copy-check-password="${Number(run.stand_id)}" data-check-vmid="${Number.isInteger(targetVmid) ? targetVmid : ""}" ${Number.isInteger(targetVmid) ? "" : "disabled"}>${icon("copy")}Скопировать пароль</button><button class="button" data-close-modal type="button">Закрыть</button>`;
     showModal({ title: "Результаты автопроверки", subtitle: `${run.blueprint_code || ""} · ${dateTime(run.started_at)}`, body, footer, size: "wide" });
+    const resultModal = modalRoot.querySelector(".modal");
+    resultModal?.setAttribute("data-check-run-id", String(run.id));
+    if (Number.isInteger(targetVmid)) resultModal?.setAttribute("data-check-target-vmid", String(targetVmid));
     modalRoot.querySelector("[data-copy-check-password]")?.addEventListener("click", async event => {
       const button = event.currentTarget;
       button.disabled = true;
@@ -1816,6 +1882,7 @@ exit 75`;
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) {
       syncOperationPolling();
+      syncCheckPolling();
       if (state.route === "infrastructure") loadWebActivity({ background: true });
     }
   });
