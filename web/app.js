@@ -146,6 +146,7 @@ exit 75`;
   let pendingAdminTokenFinish = null;
   let standDetailPollTimer = null;
   let activeStandDetailId = null;
+  let standDetailRequestToken = 0;
   let operationPollTimer = null;
   let operationPollBusy = false;
   let webActivityPollTimer = null;
@@ -1181,14 +1182,14 @@ exit 75`;
   }
 
   async function openStandDetail(id, { requestCredentials = false } = {}) {
+    const numericId = Number(id);
+    const updateExisting = Boolean(modalRoot.querySelector(`.modal[data-stand-detail-id="${numericId}"]`));
     stopStandDetailPolling();
-    activeStandDetailId = Number(id);
-    showModal({ title: "Загрузка стенда…", body: `<div class="detail-loading"><span class="spinner"></span><p>Получаем машины и доступы</p></div>`, size: "large", className: "stand-detail-modal" });
-    modalRoot.querySelector(".modal")?.setAttribute("data-stand-detail-id", String(id));
-    const requestToken = activeModalToken;
+    activeStandDetailId = numericId;
+    const requestToken = ++standDetailRequestToken;
     try {
       const stand = await api(`/api/stands/${id}`);
-      if (!requestCredentials && (requestToken !== activeModalToken || activeStandDetailId !== Number(id) || !modalRoot.innerHTML)) return;
+      if (requestToken !== standDetailRequestToken || activeStandDetailId !== numericId) return;
       let credentials = new Map();
       let credentialState = "loaded";
       let credentialError = "";
@@ -1199,12 +1200,12 @@ exit 75`;
         credentialState = error.status === 401 ? "locked" : "error";
         credentialError = error.message;
       }
-      if (!requestCredentials && (requestToken !== activeModalToken || activeStandDetailId !== Number(id) || !modalRoot.innerHTML)) return;
-      renderStandDetailModal(stand, credentials, credentialState, credentialError, { updateExisting: true });
-      if (standNeedsLivePolling(stand)) scheduleStandDetailPoll(Number(id), credentials, credentialState, credentialError);
+      if (requestToken !== standDetailRequestToken || activeStandDetailId !== numericId) return;
+      renderStandDetailModal(stand, credentials, credentialState, credentialError, { updateExisting });
+      if (standNeedsLivePolling(stand)) scheduleStandDetailPoll(numericId, credentials, credentialState, credentialError);
     } catch (error) {
-      if (!requestCredentials && requestToken !== activeModalToken) return;
-      closeModal();
+      if (requestToken !== standDetailRequestToken) return;
+      if (!updateExisting) activeStandDetailId = null;
       toast(error.message, "error");
     }
   }
@@ -1226,7 +1227,10 @@ exit 75`;
     if (!currentRow) return;
     const container = document.createElement("tbody");
     container.innerHTML = standRow(state.data.stands[index]);
-    currentRow.replaceWith(container.firstElementChild);
+    const nextRow = container.firstElementChild;
+    nextRow?.classList.add("is-live-update");
+    currentRow.replaceWith(nextRow);
+    window.requestAnimationFrame(() => nextRow?.classList.remove("is-live-update"));
   }
 
   function settleBulkRollbackPending(stand) {
@@ -1284,6 +1288,7 @@ exit 75`;
     if (standDetailPollTimer) window.clearTimeout(standDetailPollTimer);
     standDetailPollTimer = null;
     activeStandDetailId = null;
+    standDetailRequestToken += 1;
     syncOperationPolling();
   }
 
