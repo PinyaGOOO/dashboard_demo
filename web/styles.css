@@ -864,11 +864,10 @@ code { padding: 2px 5px; color: #365d86; background: rgba(255,255,255,.6); borde
 .credential-state svg { width: 14px; height: 14px; }
 .credential-state--ready { color: var(--green); background: var(--green-soft); border-color: #cde8dc; }
 .vm-list { display: grid; }
-.vm-row { display: grid; grid-template-columns: 9px minmax(185px, .75fr) minmax(300px, 1.15fr) minmax(235px, .8fr); min-height: 122px; align-items: center; gap: 15px; padding: 14px; border-bottom: 1px solid var(--line); animation: stand-card-in 300ms cubic-bezier(.2,.8,.2,1) both; transition: background 180ms ease, transform 180ms ease; }
+.vm-row { display: grid; grid-template-columns: 9px minmax(185px, .75fr) minmax(300px, 1.15fr) minmax(235px, .8fr); min-height: 122px; align-items: center; gap: 15px; padding: 14px; border-bottom: 1px solid var(--line); animation: stand-card-in 300ms cubic-bezier(.2,.8,.2,1) both; }
 .vm-row:nth-child(2) { animation-delay: 30ms; }
 .vm-row:nth-child(3) { animation-delay: 60ms; }
 .vm-row:nth-child(4) { animation-delay: 90ms; }
-.vm-row:hover { background: #fffaf7; transform: translateX(2px); }
 .stand-detail-modal[data-hydrated="true"] .vm-row { animation: none; }
 .detail-actions .button:not(:disabled):focus-visible, .vm-actions .button:not(:disabled):focus-visible { animation: action-pop 240ms ease-out; }
 .vm-row:last-child { border-bottom: 0; }
