@@ -118,6 +118,27 @@ class ExistingPoolServiceTests(unittest.TestCase):
                 "use_existing_pool": True,
             })
 
+    def test_imported_pool_can_delete_all_current_vms_without_removing_pool_card(self) -> None:
+        self.gateway.pool_members.return_value = [
+            {"vmid": 410, "name": "router-1", "node": "pve-1", "status": "running"},
+            {"vmid": 411, "name": "router-2", "node": "pve-2", "status": "stopped"},
+        ]
+        stand = self.service.import_pool({
+            "pool_id": "shared-lab",
+            "name": "Подключённый pool",
+            "blueprint_id": self.blueprint["id"],
+        })
+
+        result = self.service.stand_action(stand["id"], "delete_pool_stands")
+
+        self.assertEqual(result["deleted_count"], 2)
+        self.assertEqual(result["stand"]["status"], "stopped")
+        self.assertEqual(result["stand"]["vms"], [])
+        deletion_scope, vmids = self.gateway.delete_stand.call_args.args
+        self.assertEqual(deletion_scope["origin"], "existing")
+        self.assertEqual(vmids, [410, 411])
+        self.assertEqual(self.service.get_stand(stand["id"])["pool_id"], "shared-lab")
+
 
 class ExistingPoolGatewaySafetyTests(unittest.TestCase):
     def test_failed_deploy_cleanup_removes_only_matching_new_vm(self) -> None:

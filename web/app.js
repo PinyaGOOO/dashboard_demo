@@ -1096,7 +1096,7 @@ exit 75`;
       <div class="detail-meta"><span>${icon("activity")} Создан ${dateTime(stand.created_at)}</span><span>${icon("lock")} Пароль менялся ${relativeTime(stand.password_updated_at)}</span><span>${icon("users")} Ответственный: ${escapeHtml(stand.owner)}</span></div>
     </div>`;
     const importedPool = stand.origin === "imported";
-    const footer = `<button class="button button--danger" data-delete-stand="${stand.id}" type="button" ${standBusy ? "disabled" : ""}>${icon("trash")}${importedPool ? "Убрать pool из списка" : "Удалить стенд"}</button><button class="button" data-close-modal type="button">Закрыть</button>`;
+    const footer = `${importedPool ? `<button class="button button--danger" data-delete-pool-stands="${stand.id}" type="button" ${standBusy || !stand.vms.length ? "disabled" : ""}>${icon("trash")}Удалить все стенды</button>` : ""}<button class="button ${importedPool ? "" : "button--danger"}" data-delete-stand="${stand.id}" type="button" ${standBusy ? "disabled" : ""}>${icon(importedPool ? "info" : "trash")}${importedPool ? "Убрать pool из списка" : "Удалить стенд"}</button><button class="button" data-close-modal type="button">Закрыть</button>`;
     const existing = updateExisting ? modalRoot.querySelector(`.modal[data-stand-detail-id="${Number(stand.id)}"]`) : null;
     if (existing) {
       const bodyNode = existing.querySelector(".modal__body");
@@ -1503,6 +1503,36 @@ exit 75`;
     });
   }
 
+  async function confirmDeletePoolStands(id) {
+    const stand = state.data.stands.find(item => item.id === Number(id));
+    if (!stand || stand.origin !== "imported") return;
+    const confirmationTarget = stand.pool_id;
+    const vmCount = Number(stand.actual_vm_count ?? stand.vm_count ?? stand.vms?.length ?? 0);
+    const body = `<div class="danger-confirm"><span>${icon("trash")}</span><h3>Удалить все стенды из pool?</h3><p>Будут безвозвратно удалены <strong>${vmCount} VM</strong> и их диски из pool <strong class="mono">${escapeHtml(confirmationTarget)}</strong>. Сам pool останется в Proxmox и продолжит отображаться в Deployer.</p><label class="field"><span class="field-label">Введите название pool для подтверждения</span><input class="input mono" id="delete-pool-stands-confirm-name" autocomplete="off" placeholder="${escapeHtml(confirmationTarget)}"></label></div>`;
+    showModal({
+      title: "Удаление всех стендов pool",
+      subtitle: "Необратимая операция",
+      body,
+      footer: `<button class="button" data-close-modal type="button">Отмена</button><button class="button button--danger" id="delete-pool-stands-confirm" type="button" disabled>${icon("trash")}Удалить все стенды</button>`,
+    });
+    const input = modalRoot.querySelector("#delete-pool-stands-confirm-name");
+    const button = modalRoot.querySelector("#delete-pool-stands-confirm");
+    input.addEventListener("input", () => { button.disabled = input.value !== confirmationTarget; });
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      try {
+        const result = await api(`/api/stands/${id}/actions`, { method: "POST", body: { action: "delete_pool_stands" } });
+        state.ipam = null;
+        closeModal();
+        toast(result.message || "Все стенды pool удалены", "warning");
+        await loadData();
+      } catch (error) {
+        button.disabled = false;
+        toast(error.message, "error");
+      }
+    });
+  }
+
   async function confirmDeleteBlueprint(id) {
     const blueprint = state.data.blueprints.find(item => item.id === Number(id));
     showModal({ title: "Удалить сценарий?", subtitle: blueprint?.code || "", body: `<div class="danger-confirm compact"><span>${icon("trash")}</span><h3>${escapeHtml(blueprint?.name)}</h3><p>Удаление возможно только если сценарий не используется ни одним стендом.</p></div>`, footer: `<button class="button" data-close-modal>Отмена</button><button class="button button--danger" id="delete-blueprint-confirm">${icon("trash")}Удалить</button>` });
@@ -1601,6 +1631,7 @@ exit 75`;
       finally { if (target.isConnected) { target.disabled = false; delete target.dataset.busy; } }
     }
     else if (target.dataset.editStand) openStandEditor(Number(target.dataset.editStand));
+    else if (target.dataset.deletePoolStands) confirmDeletePoolStands(Number(target.dataset.deletePoolStands));
     else if (target.dataset.deleteStand) confirmDeleteStand(Number(target.dataset.deleteStand));
     else if (target.matches("[data-copy-stand-access]")) {
       const standId = Number(target.dataset.copyStandAccess);

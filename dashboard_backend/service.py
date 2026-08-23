@@ -973,6 +973,38 @@ class DashboardService:
             )
             self.store.add_activity("snapshot", "Создан снимок", f"{stand['name']} · {label}", "success")
             return {"stand": self.get_stand(stand_id), "message": f"Снимок «{label}» создан на всех VM"}
+        if action == "delete_pool_stands":
+            if str(stand.get("origin") or "") != "imported":
+                raise ValidationError("Удаление всех VM доступно только для подключённой карточки pool")
+            if stand.get("check_status") == "running" or any(
+                vm.get("check_status") == "running" for vm in stand.get("vms", [])
+            ):
+                raise ConflictError("Сначала дождитесь завершения автопроверки")
+            members = self.gateway.pool_members(str(stand["pool_id"]))
+            current_vms = [
+                dict(vm) for vm in members
+                if vm.get("vmid") is not None
+            ]
+            current_vmids = [int(vm["vmid"]) for vm in current_vms]
+            if not current_vmids:
+                raise ConflictError("В pool нет VM для удаления")
+            deletion_scope = {**stand, "origin": "existing", "vms": current_vms}
+            self.gateway.delete_stand(deletion_scope, current_vmids)
+            self.store.execute("DELETE FROM stand_vms WHERE stand_id = ?", (stand_id,))
+            self.store.execute(
+                """UPDATE stands SET status = 'stopped', progress = 100, vm_count = 0,
+                cpu = 0, ram = 0, disk = 0, last_error = '', updated_at = ? WHERE id = ?""",
+                (utc_now(), stand_id),
+            )
+            self.store.add_activity(
+                "delete", "Все VM pool удалены",
+                f"{stand['pool_id']} · удалено {len(current_vmids)} VM", "warning",
+            )
+            return {
+                "stand": self.get_stand(stand_id),
+                "message": f"Удалено VM: {len(current_vmids)}; pool сохранён",
+                "deleted_count": len(current_vmids),
+            }
         if action == "rotate_password":
             username = str(payload.get("username", "root")).strip()
             web_username = str(payload.get("web_username", "root@pam")).strip() or "root@pam"
