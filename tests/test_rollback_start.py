@@ -183,6 +183,108 @@ class ServiceRollbackTests(unittest.TestCase):
             )
         return stand_id
 
+    def test_queued_snapshot_does_not_block_control_action_for_same_stand(self) -> None:
+        """A heavy waiter must not own the per-stand lock before admission."""
+        blocker = self.service._operation_queue.reserve(
+            "deploy", "busy cluster", 8, lane="heavy",
+        )
+        blocker.__enter__()
+        snapshot_errors: list[BaseException] = []
+        stop_errors: list[BaseException] = []
+        power_called = threading.Event()
+
+        def snapshot() -> None:
+            try:
+                self.service.stand_action(
+                    self.stand_id, "snapshot", {"name": "queued-test"},
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                snapshot_errors.append(exc)
+
+        def stop() -> None:
+            try:
+                self.service.stand_action(self.stand_id, "stop")
+            except BaseException as exc:  # pragma: no cover - asserted below
+                stop_errors.append(exc)
+
+        self.gateway.power_action.side_effect = lambda *_args, **_kwargs: power_called.set()
+        snapshot_thread = threading.Thread(target=snapshot, daemon=True)
+        stop_thread = threading.Thread(target=stop, daemon=True)
+        try:
+            snapshot_thread.start()
+            for _ in range(100):
+                queued = self.service._operation_queue.snapshot().get("queued", [])
+                if any(item.get("kind") == "snapshot" for item in queued):
+                    break
+                threading.Event().wait(0.01)
+            else:
+                self.fail("snapshot request did not enter the scheduler queue")
+
+            stop_thread.start()
+            self.assertTrue(
+                power_called.wait(0.75),
+                "control-lane stop was blocked by the queued snapshot lock",
+            )
+        finally:
+            blocker.__exit__(None, None, None)
+            snapshot_thread.join(timeout=2)
+            if stop_thread.ident is not None:
+                stop_thread.join(timeout=2)
+
+        self.assertFalse(snapshot_thread.is_alive())
+        self.assertFalse(stop_thread.is_alive())
+        self.assertEqual(snapshot_errors, [])
+        self.assertEqual(stop_errors, [])
+
+    def test_second_same_stand_operation_waits_locally_without_capacity(self) -> None:
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        errors: list[BaseException] = []
+
+        def create_snapshot(_vmids, label, _description) -> None:
+            if label == "first-local-gate":
+                first_entered.set()
+                release_first.wait(2)
+
+        self.gateway.create_snapshot.side_effect = create_snapshot
+
+        def snapshot(label: str) -> None:
+            try:
+                self.service.stand_action(
+                    self.stand_id, "snapshot", {"name": label},
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        first = threading.Thread(target=snapshot, args=("first-local-gate",), daemon=True)
+        second = threading.Thread(target=snapshot, args=("second-local-gate",), daemon=True)
+        first.start()
+        self.assertTrue(first_entered.wait(1))
+        second.start()
+        try:
+            for _ in range(100):
+                with self.service._stand_gate_condition:
+                    local_waiters = len(
+                        self.service._stand_gate_waiting.get(self.stand_id, []),
+                    )
+                if local_waiters == 2:
+                    break
+                threading.Event().wait(0.01)
+            snapshot_state = self.service._operation_queue.snapshot()
+            self.assertEqual(snapshot_state["active_count"], 1)
+            self.assertEqual(snapshot_state["queued_count"], 0)
+            self.assertEqual(snapshot_state["used"], 3)
+        finally:
+            release_first.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(self.service._stand_gate_waiting, {})
+        self.assertEqual(self.service._stand_gate_owner, {})
+
     def _seed_additional_stand(
         self,
         *,

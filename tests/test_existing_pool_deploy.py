@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -48,6 +49,66 @@ class ExistingPoolServiceTests(unittest.TestCase):
             ],
         )
         thread.return_value.start.assert_called_once_with()
+
+    def test_deploy_repeats_preflight_and_reservation_after_long_queue_wait(self) -> None:
+        first_scope = {
+            "node_weights": {"pve-1": 1},
+            "storage_weights": {"shared-lab": 1},
+            "template_node": "pve-1",
+            "template_vmid": int(self.blueprint["template_vmid"]),
+            "target_nodes": ["pve-1"],
+        }
+        second_scope = {
+            "node_weights": {"pve-2": 1},
+            "storage_weights": {"shared-lab": 1},
+            "template_node": "pve-2",
+            "template_vmid": int(self.blueprint["template_vmid"]),
+            "target_nodes": ["pve-2"],
+        }
+        self.gateway.deployment_scheduler_scope.side_effect = [first_scope, second_scope]
+        with patch("dashboard_backend.service.threading.Thread") as thread:
+            stand = self.service.create_stand({
+                "blueprint_id": self.blueprint["id"],
+                "name": "Повторный preflight",
+                "pool_id": "shared-lab",
+                "use_existing_pool": True,
+                "vm_count": 1,
+                "subnet": "10.39.11.1/16",
+                "start_ip": "10.39.11.1",
+            })
+        deployment = thread.call_args.kwargs["args"][1]
+        reserve_scopes: list[dict[str, object]] = []
+
+        @contextmanager
+        def reserve(_kind, _label, _weight, **kwargs):
+            reserve_scopes.append(dict(kwargs))
+            yield {"wait_seconds": 6.0 if len(reserve_scopes) == 1 else 0.0}
+
+        def deploy(_stand, selected_blueprint, _progress):
+            self.assertEqual(selected_blueprint["_scheduler_scope"]["target_nodes"], ["pve-2"])
+            return [{
+                "index": 1,
+                "vmid": 517,
+                "name": f"shared-lab-deployer-{stand['id']}-1",
+                "node": "pve-2",
+                "status": "running",
+                "ip": selected_blueprint["allocated_ips"][0],
+                "username": "root",
+                "web_username": "root@pam",
+                "password": "SafePass2",
+                "snapshot": "start",
+            }]
+
+        self.gateway.deploy.side_effect = deploy
+        with patch.object(self.service._operation_queue, "reserve", side_effect=reserve):
+            self.service._deploy_job(stand["id"], deployment)
+
+        self.assertEqual(self.gateway.deployment_scheduler_scope.call_count, 2)
+        self.assertEqual(reserve_scopes[0]["node_weights"], {"pve-1": 1})
+        self.assertEqual(reserve_scopes[1]["node_weights"], {"pve-2": 1})
+        self.gateway.deploy.assert_called_once()
+        refreshed = self.service.get_stand(stand["id"])
+        self.assertEqual(refreshed["status"], "running", refreshed.get("last_error"))
 
     def test_existing_pool_id_preserves_proxmox_letter_case(self) -> None:
         with patch("dashboard_backend.service.threading.Thread") as thread:
@@ -163,6 +224,40 @@ class ExistingPoolServiceTests(unittest.TestCase):
         self.assertEqual(deletion_scope["origin"], "existing")
         self.assertEqual(vmids, [410, 411])
         self.assertEqual(self.service.get_stand(stand["id"])["pool_id"], "shared-lab")
+
+    def test_pool_delete_rejects_migration_after_scheduler_preflight(self) -> None:
+        original = [
+            {"vmid": 415, "name": "router", "node": "pve-1", "status": "running"},
+        ]
+        migrated = [
+            {"vmid": 415, "name": "router", "node": "pve-2", "status": "running"},
+        ]
+        self.gateway.pool_members.side_effect = [original, original, migrated]
+        stand = self.service.import_pool({"pool_id": "shared-lab"})
+
+        with self.assertRaisesRegex(ConflictError, "Состав или размещение VM"):
+            self.service.stand_action(stand["id"], "delete_pool_stands")
+
+        self.gateway.delete_stand.assert_not_called()
+        queue = self.service.operation_queue()
+        self.assertEqual(queue["used"], 0)
+        self.assertEqual(queue["queued_count"], 0)
+
+    def test_pool_delete_rejects_reused_vmid_after_scheduler_preflight(self) -> None:
+        original = [
+            {"vmid": 416, "name": "owned-router", "node": "pve-1", "status": "running"},
+        ]
+        replacement = [
+            {"vmid": 416, "name": "unrelated-router", "node": "pve-1", "status": "running"},
+        ]
+        self.gateway.pool_members.side_effect = [original, original, replacement]
+        stand = self.service.import_pool({"pool_id": "shared-lab"})
+
+        with self.assertRaisesRegex(ConflictError, "Состав или размещение VM"):
+            self.service.stand_action(stand["id"], "delete_pool_stands")
+
+        self.gateway.delete_stand.assert_not_called()
+        self.assertEqual(self.service.operation_queue()["used"], 0)
 
     def test_import_pool_does_not_require_display_metadata_or_blueprint(self) -> None:
         self.gateway.pool_members.return_value = [

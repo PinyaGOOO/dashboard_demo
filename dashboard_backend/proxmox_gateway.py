@@ -138,6 +138,228 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def _scheduler_number(value: Any, default: float = 0.0) -> float:
+    """Return a finite telemetry number without trusting PVE's wire type."""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return result if math.isfinite(result) else float(default)
+
+
+def _scheduler_integer(value: Any) -> int | None:
+    """Normalize an optional integer field from Proxmox telemetry."""
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return None
+    return result
+
+
+def _scheduler_flag(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"0", "false", "no", "off", "disabled"}:
+            return False
+        if normalized in {"1", "true", "yes", "on", "enabled"}:
+            return True
+    return bool(value)
+
+
+def _scheduler_ratio(used: Any, total: Any) -> tuple[float, float, float]:
+    safe_used = max(0.0, _scheduler_number(used))
+    safe_total = max(0.0, _scheduler_number(total))
+    ratio = _clamp(safe_used / safe_total, 0.0, 1.0) if safe_total else 0.0
+    return safe_used, safe_total, ratio
+
+
+def _scheduler_storage_key(node: Any, storage: Any, shared: Any) -> str:
+    """Return the canonical admission key for a PVE storage resource."""
+    storage_id = str(storage or "").strip()
+    if not storage_id:
+        return ""
+    node_name = str(node or "").strip()
+    if _scheduler_flag(shared) or not node_name:
+        return storage_id
+    return f"{node_name}/{storage_id}"
+
+
+def _normalize_scheduler_resources(resources: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Normalize node and storage rows returned by ``cluster/resources``.
+
+    This helper is deliberately pure so admission-policy tests do not need a
+    live Proxmox client.  The root filesystem reported for a node is named
+    explicitly; it must not be mistaken for VM storage capacity.
+    """
+    nodes_by_name: dict[str, dict[str, Any]] = {}
+    storages_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    if not isinstance(resources, (list, tuple)):
+        return [], []
+
+    for raw in resources:
+        if not isinstance(raw, dict):
+            continue
+        resource_type = str(raw.get("type") or "").strip().lower()
+        if resource_type == "node":
+            node = str(raw.get("node") or raw.get("name") or "").strip()
+            if not node:
+                continue
+            cpu_ratio = _clamp(_scheduler_number(raw.get("cpu")), 0.0, 1.0)
+            memory_used, memory_total, memory_ratio = _scheduler_ratio(
+                raw.get("mem"), raw.get("maxmem"),
+            )
+            root_used, root_total, root_ratio = _scheduler_ratio(
+                raw.get("disk"), raw.get("maxdisk"),
+            )
+            maxcpu = max(0.0, _scheduler_number(raw.get("maxcpu")))
+            status = str(raw.get("status") or "unknown").strip().lower()
+            nodes_by_name[node] = {
+                "node": node,
+                "status": status,
+                "online": status == "online",
+                "cpu_ratio": round(cpu_ratio, 4),
+                "cpu_percent": round(cpu_ratio * 100, 1),
+                "maxcpu": maxcpu,
+                "memory_used": memory_used,
+                "memory_total": memory_total,
+                "memory_ratio": round(memory_ratio, 4),
+                "memory_percent": round(memory_ratio * 100, 1),
+                "root_used": root_used,
+                "root_total": root_total,
+                "root_used_ratio": round(root_ratio, 4),
+                "uptime": max(0, _scheduler_integer(raw.get("uptime")) or 0),
+            }
+            continue
+
+        if resource_type != "storage":
+            continue
+        node = str(raw.get("node") or "").strip()
+        storage = str(raw.get("storage") or raw.get("name") or "").strip()
+        if not node or not storage:
+            continue
+        used, total, used_ratio = _scheduler_ratio(
+            raw.get("disk", raw.get("used")),
+            raw.get("maxdisk", raw.get("total")),
+        )
+        raw_free = raw.get("avail", raw.get("free"))
+        free = max(0.0, _scheduler_number(raw_free, total - used))
+        status = str(raw.get("status") or "unknown").strip().lower()
+        shared = _scheduler_flag(raw.get("shared"))
+        scheduler_key = _scheduler_storage_key(node, storage, shared)
+        storages_by_key[(node, storage)] = {
+            "node": node,
+            "storage": storage,
+            "storage_id": storage,
+            "scheduler_key": scheduler_key,
+            "status": status,
+            "available": status in {"available", "online", "active"},
+            "shared": shared,
+            "content": str(raw.get("content") or ""),
+            "storage_type": str(raw.get("plugintype") or ""),
+            "used": used,
+            "total": total,
+            "free": free,
+            "used_ratio": round(used_ratio, 4),
+            "used_percent": round(used_ratio * 100, 1),
+        }
+
+    nodes = sorted(nodes_by_name.values(), key=lambda item: item["node"].lower())
+    storages = sorted(
+        storages_by_key.values(),
+        key=lambda item: (item["storage"].lower(), item["node"].lower()),
+    )
+    return nodes, storages
+
+
+def _normalize_scheduler_tasks(tasks: Any) -> list[dict[str, Any]]:
+    """Normalize the active UPID rows returned by ``cluster/tasks``."""
+    # For clone/migrate workers PVE reports the node executing the task, not
+    # necessarily the destination node consuming the new capacity.  Preserve
+    # that value for diagnostics, but do not expose it as an admission target:
+    # the queue must account such an external operation cluster-wide instead
+    # of throttling the source while overlooking an unknown destination.
+    non_target_worker_types = {
+        "clone", "qmclone", "vzclone",
+        "migrate", "qmigrate", "qmmigrate", "vzmigrate",
+    }
+    result_by_upid: dict[str, dict[str, Any]] = {}
+    if not isinstance(tasks, (list, tuple)):
+        return []
+    for raw in tasks:
+        if not isinstance(raw, dict):
+            continue
+        upid = str(raw.get("upid") or "").strip()
+        if not upid:
+            continue
+        identifier = str(raw.get("id") or "").strip()
+        vmid = int(identifier) if re.fullmatch(r"\d+", identifier) else None
+        status = str(raw.get("status") or "running").strip().lower()
+        task_type = str(raw.get("type") or "unknown").strip().lower()
+        worker_node = str(raw.get("node") or "").strip()
+        terminal = status in {"ok", "warning", "error", "stopped"}
+        result_by_upid[upid] = {
+            "upid": upid,
+            "node": "" if task_type in non_target_worker_types else worker_node,
+            "worker_node": worker_node,
+            "type": task_type,
+            "id": identifier,
+            "vmid": vmid,
+            "user": str(raw.get("user") or "").strip(),
+            "token_id": str(raw.get("tokenid") or "").strip(),
+            "start_time": _scheduler_integer(raw.get("starttime")),
+            "status": status,
+            "running": raw.get("endtime") is None and not terminal,
+        }
+    return sorted(
+        result_by_upid.values(),
+        key=lambda item: (item["start_time"] or 0, item["upid"]),
+    )
+
+
+def _scheduler_distribution(
+    target_nodes: list[str],
+    storages: list[str],
+    vm_count: int,
+) -> dict[str, Any]:
+    """Build deterministic node/storage admission weights for a deployment."""
+    count = max(1, int(vm_count or 1))
+    clean_nodes = list(dict.fromkeys(
+        str(node).strip() for node in target_nodes if str(node).strip()
+    ))
+    clean_storages = list(dict.fromkeys(
+        str(storage).strip() for storage in storages if str(storage).strip()
+    ))
+    if not clean_nodes:
+        raise RuntimeError("Proxmox не вернул доступных нод для развёртывания")
+    node_weights = {node: 0 for node in clean_nodes}
+    for index in range(count):
+        node_weights[clean_nodes[index % len(clean_nodes)]] += 1
+    return {
+        "node_weights": node_weights,
+        "storage_weights": {storage: count for storage in clean_storages},
+        "target_nodes": clean_nodes,
+        "storages": clean_storages,
+    }
+
+
+def _copy_scheduler_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Return a defensive copy without importing a generic deep-copy stack."""
+    copied = dict(snapshot)
+    copied["nodes"] = [dict(item) for item in snapshot.get("nodes", [])]
+    copied["storages"] = [dict(item) for item in snapshot.get("storages", [])]
+    copied["tasks"] = [dict(item) for item in snapshot.get("tasks", [])]
+    copied["warnings"] = list(snapshot.get("warnings", []))
+    copied["sources"] = dict(snapshot.get("sources", {}))
+    return copied
+
+
+def _scheduler_error(source: str, exc: Exception) -> str:
+    detail = " ".join(str(exc).split())[:300] or exc.__class__.__name__
+    return f"{source}: {detail}"
+
+
 @dataclass(frozen=True)
 class IntegrationInfo:
     mode: str
@@ -149,6 +371,60 @@ class IntegrationInfo:
 
 class DemoProxmoxGateway:
     mode = "demo"
+
+    def scheduler_snapshot(self) -> dict[str, Any]:
+        resources: list[dict[str, Any]] = []
+        for index, (node, cpu, memory) in enumerate((
+            ("pve-01", 0.48, 0.62),
+            ("pve-02", 0.67, 0.74),
+            ("pve-03", 0.31, 0.46),
+            ("pve-04", 0.54, 0.59),
+        )):
+            resources.extend((
+                {
+                    "type": "node", "node": node, "status": "online",
+                    "cpu": cpu, "maxcpu": 16, "mem": memory * 64 * 1024**3,
+                    "maxmem": 64 * 1024**3, "disk": (0.45 + index * 0.04) * 256 * 1024**3,
+                    "maxdisk": 256 * 1024**3, "uptime": (19 + index * 7) * 86400,
+                },
+                {
+                    "type": "storage", "node": node, "storage": "demo-shared",
+                    "status": "available", "shared": 1, "content": "images,rootdir",
+                    "plugintype": "nfs", "disk": (0.58 + index * 0.01) * 4 * 1024**4,
+                    "maxdisk": 4 * 1024**4,
+                },
+            ))
+        nodes, storages = _normalize_scheduler_resources(resources)
+        return {
+            "available": True,
+            "partial": False,
+            "stale": False,
+            "collected_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+            "sources": {"resources": True, "tasks": True},
+            "nodes": nodes,
+            "storages": storages,
+            "tasks": [],
+            "warnings": [],
+        }
+
+    def deployment_scheduler_scope(
+        self,
+        stand: dict[str, Any],
+        blueprint: dict[str, Any],
+    ) -> dict[str, Any]:
+        known_nodes = ["pve-01", "pve-02", "pve-03", "pve-04"]
+        requested_node = str(stand.get("node") or "").strip()
+        if requested_node and requested_node != "auto":
+            if requested_node not in known_nodes:
+                raise RuntimeError(f"Нода {requested_node} недоступна")
+            target_nodes = [requested_node]
+        else:
+            target_nodes = known_nodes
+        return _scheduler_distribution(
+            target_nodes,
+            ["demo-shared"],
+            int(blueprint.get("vm_count") or 1),
+        )
 
     def integration_info(self) -> IntegrationInfo:
         return IntegrationInfo("demo", True, "demo-cluster.local", "DEMO-PVE", "Демонстрационные данные")
@@ -375,6 +651,9 @@ class LiveProxmoxGateway:
         self._metrics_cache_key: frozenset[int] | None = None
         self._metrics_cache_at = 0.0
         self._metrics_cache_value: dict[str, Any] | None = None
+        self._scheduler_snapshot_lock = threading.RLock()
+        self._scheduler_snapshot_cache_at = 0.0
+        self._scheduler_snapshot_cache: dict[str, Any] | None = None
         # PVE's nextid endpoint only reports a free ID; it does not reserve it.
         # Keep allocation and clone submission indivisible between concurrent
         # dashboard deployment threads.
@@ -387,6 +666,73 @@ class LiveProxmoxGateway:
             return IntegrationInfo("live", True, endpoint, os.environ.get("PROXMOX_CLUSTER_NAME", "Proxmox VE"), f"{len(nodes)} нод")
         except Exception as exc:
             return IntegrationInfo("live", False, endpoint, "Proxmox VE", str(exc))
+
+    def scheduler_snapshot(self) -> dict[str, Any]:
+        """Return cached, read-only admission telemetry from Proxmox.
+
+        Resource and task endpoints are intentionally independent: a missing
+        audit privilege or a transient failure in one endpoint must not discard
+        the useful half of the sample.  Callers can inspect ``sources`` before
+        applying dynamic admission and retain the existing static queue as a
+        safe fallback.
+        """
+        now = time.monotonic()
+        with self._scheduler_snapshot_lock:
+            cached = self._scheduler_snapshot_cache
+            if cached is not None and now - self._scheduler_snapshot_cache_at < 5.0:
+                return _copy_scheduler_snapshot(cached)
+
+            warnings: list[str] = []
+            resources_ok = False
+            tasks_ok = False
+            nodes: list[dict[str, Any]] = []
+            storages: list[dict[str, Any]] = []
+            tasks: list[dict[str, Any]] = []
+
+            try:
+                resources = self.client.cluster.resources.get()
+                nodes, storages = _normalize_scheduler_resources(resources)
+                resources_ok = True
+            except Exception as exc:
+                warnings.append(_scheduler_error("cluster.resources", exc))
+
+            try:
+                active_tasks = self.client.cluster.tasks.get()
+                tasks = _normalize_scheduler_tasks(active_tasks)
+                tasks_ok = True
+            except Exception as exc:
+                warnings.append(_scheduler_error("cluster.tasks", exc))
+
+            collected_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+            snapshot = {
+                "available": resources_ok or tasks_ok,
+                "partial": resources_ok != tasks_ok,
+                "stale": False,
+                "collected_at": collected_at,
+                "sources": {"resources": resources_ok, "tasks": tasks_ok},
+                "nodes": nodes,
+                "storages": storages,
+                "tasks": tasks,
+                "warnings": warnings,
+            }
+            if not snapshot["available"] and cached is not None:
+                # A brief PVE API outage should not make telemetry consumers
+                # fail.  Preserve the previous values, but make their age and
+                # lack of fresh sources explicit so policy can stay conservative.
+                snapshot = _copy_scheduler_snapshot(cached)
+                snapshot.update({
+                    "available": True,
+                    "partial": True,
+                    "stale": True,
+                    "sources": {"resources": False, "tasks": False},
+                    "warnings": list(dict.fromkeys(
+                        [*snapshot.get("warnings", []), *warnings]
+                    ))[-6:],
+                })
+
+            self._scheduler_snapshot_cache = _copy_scheduler_snapshot(snapshot)
+            self._scheduler_snapshot_cache_at = now
+            return _copy_scheduler_snapshot(snapshot)
 
     def list_templates(self) -> list[dict[str, Any]]:
         templates: list[dict[str, Any]] = []
@@ -519,6 +865,135 @@ class LiveProxmoxGateway:
         if not online:
             raise RuntimeError("В кластере нет доступных нод")
         return [node["node"] for node in online]
+
+    @staticmethod
+    def _require_online_template_node(
+        template_node: str,
+        ranked_nodes: list[str],
+        template_vmid: int,
+    ) -> None:
+        if template_node not in ranked_nodes:
+            raise RuntimeError(
+                f"Нода шаблона VMID {template_vmid} ({template_node}) недоступна. "
+                "Включите ноду-источник и повторите развёртывание."
+            )
+
+    def deployment_scheduler_scope(
+        self,
+        stand: dict[str, Any],
+        blueprint: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Describe likely deployment targets without changing PVE state.
+
+        Deployment deliberately recalculates the same placement later: this is
+        an admission hint, not a reservation, and resource state may change
+        while a request waits in the queue.
+        """
+        template_vmid = int(blueprint.get("template_vmid") or 0)
+        if template_vmid <= 0:
+            raise RuntimeError("Не указан VMID шаблона")
+        template_node = self._find_template_node(template_vmid)
+        ranked_nodes = self._rank_nodes()
+        self._require_online_template_node(template_node, ranked_nodes, template_vmid)
+        target_nodes, template_storages, linked_disk_storages = self._linked_clone_nodes(
+            template_node,
+            template_vmid,
+            ranked_nodes,
+        )
+        requested_node = str(stand.get("node") or "").strip()
+        if requested_node and requested_node != "auto":
+            if requested_node not in ranked_nodes:
+                raise RuntimeError(f"Нода {requested_node} недоступна")
+            if requested_node not in target_nodes:
+                storage_label = ", ".join(template_storages) or "хранилище шаблона"
+                raise RuntimeError(
+                    f"Linked clone шаблона VMID {template_vmid} нельзя разместить "
+                    f"на ноде {requested_node}: {storage_label} не подтверждено "
+                    "как общее и доступное."
+                )
+            target_nodes = [requested_node]
+
+        # Linked overlays are the primary storage pressure.  Templates without
+        # a detected base-volume marker still account for all attached stores.
+        pressure_storages = linked_disk_storages or template_storages
+        scope = _scheduler_distribution(
+            target_nodes,
+            [],
+            int(blueprint.get("vm_count") or 1),
+        )
+        storage_weights = self._deployment_storage_weights(
+            target_nodes,
+            pressure_storages,
+            scope["node_weights"],
+        )
+        scope["storage_weights"] = storage_weights
+        scope["storages"] = list(storage_weights)
+        scope["template_node"] = template_node
+        scope["template_vmid"] = template_vmid
+        scope["ranked_nodes"] = list(ranked_nodes)
+        scope["template_storages"] = list(template_storages)
+        scope["linked_disk_storages"] = list(linked_disk_storages)
+        return scope
+
+    def _deployment_storage_weights(
+        self,
+        target_nodes: list[str],
+        storage_ids: list[str],
+        node_weights: dict[str, int],
+    ) -> dict[str, int]:
+        """Map deployment stores to the same keys used by resource telemetry.
+
+        Shared datastores are one cluster-wide bottleneck and retain their
+        legacy bare storage ID.  A non-shared datastore is a different resource
+        on each destination node, so its key includes that actual target node.
+        When storage metadata is unavailable, a single-node fallback reserves
+        both forms; this preserves legacy adapters while still matching live
+        local-storage telemetry conservatively.
+        """
+        clean_nodes = list(dict.fromkeys(
+            str(node).strip() for node in target_nodes if str(node).strip()
+        ))
+        clean_storages = list(dict.fromkeys(
+            str(storage).strip() for storage in storage_ids if str(storage).strip()
+        ))
+        if not clean_storages:
+            return {}
+        try:
+            definitions = {
+                str(item.get("storage") or "").strip(): item
+                for item in self.client.storage.get()
+                if isinstance(item, dict) and str(item.get("storage") or "").strip()
+            }
+        except Exception:
+            definitions = {}
+
+        total = max(1, sum(max(0, int(value)) for value in node_weights.values()))
+        result: dict[str, int] = {}
+        for storage_id in clean_storages:
+            definition = definitions.get(storage_id)
+            if definition is not None:
+                shared = self._enabled_flag(definition.get("shared"), False)
+                if shared:
+                    result[storage_id] = total
+                    continue
+                for node in clean_nodes:
+                    weight = max(0, int(node_weights.get(node, 0)))
+                    if weight:
+                        result[_scheduler_storage_key(node, storage_id, False)] = weight
+                continue
+
+            # Multiple verified target nodes imply shared storage: the linked
+            # clone placement check would otherwise have fallen back to the
+            # template node.  With one target the metadata is ambiguous, so
+            # reserve both canonical possibilities instead of silently missing
+            # the live telemetry key.
+            result[storage_id] = total
+            if len(clean_nodes) == 1:
+                node = clean_nodes[0]
+                weight = max(0, int(node_weights.get(node, total)))
+                if weight:
+                    result[_scheduler_storage_key(node, storage_id, False)] = weight
+        return result
 
     @staticmethod
     def _enabled_flag(value: Any, default: bool = True) -> bool:
@@ -1182,11 +1657,37 @@ class LiveProxmoxGateway:
             template_vmid = int(blueprint["template_vmid"])
             if template_vmid <= 0:
                 raise RuntimeError("Не указан VMID шаблона")
-            template_node = self._find_template_node(template_vmid)
-            ranked_nodes = self._rank_nodes()
-            target_nodes, template_storages, linked_disk_storages = self._linked_clone_nodes(
-                template_node, template_vmid, ranked_nodes,
+            scheduler_scope = blueprint.get("_scheduler_scope")
+            scope_is_current = (
+                isinstance(scheduler_scope, dict)
+                and int(scheduler_scope.get("template_vmid") or 0) == template_vmid
+                and bool(scheduler_scope.get("template_node"))
+                and bool(scheduler_scope.get("target_nodes"))
             )
+            if scope_is_current:
+                template_node = str(scheduler_scope["template_node"])
+                ranked_nodes = [str(node) for node in scheduler_scope.get("ranked_nodes", [])]
+                target_nodes = [str(node) for node in scheduler_scope["target_nodes"]]
+                template_storages = [
+                    str(storage) for storage in scheduler_scope.get("template_storages", [])
+                ]
+                linked_disk_storages = [
+                    str(storage) for storage in scheduler_scope.get("linked_disk_storages", [])
+                ]
+                if not ranked_nodes:
+                    ranked_nodes = list(target_nodes)
+                self._require_online_template_node(
+                    template_node, ranked_nodes, template_vmid,
+                )
+            else:
+                template_node = self._find_template_node(template_vmid)
+                ranked_nodes = self._rank_nodes()
+                self._require_online_template_node(
+                    template_node, ranked_nodes, template_vmid,
+                )
+                target_nodes, template_storages, linked_disk_storages = self._linked_clone_nodes(
+                    template_node, template_vmid, ranked_nodes,
+                )
             requested_node = str(stand.get("node", "")).strip()
             if requested_node and requested_node != "auto":
                 if requested_node not in ranked_nodes:

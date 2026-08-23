@@ -629,13 +629,149 @@ exit 75`;
   }
 
   function operationQueueCard(queue = {}) {
-    const capacity = Math.max(1, Number(queue.capacity) || 10);
-    const used = clamp(Number(queue.used) || 0, 0, capacity);
+    const finiteNumber = (value, fallback = 0) => {
+      const parsed = Number(value);
+      return value !== null && value !== "" && Number.isFinite(parsed) ? parsed : fallback;
+    };
+    const pluralRu = (value, one, few, many) => {
+      const count = Math.abs(Math.round(Number(value) || 0)) % 100;
+      const last = count % 10;
+      if (count > 10 && count < 20) return many;
+      if (last === 1) return one;
+      if (last >= 2 && last <= 4) return few;
+      return many;
+    };
+    const configuredCapacity = Math.max(1, finiteNumber(queue.configured_capacity, finiteNumber(queue.capacity, 10)));
+    const effectiveCapacity = clamp(finiteNumber(queue.effective_capacity, finiteNumber(queue.capacity, configuredCapacity)), 0, configuredCapacity);
+    const internalUsed = Math.max(0, finiteNumber(queue.used));
+    const externalUsed = Math.max(0, finiteNumber(queue.external_used));
+    const totalUsed = Math.max(0, finiteNumber(queue.total_used, internalUsed + externalUsed));
+    const free = Math.max(0, finiteNumber(queue.free, effectiveCapacity - totalUsed));
     const active = Array.isArray(queue.active) ? queue.active : [];
     const queued = Array.isArray(queue.queued) ? queue.queued : [];
+    const nodes = Array.isArray(queue.nodes) ? queue.nodes : [];
+    const storages = Array.isArray(queue.storages) ? queue.storages : [];
+    const externalTaskCountKnown = queue.external_tasks_count !== undefined && queue.external_tasks_count !== null;
+    const externalTasks = Math.max(0, Math.round(finiteNumber(queue.external_tasks_count)));
+    const hasPressure = Boolean(
+      queue.pressure && typeof queue.pressure === "object" && Object.keys(queue.pressure).length,
+    );
+    const pressure = hasPressure ? queue.pressure : {};
+    const pressureWarnings = Array.isArray(pressure.warnings)
+      ? pressure.warnings.map(item => typeof item === "string" ? item : item?.message || item?.reason || "").filter(Boolean)
+      : [];
+    const pressureStale = hasPressure && (Boolean(pressure.stale) || String(pressure.state || "").toLowerCase() === "stale");
+    const pressureStateRaw = String(pressure.state || (hasPressure ? (effectiveCapacity < configuredCapacity ? "reduced" : "normal") : "static")).toLowerCase();
+    const criticalStates = new Set(["critical", "paused", "blocked", "offline", "error"]);
+    const warningStates = new Set(["warning", "warn", "elevated", "high", "reduced", "throttled", "degraded", "constrained", "limited", "busy"]);
+    const pressureTone = !hasPressure || pressureStale || ["unknown", "static"].includes(pressureStateRaw) ? "stale" : criticalStates.has(pressureStateRaw) ? "critical" : warningStates.has(pressureStateRaw) || effectiveCapacity < configuredCapacity ? "warning" : "normal";
+    const pressureTitle = !hasPressure
+      ? "Работает статический лимит"
+      : pressureStale
+      ? "Данные автолимита устарели"
+      : pressureTone === "critical"
+        ? "Новые операции ограничены"
+        : pressureTone === "warning"
+          ? "Автолимит снизил параллельность"
+          : "Автолимит работает без ограничений";
+    const pressureReason = String(pressure.reason || pressureWarnings[0] || (!hasPressure ? "Телеметрия Proxmox недоступна; используется настроенная ёмкость очереди." : pressureTone === "normal" ? "Нагрузка нод позволяет использовать полную ёмкость очереди." : "Лимит скорректирован по состоянию нод Proxmox."));
+    const pressureExtras = pressureWarnings.filter(item => item !== pressureReason);
+    const pressureAgeRaw = finiteNumber(pressure.age_seconds, -1);
+    const pressureAge = pressureAgeRaw >= 0 ? pressureAgeRaw : -1;
+    const pressureFreshness = !hasPressure
+      ? "нет данных"
+      : pressureStale
+      ? `устарело${pressureAge >= 0 ? ` · ${formatNumber(pressureAge)} с` : ""}`
+      : pressureAge >= 0
+        ? `${formatNumber(pressureAge)} с назад`
+        : pressure.collected_at
+          ? relativeTime(pressure.collected_at)
+          : "актуально";
     const labels = { deploy: "Развёртывание", rollback: "Возврат к start", delete: "Удаление", snapshot: "Снимок", power: "Питание", password: "Смена пароля" };
-    const row = (item, waiting = false) => `<div class="queue-operation"><span class="queue-operation__icon queue-operation__icon--${waiting ? "waiting" : "active"}">${icon(waiting ? "clock" : "activity")}</span><span><strong>${escapeHtml(labels[item.kind] || item.kind)}</strong><small>${escapeHtml(item.label)}${item.vm_count ? ` · ${Number(item.vm_count)} VM` : ""}</small></span><span class="queue-operation__meta">${waiting ? `№ ${Number(item.position)}` : `${Number(item.weight)} ед.`}<small>${waiting ? `${formatNumber(item.wait_seconds || 0)} с` : `${formatNumber(item.duration_seconds || 0)} с`}</small></span></div>`;
-    return `<article class="card operation-queue-card" id="operation-queue-card"><div class="card__header"><div class="card__heading"><h3 class="card__title">Очередь операций Proxmox</h3><p class="card__subtitle">Тяжёлые операции ограничиваются, лёгкие используют свободный резерв</p></div><div class="queue-capacity"><strong>${used} / ${capacity}</strong><small>единиц нагрузки</small></div></div><div class="card__body"><div class="queue-load"><div><span>Расчётная занятость</span><strong>${formatNumber(used / capacity * 100)}%</strong></div><div class="progress"><div class="progress__bar progress__bar--blue" style="width:${clamp(used / capacity * 100)}%"></div></div></div><div class="queue-columns"><section><h4>Выполняются <span>${active.length}</span></h4><div class="queue-list">${active.map(item => row(item)).join("") || `<p class="queue-empty">Кластер свободен — новая операция запустится сразу.</p>`}</div></section><section><h4>Ожидают <span>${queued.length}</span></h4><div class="queue-list">${queued.map(item => row(item, true)).join("") || `<p class="queue-empty">Операций в ожидании нет.</p>`}</div></section></div></div></article>`;
+    const weightedResources = (raw, unit) => {
+      if (!raw) return [];
+      if (Array.isArray(raw)) return raw.map(item => typeof item === "object" ? item.name || item.node || item.storage : item).filter(Boolean).map(String);
+      if (typeof raw === "string") return raw ? [raw] : [];
+      if (typeof raw !== "object") return [];
+      return Object.entries(raw).map(([name, weight]) => `${name}${Number(weight) > 0 ? ` ${formatNumber(weight)} ${unit}` : ""}`);
+    };
+    const operationResources = item => {
+      const nodeResources = weightedResources(item.node_weights || item.nodes, "ед.");
+      const storageResources = weightedResources(item.storage_weights || item.storages, "ед.");
+      const parts = [];
+      if (nodeResources.length) parts.push(`${icon("server")}<span>Ноды: ${escapeHtml(nodeResources.join(", "))}</span>`);
+      if (storageResources.length) parts.push(`${icon("activity")}<span>Storage: ${escapeHtml(storageResources.join(", "))}</span>`);
+      return parts.length ? `<span class="queue-operation__resources">${parts.join("")}</span>` : "";
+    };
+    const blockReasonLabel = rawReason => {
+      const reason = String(rawReason || "");
+      if (reason === "global_capacity") return "Общий автолимит занят";
+      if (reason === "control_reserve") return "Резерв оставлен для команд управления";
+      if (reason === "earlier_operation") return "Ожидает более раннюю операцию";
+      if (reason.startsWith("node_control_reserve:")) return `Резерв управления на ноде ${reason.split(":").slice(1).join(":")}`;
+      if (reason.startsWith("node:")) return `Лимит ноды ${reason.split(":").slice(1).join(":")} занят`;
+      if (reason.startsWith("storage:")) return `Лимит хранилища ${reason.split(":").slice(1).join(":")} занят`;
+      return reason;
+    };
+    const row = (item, waiting = false) => {
+      const rawReasons = Array.isArray(item.blocking_reasons) && item.blocking_reasons.length
+        ? item.blocking_reasons
+        : item.block_reason ? [item.block_reason] : [];
+      const blockReason = waiting ? [...new Set(rawReasons.map(blockReasonLabel).filter(Boolean))].join(" · ") : "";
+      return `<div class="queue-operation"><span class="queue-operation__icon queue-operation__icon--${waiting ? "waiting" : "active"}">${icon(waiting ? "clock" : "activity")}</span><span class="queue-operation__copy"><strong>${escapeHtml(labels[item.kind] || item.kind)}</strong><small>${escapeHtml(item.label)}${item.vm_count ? ` · ${Number(item.vm_count)} VM` : ""}</small>${operationResources(item)}${blockReason ? `<span class="queue-operation__reason">${icon("alert")}<span>${escapeHtml(blockReason)}</span></span>` : ""}</span><span class="queue-operation__meta">${waiting ? `№ ${Number(item.position)}` : `${formatNumber(item.weight)} ед.`}<small>${waiting ? `${formatNumber(item.wait_seconds || 0)} с` : `${formatNumber(item.duration_seconds || 0)} с`}</small></span></div>`;
+    };
+    const nodeCard = rawNode => {
+      const name = String(rawNode.name || rawNode.node || "Неизвестная нода");
+      const configured = Math.max(1, finiteNumber(rawNode.configured_capacity, finiteNumber(rawNode.base_capacity, finiteNumber(queue.node_capacity, configuredCapacity))));
+      const effective = clamp(finiteNumber(rawNode.effective_capacity, configured), 0, configured);
+      const used = Math.max(0, finiteNumber(rawNode.used));
+      const external = Math.max(0, finiteNumber(rawNode.external_used));
+      const total = Math.max(0, finiteNumber(rawNode.total_used, used + external));
+      const nodeExternalTaskCountKnown = rawNode.external_tasks_count !== undefined && rawNode.external_tasks_count !== null;
+      const nodeExternalTasks = Math.max(0, Math.round(finiteNumber(rawNode.external_tasks_count)));
+      const cpuKnown = rawNode.cpu_percent !== null && rawNode.cpu_percent !== undefined && Number.isFinite(Number(rawNode.cpu_percent));
+      const ramKnown = rawNode.memory_percent !== null && rawNode.memory_percent !== undefined && Number.isFinite(Number(rawNode.memory_percent));
+      const cpu = cpuKnown ? clamp(Number(rawNode.cpu_percent)) : null;
+      const ram = ramKnown ? clamp(Number(rawNode.memory_percent)) : null;
+      const state = String(rawNode.state || (effective < configured ? "reduced" : "normal")).toLowerCase();
+      const nodeTelemetryMissing = pressureStale || !hasPressure || ["unknown", "stale", "static"].includes(state) || (!cpuKnown && !ramKnown);
+      const tone = criticalStates.has(state) ? "critical" : warningStates.has(state) ? "warning" : nodeTelemetryMissing ? "stale" : effective < configured ? "warning" : "normal";
+      const stateLabel = tone === "stale" ? "Нет данных" : tone === "critical" ? "Пауза" : tone === "warning" ? "Снижен" : "Норма";
+      const utilization = effective > 0 ? clamp(total / effective * 100) : total > 0 ? 100 : 0;
+      const reason = String(rawNode.reason || (nodeTelemetryMissing ? pressureReason : ""));
+      return `<article class="queue-node queue-node--${tone}"><div class="queue-node__head"><strong>${escapeHtml(name)}</strong><span>${stateLabel}</span></div><div class="queue-node__capacity"><strong>${formatNumber(total)} ед. занято</strong><small>автолимит ${formatNumber(effective)} из ${formatNumber(configured)}</small></div><div class="progress"><div class="progress__bar ${tone === "normal" ? "progress__bar--blue" : ""}" style="width:${utilization}%"></div></div><div class="queue-node__metrics"><span>CPU <strong>${cpu === null ? "—" : `${formatNumber(cpu, 1)}%`}</strong></span><span>RAM <strong>${ram === null ? "—" : `${formatNumber(ram, 1)}%`}</strong></span><span>Deployer <strong>${formatNumber(used)}</strong></span><span>Proxmox <strong>${formatNumber(external)}</strong>${nodeExternalTaskCountKnown ? ` · ${nodeExternalTasks} ${pluralRu(nodeExternalTasks, "задача", "задачи", "задач")}` : ""}</span></div>${reason ? `<small class="queue-node__reason">${escapeHtml(reason)}</small>` : ""}</article>`;
+    };
+    const storageRow = rawStorage => {
+      const name = String(rawStorage.name || rawStorage.storage || "Неизвестное хранилище");
+      const configured = Math.max(1, finiteNumber(rawStorage.configured_capacity, finiteNumber(rawStorage.base_capacity, finiteNumber(queue.storage_capacity, configuredCapacity))));
+      const effective = clamp(finiteNumber(rawStorage.effective_capacity, configured), 0, configured);
+      const internal = Math.max(0, finiteNumber(rawStorage.used, finiteNumber(rawStorage.internal_used)));
+      const external = Math.max(0, finiteNumber(rawStorage.external_used));
+      const total = Math.max(0, finiteNumber(rawStorage.total_used, internal + external));
+      const taskCountKnown = rawStorage.external_tasks_count !== undefined && rawStorage.external_tasks_count !== null;
+      const taskCount = Math.max(0, Math.round(finiteNumber(rawStorage.external_tasks_count)));
+      const usedPercentKnown = rawStorage.used_percent !== null && rawStorage.used_percent !== undefined && Number.isFinite(Number(rawStorage.used_percent));
+      const usedPercent = usedPercentKnown ? clamp(Number(rawStorage.used_percent)) : null;
+      const state = String(rawStorage.state || (effective < configured ? "reduced" : "normal")).toLowerCase();
+      const telemetryMissing = pressureStale || !hasPressure || ["unknown", "stale", "static"].includes(state);
+      const tone = criticalStates.has(state) ? "critical" : warningStates.has(state) ? "warning" : telemetryMissing ? "stale" : effective < configured ? "warning" : "normal";
+      const reason = String(rawStorage.reason || (telemetryMissing ? pressureReason : ""));
+      return `<div class="queue-storage queue-storage--${tone}"><span class="queue-storage__icon">${icon("activity")}</span><span class="queue-storage__copy"><strong>${escapeHtml(name)}</strong><small>${escapeHtml(reason || "Хранилище участвует в текущих операциях")}</small></span><span class="queue-storage__metrics"><strong>${formatNumber(total)} / ${formatNumber(effective)} ед.</strong><small>лимит ${formatNumber(effective)} из ${formatNumber(configured)}${usedPercent === null ? "" : ` · занято ${formatNumber(usedPercent, 1)}%`}${taskCountKnown ? ` · ${taskCount} ${pluralRu(taskCount, "задача", "задачи", "задач")}` : ""}</small></span></div>`;
+    };
+    const visibleStorages = storages.filter(rawStorage => {
+      const configured = Math.max(1, finiteNumber(rawStorage.configured_capacity, finiteNumber(rawStorage.base_capacity, finiteNumber(queue.storage_capacity, configuredCapacity))));
+      const effective = clamp(finiteNumber(rawStorage.effective_capacity, configured), 0, configured);
+      const state = String(rawStorage.state || "normal").toLowerCase();
+      return effective < configured || criticalStates.has(state) || warningStates.has(state) || ["unknown", "stale", "static"].includes(state) || finiteNumber(rawStorage.total_used, finiteNumber(rawStorage.used) + finiteNumber(rawStorage.external_used)) > 0 || finiteNumber(rawStorage.external_tasks_count) > 0;
+    });
+    const utilization = effectiveCapacity > 0 ? clamp(totalUsed / effectiveCapacity * 100) : totalUsed > 0 || queued.length ? 100 : 0;
+    const loadTone = pressureTone === "critical" ? "danger" : pressureTone === "warning" || pressureTone === "stale" ? "warning" : "blue";
+    const activeEmpty = totalUsed > 0 || externalTasks > 0
+      ? "Операций Deployer сейчас нет. Активные задачи Proxmox уже учтены в автолимите."
+      : queued.length
+        ? "Активных операций Deployer нет; ожидающие запустятся после освобождения ресурсов."
+        : "Кластер свободен — новая операция запустится сразу.";
+    return `<article class="card operation-queue-card" id="operation-queue-card"><div class="card__header"><div class="card__heading"><h3 class="card__title">Очередь операций Proxmox</h3><p class="card__subtitle">Автолимит учитывает нагрузку нод и уже выполняющиеся задачи Proxmox</p></div><div class="queue-capacity"><strong>${formatNumber(totalUsed)} ед. занято</strong><small>лимит ${formatNumber(effectiveCapacity)} из ${formatNumber(configuredCapacity)}</small></div></div><div class="card__body"><div class="queue-pressure queue-pressure--${pressureTone}"><span class="queue-pressure__icon">${icon(pressureTone === "normal" ? "shield" : "alert")}</span><span class="queue-pressure__copy"><strong>${pressureTitle}</strong><small>${escapeHtml(pressureReason)}${pressureExtras.length ? ` · ${escapeHtml(pressureExtras.join(" · "))}` : ""}</small></span><span class="queue-pressure__freshness">${escapeHtml(pressureFreshness)}</span></div><div class="queue-load"><div><span>Занято относительно текущего автолимита</span><strong>${formatNumber(utilization)}%</strong></div><div class="progress"><div class="progress__bar progress__bar--${loadTone}" style="width:${utilization}%"></div></div></div><div class="queue-usage-summary"><div><span>Deployer</span><strong>${formatNumber(internalUsed)} ед.</strong></div><div><span>Задачи Proxmox</span><strong>${formatNumber(externalUsed)} ед.</strong><small>${externalTaskCountKnown ? `${externalTasks} ${pluralRu(externalTasks, "активная", "активные", "активных")}` : "нет данных"}</small></div><div><span>Всего занято</span><strong>${formatNumber(totalUsed)} ед.</strong></div><div><span>Свободно</span><strong>${formatNumber(free)} ед.</strong></div></div>${nodes.length ? `<section class="queue-node-section"><div class="queue-section-heading"><h4>Ёмкость по нодам</h4><small>CPU, RAM и активные задачи Proxmox</small></div><div class="queue-node-grid">${nodes.map(nodeCard).join("")}</div></section>` : ""}${visibleStorages.length ? `<section class="queue-storage-section"><div class="queue-section-heading"><h4>Хранилища под нагрузкой</h4><small>${visibleStorages.length} из ${storages.length}</small></div><div class="queue-storage-list">${visibleStorages.map(storageRow).join("")}</div></section>` : ""}<div class="queue-columns"><section><h4>Выполняются <span>${active.length}</span></h4><div class="queue-list">${active.map(item => row(item)).join("") || `<p class="queue-empty">${activeEmpty}</p>`}</div></section><section><h4>Ожидают <span>${queued.length}</span></h4><div class="queue-list">${queued.map(item => row(item, true)).join("") || `<p class="queue-empty">Операций в ожидании нет.</p>`}</div></section></div></div></article>`;
   }
 
   function infraNode(node) {
@@ -1303,7 +1439,30 @@ exit 75`;
       const current = document.querySelector("#operation-queue-card");
       if (current) current.outerHTML = operationQueueCard(queue);
     } catch {
-      // The next lightweight poll will retry without disturbing the page.
+      const previous = state.data.operation_queue && typeof state.data.operation_queue === "object"
+        ? state.data.operation_queue
+        : {};
+      const previousPressure = previous.pressure && typeof previous.pressure === "object"
+        ? previous.pressure
+        : {};
+      const collected = parseDate(previousPressure.collected_at || previousPressure.updated_at);
+      const priorAge = Number(previousPressure.age_seconds);
+      const localAge = collected
+        ? Math.max(Number.isFinite(priorAge) ? priorAge : 0, (Date.now() - collected.getTime()) / 1000)
+        : Math.max(0, Number.isFinite(priorAge) ? priorAge + 1.8 : 1.8);
+      const staleQueue = {
+        ...previous,
+        pressure: {
+          ...previousPressure,
+          state: "stale",
+          stale: true,
+          reason: "Не удалось обновить очередь; показаны последние полученные данные.",
+          age_seconds: Math.round(localAge * 10) / 10,
+        },
+      };
+      state.data.operation_queue = staleQueue;
+      const current = document.querySelector("#operation-queue-card");
+      if (current) current.outerHTML = operationQueueCard(staleQueue);
     } finally {
       queuePollBusy = false;
       syncQueuePolling();

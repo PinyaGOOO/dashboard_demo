@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import ipaddress
+import itertools
 import json
 import os
 import re
 import threading
 import time
+from contextlib import contextmanager, nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Iterator
 
 from .database import DashboardStore, utc_now
 from .operation_queue import ProxmoxOperationQueue
@@ -43,14 +45,42 @@ class DashboardService:
     def __init__(self, store: DashboardStore, gateway: Gateway):
         self.store = store
         self.gateway = gateway
+        def env_int(name: str, default: int, low: int = 1, high: int = 100) -> int:
+            try:
+                value = int(os.environ.get(name, str(default)))
+            except (TypeError, ValueError):
+                value = default
+            return max(low, min(value, high))
+
         try:
-            queue_capacity = int(os.environ.get("PROXMOX_OPERATION_CAPACITY", "10"))
-        except ValueError:
-            queue_capacity = 10
-        self._operation_queue = ProxmoxOperationQueue(queue_capacity)
+            telemetry_stale_seconds = float(
+                os.environ.get("PROXMOX_SCHEDULER_STALE_SECONDS", "20"),
+            )
+        except (TypeError, ValueError):
+            telemetry_stale_seconds = 20.0
+        self._scheduler_poll_seconds = float(
+            env_int("PROXMOX_SCHEDULER_POLL_SECONDS", 5, 2, 60),
+        )
+        self._operation_queue = ProxmoxOperationQueue(
+            env_int("PROXMOX_OPERATION_CAPACITY", 10),
+            node_capacity=env_int("PROXMOX_NODE_OPERATION_CAPACITY", 4),
+            storage_capacity=env_int("PROXMOX_STORAGE_OPERATION_CAPACITY", 6),
+            control_reserve=env_int("PROXMOX_CONTROL_RESERVE", 2, 0, 20),
+            node_control_reserve=env_int("PROXMOX_NODE_CONTROL_RESERVE", 1, 0, 20),
+            telemetry_stale_seconds=max(5.0, min(telemetry_stale_seconds, 300.0)),
+        )
+        self._deployment_preflight_slots = threading.BoundedSemaphore(
+            env_int("PROXMOX_PREFLIGHT_CONCURRENCY", 2, 1, 16),
+        )
+        self._scheduler_monitor_stop = threading.Event()
+        self._scheduler_monitor_thread: threading.Thread | None = None
         self._jobs: dict[int, threading.Thread] = {}
         self._job_lock = threading.Lock()
         self._stand_operation_locks: dict[int, threading.RLock] = {}
+        self._stand_gate_condition = threading.Condition(threading.RLock())
+        self._stand_gate_sequence = itertools.count(1)
+        self._stand_gate_waiting: dict[int, list[dict[str, Any]]] = {}
+        self._stand_gate_owner: dict[int, dict[str, Any]] = {}
         self._bulk_rollback_lock = threading.RLock()
         self._bulk_rollback_job: threading.Thread | None = None
         self._bulk_rollback_pending: set[int] = set()
@@ -60,6 +90,7 @@ class DashboardService:
         self._mark_interrupted_rollbacks()
         if gateway.mode == "demo":
             self._resume_demo_deployments()
+        self._start_scheduler_monitor()
 
     def _mark_interrupted_rollbacks(self) -> None:
         """A background rollback cannot survive a dashboard process restart."""
@@ -109,13 +140,239 @@ class DashboardService:
         with self._job_lock:
             return self._stand_operation_locks.setdefault(stand_id, threading.RLock())
 
+    @contextmanager
+    def _stand_admitted_operation(
+        self,
+        stand_id: int,
+        kind: str,
+        label: str,
+        weight: int,
+        **queue_kwargs: Any,
+    ) -> Iterator[dict[str, Any]]:
+        """Own one stand turn, then reserve cluster capacity without phantoms.
+
+        Only the selected local ticket may enter the process-wide scheduler.
+        A control request can cancel a heavy ticket while that ticket is still
+        waiting globally; an already admitted/mutating operation is never
+        interrupted. Thus waiting work neither owns the stand lock nor consumes
+        capacity while another request for the same stand is executing.
+        """
+        safe_stand_id = int(stand_id)
+        lane = "control" if kind in {"power", "password"} else "heavy"
+        ticket: dict[str, Any] = {
+            "id": next(self._stand_gate_sequence),
+            "lane": lane,
+            "phase": "local_wait",
+            "cancel_event": threading.Event(),
+        }
+        with self._stand_gate_condition:
+            self._stand_gate_waiting.setdefault(safe_stand_id, []).append(ticket)
+            self._stand_gate_condition.notify_all()
+
+        admitted = False
+        try:
+            while True:
+                with self._stand_gate_condition:
+                    while True:
+                        owner = self._stand_gate_owner.get(safe_stand_id)
+                        waiting = self._stand_gate_waiting.get(safe_stand_id, [])
+                        if owner is None and waiting:
+                            selected = min(
+                                waiting,
+                                key=lambda item: (
+                                    0 if item["lane"] == "control" else 1,
+                                    int(item["id"]),
+                                ),
+                            )
+                            if selected is ticket:
+                                ticket["phase"] = "global_wait"
+                                self._stand_gate_owner[safe_stand_id] = ticket
+                                break
+                        elif (
+                            lane == "control"
+                            and owner is not None
+                            and owner.get("lane") == "heavy"
+                            and owner.get("phase") == "global_wait"
+                        ):
+                            owner["cancel_event"].set()
+                        self._stand_gate_condition.wait(timeout=0.1)
+
+                admitted = False
+                try:
+                    with self._operation_queue.reserve(
+                        kind,
+                        label,
+                        weight,
+                        cancel_event=ticket["cancel_event"],
+                        **queue_kwargs,
+                    ) as admission:
+                        admitted = True
+                        with self._stand_gate_condition:
+                            ticket["phase"] = "admitted"
+                        lock = self._stand_operation_lock(safe_stand_id)
+                        lock.acquire()
+                        try:
+                            with self._stand_gate_condition:
+                                ticket["phase"] = "executing"
+                            yield admission
+                        finally:
+                            lock.release()
+                        return
+                except InterruptedError:
+                    if admitted:
+                        raise
+                    # A control request preempted this heavy global waiter.
+                    # Keep its original local sequence and retry after control.
+                    with self._stand_gate_condition:
+                        if self._stand_gate_owner.get(safe_stand_id) is ticket:
+                            self._stand_gate_owner.pop(safe_stand_id, None)
+                        ticket["phase"] = "local_wait"
+                        ticket["cancel_event"] = threading.Event()
+                        self._stand_gate_condition.notify_all()
+        finally:
+            with self._stand_gate_condition:
+                waiting = self._stand_gate_waiting.get(safe_stand_id, [])
+                if ticket in waiting:
+                    waiting.remove(ticket)
+                if not waiting:
+                    self._stand_gate_waiting.pop(safe_stand_id, None)
+                if self._stand_gate_owner.get(safe_stand_id) is ticket:
+                    self._stand_gate_owner.pop(safe_stand_id, None)
+                self._stand_gate_condition.notify_all()
+
     def _assert_not_bulk_rollback_pending(self, stand_id: int) -> None:
         with self._bulk_rollback_lock:
             if int(stand_id) in self._bulk_rollback_pending:
                 raise ConflictError("Стенд уже поставлен в очередь массового возврата к snapshot start")
 
     def operation_queue(self) -> dict[str, Any]:
+        if isinstance(self.gateway, DemoProxmoxGateway):
+            # Demo telemetry is local and deterministic; refresh its timestamp
+            # on reads so the preview does not become "stale" after 20 seconds.
+            self._operation_queue.update_pressure(self.gateway.scheduler_snapshot())
         return self._operation_queue.snapshot()
+
+    def _start_scheduler_monitor(self) -> None:
+        """Feed cached cluster pressure into admission control without blocking HTTP."""
+        if isinstance(self.gateway, DemoProxmoxGateway):
+            try:
+                self._operation_queue.update_pressure(self.gateway.scheduler_snapshot())
+            except Exception as exc:
+                self._operation_queue.mark_pressure_error(str(exc))
+            return
+        if not isinstance(self.gateway, LiveProxmoxGateway):
+            # Tests and third-party gateway adapters remain deterministic until
+            # they opt into the scheduler telemetry contract explicitly.
+            return
+        self._scheduler_monitor_thread = threading.Thread(
+            target=self._scheduler_monitor_loop,
+            name="proxmox-pressure-monitor",
+            daemon=True,
+        )
+        self._scheduler_monitor_thread.start()
+
+    def _scheduler_monitor_loop(self) -> None:
+        while not self._scheduler_monitor_stop.is_set():
+            started = time.monotonic()
+            try:
+                snapshot = self.gateway.scheduler_snapshot()
+                self._operation_queue.update_pressure(snapshot)
+            except Exception as exc:
+                # A monitoring permission or transient API failure must not
+                # deadlock mutating operations. The queue keeps its last good
+                # sample briefly and then falls back to configured limits.
+                self._operation_queue.mark_pressure_error(str(exc))
+            elapsed = time.monotonic() - started
+            self._scheduler_monitor_stop.wait(
+                max(0.25, self._scheduler_poll_seconds - elapsed),
+            )
+
+    def _operation_scope(
+        self,
+        kind: str,
+        vms: list[dict[str, Any]] | None = None,
+        *,
+        fallback_node: str = "",
+        vm_count: int = 0,
+    ) -> dict[str, Any]:
+        """Build an atomic node reservation from known VM placement."""
+        counts: dict[str, int] = {}
+        for vm in vms or []:
+            node = str(vm.get("node") or "").strip()
+            if not node or node == "auto":
+                continue
+            counts[node] = counts.get(node, 0) + 1
+        fallback = str(fallback_node or "").strip()
+        if not counts and fallback and fallback != "auto":
+            counts[fallback] = max(1, int(vm_count or 1))
+
+        control = kind in {"power", "password"}
+        node_capacity = max(1, int(getattr(self._operation_queue, "node_capacity", 4)))
+        node_reserve = max(0, int(getattr(self._operation_queue, "node_control_reserve", 1)))
+        heavy_limit = max(1, node_capacity - min(node_reserve, node_capacity - 1))
+        node_weights = {
+            node: 1 if control else min(heavy_limit, 1 + (count - 1) // 8)
+            for node, count in counts.items()
+        }
+        return {
+            "node_weights": node_weights,
+            "lane": "control" if control else "heavy",
+        }
+
+    def _deployment_operation_scope(
+        self,
+        stand: dict[str, Any],
+        blueprint: dict[str, Any],
+        vm_count: int,
+    ) -> dict[str, Any]:
+        """Preflight automatic placement and scale VM counts into queue units."""
+        scope_method = getattr(self.gateway, "deployment_scheduler_scope", None)
+        if not callable(scope_method):
+            return self._operation_scope(
+                "deploy", stand.get("vms", []),
+                fallback_node=str(stand.get("node") or ""), vm_count=vm_count,
+            )
+        # Placement discovery can fan out into several cluster reads. Limit
+        # concurrent preflights so a wave of HTTP requests cannot overload the
+        # Proxmox API before it even reaches admission control.
+        with self._deployment_preflight_slots:
+            scope_started_at = time.monotonic()
+            raw_scope = scope_method(stand, blueprint)
+        if not isinstance(raw_scope, dict):
+            return self._operation_scope(
+                "deploy", stand.get("vms", []),
+                fallback_node=str(stand.get("node") or ""), vm_count=vm_count,
+            )
+        # Reuse this read-only placement preflight when admission is immediate.
+        # If the request waits, _deploy_job discards it and asks Proxmox again.
+        blueprint["_scheduler_scope"] = dict(raw_scope)
+        blueprint["_scheduler_scope_at"] = scope_started_at
+
+        node_capacity = max(1, int(getattr(self._operation_queue, "node_capacity", 4)))
+        node_reserve = max(0, int(getattr(self._operation_queue, "node_control_reserve", 1)))
+        node_limit = max(1, node_capacity - min(node_reserve, node_capacity - 1))
+        storage_capacity = max(1, int(getattr(self._operation_queue, "storage_capacity", 6)))
+
+        def scaled(raw: Any, limit: int) -> dict[str, int]:
+            if not isinstance(raw, dict):
+                return {}
+            result: dict[str, int] = {}
+            for raw_name, raw_count in raw.items():
+                name = str(raw_name or "").strip()
+                if not name:
+                    continue
+                try:
+                    count = max(1, int(raw_count))
+                except (TypeError, ValueError):
+                    count = 1
+                result[name] = min(limit, 1 + (count - 1) // 8)
+            return result
+
+        return {
+            "node_weights": scaled(raw_scope.get("node_weights"), node_limit),
+            "storage_weights": scaled(raw_scope.get("storage_weights"), storage_capacity),
+            "lane": "heavy",
+        }
 
     def _operation_weight(self, kind: str, vm_count: int) -> int:
         count = max(1, int(vm_count or 1))
@@ -130,6 +387,19 @@ class DashboardService:
         else:
             weight = 1
         return max(1, min(weight, self._operation_queue.capacity))
+
+    def _operation_reservation(
+        self,
+        already_reserved: bool,
+        kind: str,
+        label: str,
+        weight: int,
+        **kwargs: Any,
+    ) -> Any:
+        """Return a no-op context when the caller already owns admission."""
+        if already_reserved:
+            return nullcontext({})
+        return self._operation_queue.reserve(kind, label, weight, **kwargs)
 
     def integration(self) -> dict[str, Any]:
         info = self.gateway.integration_info()
@@ -896,16 +1166,49 @@ class DashboardService:
                     f"{stand['name']} · позиция {position}", "progress", "Система",
                 )
 
-            with self._operation_queue.reserve(
-                "deploy", str(stand["name"]), self._operation_weight("deploy", vm_count),
-                vm_count=vm_count, on_queued=queued,
-            ):
-                heartbeat_thread.start()
-                try:
-                    vms = self.gateway.deploy(stand, blueprint, progress)
-                finally:
-                    heartbeat_stop.set()
-                    heartbeat_thread.join(timeout=1)
+            scope_refreshes = 0
+            while True:
+                retry_scope = False
+                scope_kwargs = self._deployment_operation_scope(stand, blueprint, vm_count)
+                with self._operation_queue.reserve(
+                    "deploy", str(stand["name"]), self._operation_weight("deploy", vm_count),
+                    vm_count=vm_count, on_queued=queued,
+                    **scope_kwargs,
+                ) as admission:
+                    has_scope = isinstance(blueprint.get("_scheduler_scope"), dict)
+                    try:
+                        scope_age = time.monotonic() - float(
+                            blueprint.get("_scheduler_scope_at") or 0,
+                        )
+                    except (TypeError, ValueError):
+                        scope_age = float("inf")
+                    retry_scope = has_scope and (
+                        float(admission.get("wait_seconds") or 0) > 5.0
+                        or scope_age > 60.0
+                    )
+                    if retry_scope:
+                        # Release the old node/storage reservation first, then
+                        # repeat preflight and admission atomically. Recomputing
+                        # placement inside an old reservation would account the
+                        # real clone wave against the wrong resources.
+                        blueprint.pop("_scheduler_scope", None)
+                        blueprint.pop("_scheduler_scope_at", None)
+                    else:
+                        heartbeat_thread.start()
+                        try:
+                            vms = self.gateway.deploy(stand, blueprint, progress)
+                        finally:
+                            heartbeat_stop.set()
+                            heartbeat_thread.join(timeout=1)
+                if retry_scope:
+                    scope_refreshes += 1
+                    if scope_refreshes >= 3:
+                        raise RuntimeError(
+                            "Не удалось подтвердить актуальное размещение после ожидания "
+                            "очереди Proxmox. Повторите развёртывание после снижения нагрузки."
+                        )
+                    continue
+                break
             validation_error = ""
             normalized_vms: list[dict[str, Any]] = []
             if not isinstance(vms, list):
@@ -956,6 +1259,11 @@ class DashboardService:
                         "delete", f"{stand['name']} · очистка неудачного развёртывания",
                         self._operation_weight("delete", len(cleanup_vmids)),
                         vm_count=len(cleanup_vmids),
+                        **self._operation_scope(
+                            "delete", stand.get("vms", []),
+                            fallback_node=str(stand.get("node") or ""),
+                            vm_count=len(cleanup_vmids),
+                        ),
                     ):
                         self.gateway.delete_stand(stand, cleanup_vmids)
                 except Exception as exc:
@@ -1080,10 +1388,88 @@ class DashboardService:
     ) -> dict[str, Any]:
         if not _bulk_reserved:
             self._assert_not_bulk_rollback_pending(stand_id)
-        with self._stand_operation_lock(stand_id):
-            return self._stand_action_locked(stand_id, action, payload)
+        prepared_payload = dict(payload or {})
+        stand = self.get_stand(stand_id)
+        if stand["status"] in {"provisioning", "resetting"}:
+            label = "развёртывания" if stand["status"] == "provisioning" else "возврата к исходному состоянию"
+            raise ConflictError(f"Действие недоступно во время {label}")
+        with self._job_lock:
+            if stand_id in self._jobs:
+                raise ConflictError("Для стенда уже выполняется фоновая операция")
 
-    def _stand_action_locked(self, stand_id: int, action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        queue_vms = [vm for vm in stand.get("vms", []) if vm.get("vmid") is not None]
+        queue_kind = {
+            "start": "power",
+            "stop": "power",
+            "restart": "power",
+            "snapshot": "snapshot",
+            "delete_pool_stands": "delete",
+            "rotate_password": "password",
+        }.get(action)
+        if action == "snapshot":
+            # Keep the generated name stable while the request is queued.
+            prepared_payload["name"] = self._snapshot_label(prepared_payload.get("name"))
+        if action in {"start", "stop", "restart", "snapshot", "rotate_password"} and not queue_vms:
+            raise ConflictError("В стенде нет VM для выполнения операции")
+        if action == "rotate_password" and stand["status"] != "running":
+            raise ConflictError("Смена пароля доступна только для запущенного стенда")
+        if action == "delete_pool_stands":
+            if str(stand.get("origin") or "") != "imported":
+                raise ValidationError("Удаление всех VM доступно только для подключённой карточки pool")
+            if stand.get("check_status") == "running" or any(
+                vm.get("check_status") == "running" for vm in stand.get("vms", [])
+            ):
+                raise ConflictError("Сначала дождитесь завершения автопроверки")
+            queue_vms = [
+                dict(vm) for vm in self.gateway.pool_members(str(stand["pool_id"]))
+                if vm.get("vmid") is not None
+            ]
+            if not queue_vms:
+                raise ConflictError("В pool нет VM для удаления")
+            prepared_payload["_scheduler_pool_vmids"] = sorted(
+                int(vm["vmid"]) for vm in queue_vms
+            )
+            prepared_payload["_scheduler_pool_placements"] = sorted(
+                (
+                    int(vm["vmid"]),
+                    str(vm.get("node") or ""),
+                    str(vm.get("name") or ""),
+                )
+                for vm in queue_vms
+            )
+        vm_count = len(queue_vms)
+        if queue_kind:
+            queue_label = f"{stand['name']} · {action}"
+            if action == "snapshot":
+                queue_label = f"{stand['name']} · {prepared_payload['name']}"
+            elif action == "delete_pool_stands":
+                queue_label = f"{stand['pool_id']} · удалить все VM"
+            with self._stand_admitted_operation(
+                stand_id,
+                queue_kind, queue_label, self._operation_weight(queue_kind, vm_count),
+                vm_count=vm_count,
+                **self._operation_scope(
+                    queue_kind, queue_vms, vm_count=vm_count,
+                ),
+            ):
+                if not _bulk_reserved:
+                    self._assert_not_bulk_rollback_pending(stand_id)
+                return self._stand_action_locked(
+                    stand_id, action, prepared_payload, _queue_reserved=True,
+                )
+        with self._stand_operation_lock(stand_id):
+            if not _bulk_reserved:
+                self._assert_not_bulk_rollback_pending(stand_id)
+            return self._stand_action_locked(stand_id, action, prepared_payload)
+
+    def _stand_action_locked(
+        self,
+        stand_id: int,
+        action: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        _queue_reserved: bool = False,
+    ) -> dict[str, Any]:
         payload = payload or {}
         stand = self.get_stand(stand_id)
         vmids = [int(vm["vmid"]) for vm in stand["vms"] if vm.get("vmid") is not None]
@@ -1101,9 +1487,11 @@ class DashboardService:
         if action in {"start", "stop", "restart"}:
             if not vmids:
                 raise ConflictError("В стенде нет VM для управления питанием")
-            with self._operation_queue.reserve(
+            with self._operation_reservation(
+                _queue_reserved,
                 "power", f"{stand['name']} · {action}", self._operation_weight("power", len(vmids)),
                 vm_count=len(vmids),
+                **self._operation_scope("power", stand.get("vms", []), vm_count=len(vmids)),
             ):
                 self.gateway.power_action(vmids, action)
             new_status = "stopped" if action == "stop" else "running"
@@ -1117,9 +1505,11 @@ class DashboardService:
             if not vmids:
                 raise ConflictError("В стенде нет VM для создания снимка")
             description = str(payload.get("description", ""))[:255]
-            with self._operation_queue.reserve(
+            with self._operation_reservation(
+                _queue_reserved,
                 "snapshot", f"{stand['name']} · {label}", self._operation_weight("snapshot", len(vmids)),
                 vm_count=len(vmids),
+                **self._operation_scope("snapshot", stand.get("vms", []), vm_count=len(vmids)),
             ):
                 self.gateway.create_snapshot(vmids, label, description)
             self.store.execute(
@@ -1145,10 +1535,38 @@ class DashboardService:
             current_vmids = [int(vm["vmid"]) for vm in current_vms]
             if not current_vmids:
                 raise ConflictError("В pool нет VM для удаления")
+            planned_vmids = payload.get("_scheduler_pool_vmids")
+            if planned_vmids is not None and sorted(current_vmids) != sorted(
+                int(vmid) for vmid in planned_vmids
+            ):
+                raise ConflictError(
+                    "Состав pool изменился во время ожидания. Повторите удаление, "
+                    "чтобы очередь пересчитала нагрузку."
+                )
+            planned_placements = payload.get("_scheduler_pool_placements")
+            current_placements = sorted(
+                (
+                    int(vm["vmid"]),
+                    str(vm.get("node") or ""),
+                    str(vm.get("name") or ""),
+                )
+                for vm in current_vms
+            )
+            if planned_placements is not None and current_placements != sorted(
+                (int(vmid), str(node or ""), str(name or ""))
+                for vmid, node, name in planned_placements
+            ):
+                raise ConflictError(
+                    "Состав или размещение VM в pool изменились во время ожидания. "
+                    "Повторите удаление, чтобы очередь заново проверила владельцев "
+                    "VM и пересчитала нагрузку."
+                )
             deletion_scope = {**stand, "origin": "existing", "vms": current_vms}
-            with self._operation_queue.reserve(
+            with self._operation_reservation(
+                _queue_reserved,
                 "delete", f"{stand['pool_id']} · удалить все VM",
                 self._operation_weight("delete", len(current_vmids)), vm_count=len(current_vmids),
+                **self._operation_scope("delete", current_vms, vm_count=len(current_vmids)),
             ):
                 self.gateway.delete_stand(deletion_scope, current_vmids)
             self.store.execute("DELETE FROM stand_vms WHERE stand_id = ?", (stand_id,))
@@ -1182,9 +1600,11 @@ class DashboardService:
                 )
             if not vmids:
                 raise ConflictError("В стенде нет VM для смены пароля")
-            with self._operation_queue.reserve(
+            with self._operation_reservation(
+                _queue_reserved,
                 "password", f"{stand['name']} · смена пароля",
                 self._operation_weight("password", len(vmids)), vm_count=len(vmids),
+                **self._operation_scope("password", stand.get("vms", []), vm_count=len(vmids)),
             ):
                 self.gateway.rotate_password(vmids, username, password)
             changed_at = utc_now()
@@ -1487,6 +1907,7 @@ class DashboardService:
                 "rollback", f"{stand_name} · snapshot start",
                 self._operation_weight("rollback", len(vmids)), vm_count=len(vmids),
                 on_queued=queued,
+                **self._operation_scope("rollback", raw_vms, vm_count=len(vmids)),
             ):
                 self.gateway.rollback_snapshot(vmids, "start", start=True, progress=progress)
                 rollback_applied = True
@@ -1616,8 +2037,41 @@ class DashboardService:
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self._assert_not_bulk_rollback_pending(stand_id)
+        prepared_payload = dict(payload or {})
+        stand = self.get_stand(stand_id)
+        if stand["status"] in {"provisioning", "resetting"}:
+            raise ConflictError("Действие VM недоступно во время фоновой операции стенда")
+        with self._job_lock:
+            if stand_id in self._jobs:
+                raise ConflictError("Для стенда уже выполняется фоновая операция")
+        vm = next(
+            (item for item in stand.get("vms", []) if int(item.get("vmid") or -1) == vmid),
+            None,
+        )
+        if not vm:
+            raise NotFoundError("VM не найдена в этом стенде")
+        queue_kind = {"snapshot": "snapshot", "rotate_password": "password"}.get(action)
+        if action == "snapshot":
+            prepared_payload["name"] = self._snapshot_label(prepared_payload.get("name"))
+        if action == "rotate_password" and (
+            stand["status"] != "running" or vm.get("status") != "running"
+        ):
+            raise ConflictError("Смена пароля доступна только для запущенной VM")
+        if queue_kind:
+            suffix = prepared_payload.get("name") if action == "snapshot" else "смена пароля"
+            with self._stand_admitted_operation(
+                stand_id,
+                queue_kind, f"{stand['name']} · VM {vmid} · {suffix}",
+                self._operation_weight(queue_kind, 1), vm_count=1,
+                **self._operation_scope(queue_kind, [vm], vm_count=1),
+            ):
+                self._assert_not_bulk_rollback_pending(stand_id)
+                return self._vm_action_locked(
+                    stand_id, vmid, action, prepared_payload, _queue_reserved=True,
+                )
         with self._stand_operation_lock(stand_id):
-            return self._vm_action_locked(stand_id, vmid, action, payload)
+            self._assert_not_bulk_rollback_pending(stand_id)
+            return self._vm_action_locked(stand_id, vmid, action, prepared_payload)
 
     def _vm_action_locked(
         self,
@@ -1625,6 +2079,8 @@ class DashboardService:
         vmid: int,
         action: str,
         payload: dict[str, Any] | None = None,
+        *,
+        _queue_reserved: bool = False,
     ) -> dict[str, Any]:
         payload = payload or {}
         stand = self.get_stand(stand_id)
@@ -1647,9 +2103,11 @@ class DashboardService:
         if action == "snapshot":
             label = self._snapshot_label(payload.get("name"))
             description = str(payload.get("description", ""))[:255]
-            with self._operation_queue.reserve(
+            with self._operation_reservation(
+                _queue_reserved,
                 "snapshot", f"{stand['name']} · VM {vmid} · {label}",
                 self._operation_weight("snapshot", 1), vm_count=1,
+                **self._operation_scope("snapshot", [vm], vm_count=1),
             ):
                 self.gateway.create_snapshot([vmid], label, description)
             self.store.execute(
@@ -1681,9 +2139,11 @@ class DashboardService:
                 raise ValidationError(
                     f"Proxmox принимает пароль длиной не более {PROXMOX_PASSWORD_MAX_LENGTH} символов"
                 )
-            with self._operation_queue.reserve(
+            with self._operation_reservation(
+                _queue_reserved,
                 "password", f"{stand['name']} · VM {vmid} · смена пароля",
                 self._operation_weight("password", 1), vm_count=1,
+                **self._operation_scope("password", [vm], vm_count=1),
             ):
                 self.gateway.rotate_password([vmid], guest_username, password)
             changed_at = utc_now()
@@ -1728,10 +2188,33 @@ class DashboardService:
 
     def delete_stand(self, stand_id: int) -> None:
         self._assert_not_bulk_rollback_pending(stand_id)
+        stand = self.get_stand(stand_id)
+        if stand["status"] in {"provisioning", "resetting"}:
+            raise ConflictError("Нельзя удалить стенд во время фоновой операции")
+        with self._job_lock:
+            if stand_id in self._jobs:
+                raise ConflictError("Нельзя удалить стенд во время фоновой операции")
+        if stand["check_status"] == "running" or any(
+            vm.get("check_status") == "running" for vm in stand.get("vms", [])
+        ):
+            raise ConflictError("Нельзя удалить стенд во время автопроверки")
+        vmids = [int(vm["vmid"]) for vm in stand.get("vms", []) if vm.get("vmid") is not None]
+        imported = str(stand.get("origin") or "deployed") == "imported"
+        if not imported:
+            with self._stand_admitted_operation(
+                stand_id,
+                "delete", f"{stand['name']} · удаление",
+                self._operation_weight("delete", len(vmids)), vm_count=len(vmids),
+                **self._operation_scope("delete", stand.get("vms", []), vm_count=len(vmids)),
+            ):
+                self._assert_not_bulk_rollback_pending(stand_id)
+                self._delete_stand_locked(stand_id, _queue_reserved=True)
+                return
         with self._stand_operation_lock(stand_id):
+            self._assert_not_bulk_rollback_pending(stand_id)
             self._delete_stand_locked(stand_id)
 
-    def _delete_stand_locked(self, stand_id: int) -> None:
+    def _delete_stand_locked(self, stand_id: int, *, _queue_reserved: bool = False) -> None:
         stand = self.get_stand(stand_id)
         if stand["status"] in {"provisioning", "resetting"}:
             raise ConflictError("Нельзя удалить стенд во время фоновой операции")
@@ -1748,9 +2231,11 @@ class DashboardService:
         # live gateway to inspect the owned pool.  This makes a second cleanup
         # attempt possible if the automatic rollback only partially succeeded.
         if not imported:
-            with self._operation_queue.reserve(
+            with self._operation_reservation(
+                _queue_reserved,
                 "delete", f"{stand['name']} · удаление",
                 self._operation_weight("delete", len(vmids)), vm_count=len(vmids),
+                **self._operation_scope("delete", stand.get("vms", []), vm_count=len(vmids)),
             ):
                 self.gateway.delete_stand(stand, vmids)
         self.store.execute("DELETE FROM stands WHERE id = ?", (stand_id,))
