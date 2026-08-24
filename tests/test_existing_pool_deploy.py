@@ -372,6 +372,70 @@ class ExistingPoolGatewaySafetyTests(unittest.TestCase):
         vm_api.status.start.post.assert_called_once_with()
         sleep.assert_not_called()
 
+    def test_stop_submission_retries_when_proxmox_worker_is_temporarily_busy(self) -> None:
+        gateway = LiveProxmoxGateway.__new__(LiveProxmoxGateway)
+        gateway.client = MagicMock()
+        vm_api = gateway.client.nodes.return_value.qemu.return_value
+        vm_api.status.stop.post.side_effect = [
+            RuntimeError("500 Internal Server Error: got no worker upid - start worker failed"),
+            "UPID:pve-1:stop-290",
+        ]
+        vm_api.status.current.get.return_value = {"status": "running"}
+
+        with patch("dashboard_backend.proxmox_gateway.time.sleep") as sleep:
+            result = gateway._submit_stop_task("pve-1", 290)
+
+        self.assertEqual(result, "UPID:pve-1:stop-290")
+        self.assertEqual(vm_api.status.stop.post.call_count, 2)
+        sleep.assert_called_once_with(2)
+
+    def test_stop_submission_accepts_ambiguous_response_when_vm_is_stopped(self) -> None:
+        gateway = LiveProxmoxGateway.__new__(LiveProxmoxGateway)
+        gateway.client = MagicMock()
+        vm_api = gateway.client.nodes.return_value.qemu.return_value
+        vm_api.status.stop.post.side_effect = RuntimeError(
+            "500 Internal Server Error: got no worker upid - start worker failed"
+        )
+        vm_api.status.current.get.return_value = {"status": "stopped"}
+
+        with patch("dashboard_backend.proxmox_gateway.time.sleep") as sleep:
+            result = gateway._submit_stop_task("pve-1", 290)
+
+        self.assertIsNone(result)
+        vm_api.status.stop.post.assert_called_once_with()
+        sleep.assert_not_called()
+
+    def test_delete_submission_retries_only_for_same_vm(self) -> None:
+        gateway = LiveProxmoxGateway.__new__(LiveProxmoxGateway)
+        gateway.client = MagicMock()
+        vm_api = gateway.client.nodes.return_value.qemu.return_value
+        vm_api.delete.side_effect = [
+            RuntimeError("500 Internal Server Error: got no worker upid - start worker failed"),
+            "UPID:pve-1:destroy-290",
+        ]
+        vm_api.config.get.return_value = {"name": "Blyat-1"}
+
+        with patch("dashboard_backend.proxmox_gateway.time.sleep") as sleep:
+            result = gateway._submit_delete_task("pve-1", 290, "Blyat-1")
+
+        self.assertEqual(result, "UPID:pve-1:destroy-290")
+        self.assertEqual(vm_api.delete.call_count, 2)
+        sleep.assert_called_once_with(2)
+
+    def test_delete_submission_refuses_reused_vmid(self) -> None:
+        gateway = LiveProxmoxGateway.__new__(LiveProxmoxGateway)
+        gateway.client = MagicMock()
+        vm_api = gateway.client.nodes.return_value.qemu.return_value
+        vm_api.delete.side_effect = RuntimeError(
+            "500 Internal Server Error: got no worker upid - start worker failed"
+        )
+        vm_api.config.get.return_value = {"name": "someone-elses-vm"}
+
+        with self.assertRaisesRegex(RuntimeError, "повтор удаления отменён"):
+            gateway._submit_delete_task("pve-1", 290, "Blyat-1")
+
+        vm_api.delete.assert_called_once_with(purge=1)
+
     def test_clone_submission_retries_when_worker_never_accepted_task(self) -> None:
         gateway = LiveProxmoxGateway.__new__(LiveProxmoxGateway)
         gateway.client = MagicMock()

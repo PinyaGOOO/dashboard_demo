@@ -960,6 +960,79 @@ class LiveProxmoxGateway:
                 time.sleep(min((attempt + 1) * 2, 6))
         return None
 
+    def _submit_stop_task(self, node: str, vmid: int) -> str | None:
+        """Submit a hard stop without duplicating an ambiguously accepted task."""
+        vm_api = self.client.nodes(node).qemu(vmid)
+        for attempt in range(4):
+            try:
+                upid = vm_api.status.stop.post()
+                return str(upid) if upid else None
+            except Exception as exc:
+                if not self._worker_start_error(exc):
+                    raise RuntimeError(f"Остановка VM {vmid} не удалась: {exc}") from exc
+                try:
+                    if str(vm_api.status.current.get().get("status") or "") != "running":
+                        return None
+                except Exception:
+                    pass
+                if attempt >= 3:
+                    raise RuntimeError(
+                        f"Остановка VM {vmid} не удалась после повторных попыток: {exc}"
+                    ) from exc
+                time.sleep(min((attempt + 1) * 2, 6))
+        return None
+
+    @staticmethod
+    def _missing_vm_error(exc: Exception) -> bool:
+        status_code = getattr(exc, "status_code", None)
+        response = getattr(exc, "response", None)
+        if status_code is None and response is not None:
+            status_code = getattr(response, "status_code", None)
+        try:
+            if int(status_code) == 404:
+                return True
+        except (TypeError, ValueError):
+            pass
+        detail = " ".join(str(exc).lower().split())
+        return "does not exist" in detail or "no such vm" in detail
+
+    def _submit_delete_task(
+        self,
+        node: str,
+        vmid: int,
+        expected_name: str = "",
+    ) -> str | None:
+        """Retry a rejected destroy only while the same VM still exists."""
+        vm_api = self.client.nodes(node).qemu(vmid)
+        for attempt in range(4):
+            try:
+                upid = vm_api.delete(purge=1)
+                return str(upid) if upid else None
+            except Exception as exc:
+                if not self._worker_start_error(exc):
+                    raise
+                try:
+                    config = vm_api.config.get()
+                except Exception as state_exc:
+                    if self._missing_vm_error(state_exc):
+                        return None
+                    raise RuntimeError(
+                        f"Не удалось проверить VM {vmid} после неоднозначного ответа удаления: "
+                        f"{state_exc}"
+                    ) from state_exc
+                actual_name = str(config.get("name") or "")
+                if expected_name and actual_name != expected_name:
+                    raise RuntimeError(
+                        f"VMID {vmid} теперь принадлежит VM {actual_name or 'без имени'}; "
+                        "повтор удаления отменён"
+                    ) from exc
+                if attempt >= 3:
+                    raise RuntimeError(
+                        f"Удаление VM {vmid} не запустилось после повторных попыток: {exc}"
+                    ) from exc
+                time.sleep(min((attempt + 1) * 2, 6))
+        return None
+
     def _vm_inventory(
         self,
         vmids: list[int],
@@ -1636,7 +1709,12 @@ class LiveProxmoxGateway:
         detail = " ".join(str(exc).lower().split())
         return "is running" in detail and ("destroy" in detail or "delete" in detail)
 
-    def _delete_vm_after_stop(self, node: str, vmid: int) -> Any:
+    def _delete_vm_after_stop(
+        self,
+        node: str,
+        vmid: int,
+        expected_name: str = "",
+    ) -> Any:
         """Delete a VM, recovering from a stale or racing running state."""
         api = self.client.nodes(node).qemu(vmid)
         last_error: Exception | None = None
@@ -1646,13 +1724,13 @@ class LiveProxmoxGateway:
             except Exception:
                 current = {}
             if str(current.get("status") or "").lower() == "running":
-                upid = api.status.stop.post()
+                upid = self._submit_stop_task(node, vmid)
                 if upid:
                     self._wait_task(node, str(upid), timeout=180)
                 else:
                     time.sleep(1)
             try:
-                return api.delete(purge=1)
+                return self._submit_delete_task(node, vmid, expected_name)
             except Exception as exc:
                 last_error = exc
                 if not self._running_destroy_error(exc) or attempt >= 2:
@@ -1750,7 +1828,9 @@ class LiveProxmoxGateway:
             try:
                 # destroy-unreferenced-disks is not available in older PVE
                 # schemas. Destroying the VM already removes referenced disks.
-                upid = self._delete_vm_after_stop(node, vmid)
+                upid = self._delete_vm_after_stop(
+                    node, vmid, pool_member_names.get(vmid, ""),
+                )
                 if upid:
                     delete_tasks.append((node, str(upid)))
             except Exception as exc:
@@ -2667,17 +2747,25 @@ class LiveProxmoxGateway:
                 )
             existing_vmids = sorted(pool_vmids & set(vmids))
         inventory = self._vm_inventory(existing_vmids) if existing_vmids else {}
+        expected_names = {
+            int(vm["vmid"]): str(vm.get("name") or "")
+            for vm in stand.get("vms", [])
+            if vm.get("vmid") is not None
+        }
         stop_tasks: list[tuple[str, str]] = []
+        stop_batch = self._batch_limit("PROXMOX_DELETE_BATCH")
         for vmid in existing_vmids:
             node = str(inventory[vmid]["node"])
-            api = self.client.nodes(node).qemu(vmid)
             if inventory[vmid]["status"] == "running":
                 # Deletion is already explicitly confirmed by the operator, so
                 # use a parallel hard stop instead of waiting for 25 sequential
                 # guest shutdown timeouts.
-                upid = api.status.stop.post()
+                upid = self._submit_stop_task(node, vmid)
                 if upid:
                     stop_tasks.append((node, str(upid)))
+                if len(stop_tasks) >= stop_batch:
+                    self._wait_tasks(stop_tasks, timeout=300)
+                    stop_tasks.clear()
         self._wait_tasks(stop_tasks, timeout=300)
 
         delete_tasks: list[tuple[str, str]] = []
@@ -2691,7 +2779,9 @@ class LiveProxmoxGateway:
                 pass
             # PVE 7 and some early PVE 8 builds reject
             # destroy-unreferenced-disks as an unknown schema property.
-            upid = self._delete_vm_after_stop(node, vmid)
+            upid = self._delete_vm_after_stop(
+                node, vmid, expected_names.get(vmid, ""),
+            )
             if upid:
                 delete_tasks.append((node, str(upid)))
             if len(delete_tasks) >= delete_batch:
