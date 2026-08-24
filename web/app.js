@@ -83,9 +83,22 @@ network_ready() {
 }
 
 if command -v ifreload >/dev/null 2>&1; then
-  if ! SYNTAX_OUTPUT="$(ifreload -a -s 2>&1)"; then
+  SYNTAX_OUTPUT=""
+  for SYNTAX_ATTEMPT in 1 2 3 4 5; do
+    if SYNTAX_OUTPUT="$(ifreload -a -s 2>&1)"; then
+      SYNTAX_OUTPUT=""
+      break
+    fi
+    if grep -Fqi "Another instance of this program is already running" <<<"\${SYNTAX_OUTPUT}"; then
+      sleep 2
+      continue
+    fi
     echo "Ошибка синтаксиса сетевой конфигурации: \${SYNTAX_OUTPUT}" >&2
     exit 78
+  done
+  if [[ -n "\${SYNTAX_OUTPUT}" ]]; then
+    echo "ifreload всё ещё занят другим процессом: \${SYNTAX_OUTPUT}" >&2
+    exit 75
   fi
   if ! ifreload -a; then
     echo "ifreload не смог сразу применить конфигурацию; backend выполнит восстановление" >&2

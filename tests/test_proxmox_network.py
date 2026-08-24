@@ -116,6 +116,56 @@ class ProxmoxNetworkReadinessTests(unittest.TestCase):
         gateway.client.nodes.assert_not_called()
         gateway._wait_task.assert_not_called()
 
+    def test_deploy_bootstrap_retries_transient_ifreload_lock(self) -> None:
+        gateway = self.gateway()
+        gateway._guest_script = MagicMock(side_effect=[
+            {
+                "exit_code": 78,
+                "stdout": "",
+                "stderr": "error: Another instance of this program is already running.",
+            },
+            {
+                "exit_code": 78,
+                "stdout": "",
+                "stderr": "error: Another instance of this program is already running.",
+            },
+            {"exit_code": 0, "stdout": "ready", "stderr": ""},
+        ])
+
+        with patch("dashboard_backend.proxmox_gateway.time.sleep") as sleep:
+            result = gateway._run_deploy_script(
+                "pve-a",
+                501,
+                "#!/bin/bash\nifreload -a",
+                {"VM_IP": "10.39.4.23"},
+                retry_ifreload_busy=True,
+            )
+
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(gateway._guest_script.call_count, 3)
+        sleep.assert_has_calls([call(2), call(4)])
+
+    def test_deploy_bootstrap_does_not_retry_real_script_error(self) -> None:
+        gateway = self.gateway()
+        gateway._guest_script = MagicMock(return_value={
+            "exit_code": 78,
+            "stdout": "",
+            "stderr": "invalid /etc/network/interfaces syntax",
+        })
+
+        with patch("dashboard_backend.proxmox_gateway.time.sleep") as sleep:
+            result = gateway._run_deploy_script(
+                "pve-a",
+                501,
+                "#!/bin/bash\nexit 78",
+                {"VM_IP": "10.39.4.23"},
+                retry_ifreload_busy=True,
+            )
+
+        self.assertEqual(result["exit_code"], 78)
+        gateway._guest_script.assert_called_once()
+        sleep.assert_not_called()
+
     def test_soft_failure_reboots_once_and_waits_for_new_boot_id(self) -> None:
         gateway = self.gateway()
         old_boot_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"

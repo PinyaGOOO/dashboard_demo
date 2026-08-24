@@ -318,6 +318,32 @@ class ExistingPoolServiceTests(unittest.TestCase):
 
 
 class ExistingPoolGatewaySafetyTests(unittest.TestCase):
+    def test_delete_vm_retries_after_running_destroy_race(self) -> None:
+        gateway = LiveProxmoxGateway.__new__(LiveProxmoxGateway)
+        gateway.client = MagicMock()
+        gateway._wait_task = MagicMock()
+        vm_api = gateway.client.nodes.return_value.qemu.return_value
+        vm_api.status.current.get.side_effect = [
+            {"status": "running"},
+            {"status": "stopped"},
+        ]
+        vm_api.status.stop.post.return_value = "UPID:pve-1:stop-290"
+        vm_api.delete.side_effect = [
+            RuntimeError("500 Internal Server Error: VM 290 is running - destroy failed"),
+            "UPID:pve-1:delete-290",
+        ]
+
+        with patch("dashboard_backend.proxmox_gateway.time.sleep") as sleep:
+            result = gateway._delete_vm_after_stop("pve-1", 290)
+
+        self.assertEqual(result, "UPID:pve-1:delete-290")
+        vm_api.status.stop.post.assert_called_once_with()
+        gateway._wait_task.assert_called_once_with(
+            "pve-1", "UPID:pve-1:stop-290", timeout=180
+        )
+        self.assertEqual(vm_api.delete.call_count, 2)
+        sleep.assert_called_once_with(1)
+
     def test_failed_deploy_cleanup_removes_only_matching_new_vm(self) -> None:
         gateway = LiveProxmoxGateway.__new__(LiveProxmoxGateway)
         gateway.client = MagicMock()

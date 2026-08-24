@@ -107,11 +107,25 @@ fi
 for attempt in 1 2; do
   echo "Попытка ${attempt}: применяем сетевую конфигурацию ${NETWORK_INTERFACE}" >&2
   if command -v ifreload >/dev/null 2>&1; then
-    syntax_output="$(ifreload -a -s 2>&1)" || {
+    syntax_output=""
+    for syntax_attempt in 1 2 3 4 5; do
+      if syntax_output="$(ifreload -a -s 2>&1)"; then
+        syntax_output=""
+        break
+      fi
+      if grep -Fqi "Another instance of this program is already running" <<<"${syntax_output}"; then
+        sleep 2
+        continue
+      fi
       echo "Ошибка синтаксиса /etc/network/interfaces: ${syntax_output}" >&2
       network_diagnostics
       exit 2
-    }
+    done
+    if [[ -n "${syntax_output}" ]]; then
+      echo "ifreload всё ещё занят другим процессом: ${syntax_output}" >&2
+      network_diagnostics
+      exit 1
+    fi
     ifreload -a >&2 2>&1 || true
   else
     echo "ifreload не найден; применяем конфигурацию безопасной перезагрузкой VM" >&2
@@ -1362,6 +1376,44 @@ class LiveProxmoxGateway:
         return detail[-1200:] if detail else f"exit code {result.get('exit_code', 1)}"
 
     @staticmethod
+    def _ifreload_busy(result: dict[str, Any] | None) -> bool:
+        if not result:
+            return False
+        detail = "\n".join((
+            str(result.get("stderr") or ""),
+            str(result.get("stdout") or ""),
+        )).lower()
+        return "another instance of this program is already running" in detail
+
+    def _run_deploy_script(
+        self,
+        node: str,
+        vmid: int,
+        script: str,
+        environment: dict[str, str],
+        *,
+        retry_ifreload_busy: bool,
+    ) -> dict[str, Any]:
+        """Run bootstrap, retrying only the known transient ifreload lock."""
+        attempts = 5 if retry_ifreload_busy else 1
+        result: dict[str, Any] = {}
+        for attempt in range(1, attempts + 1):
+            result = self._guest_script(
+                node,
+                vmid,
+                script,
+                "deploy",
+                environment,
+                timeout=900,
+            )
+            if int(result.get("exit_code", 1)) == 0:
+                return result
+            if not self._ifreload_busy(result) or attempt >= attempts:
+                return result
+            time.sleep(min(attempt * 2, 6))
+        return result
+
+    @staticmethod
     def _network_boot_id(result: dict[str, Any] | None) -> str:
         if not result:
             return ""
@@ -1461,6 +1513,36 @@ class LiveProxmoxGateway:
             f"интерфейс {interface}, ожидался {expected_cidr}. {last_detail}"
         )
 
+    @staticmethod
+    def _running_destroy_error(exc: Exception) -> bool:
+        detail = " ".join(str(exc).lower().split())
+        return "is running" in detail and ("destroy" in detail or "delete" in detail)
+
+    def _delete_vm_after_stop(self, node: str, vmid: int) -> Any:
+        """Delete a VM, recovering from a stale or racing running state."""
+        api = self.client.nodes(node).qemu(vmid)
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                current = api.status.current.get()
+            except Exception:
+                current = {}
+            if str(current.get("status") or "").lower() == "running":
+                upid = api.status.stop.post()
+                if upid:
+                    self._wait_task(node, str(upid), timeout=180)
+                else:
+                    time.sleep(1)
+            try:
+                return api.delete(purge=1)
+            except Exception as exc:
+                last_error = exc
+                if not self._running_destroy_error(exc) or attempt >= 2:
+                    raise
+                time.sleep(attempt + 1)
+        assert last_error is not None
+        raise last_error
+
     def _cleanup_failed_deploy(
         self,
         created: list[tuple[str, int]],
@@ -1550,7 +1632,7 @@ class LiveProxmoxGateway:
             try:
                 # destroy-unreferenced-disks is not available in older PVE
                 # schemas. Destroying the VM already removes referenced disks.
-                upid = api.delete(purge=1)
+                upid = self._delete_vm_after_stop(node, vmid)
                 if upid:
                     delete_tasks.append((node, str(upid)))
             except Exception as exc:
@@ -1829,13 +1911,12 @@ class LiveProxmoxGateway:
                     }
                     if network_target:
                         environment["GUEST_INTERFACE"] = network_target[0]
-                    result = self._guest_script(
+                    result = self._run_deploy_script(
                         target_node,
                         new_vmid,
                         deploy_script,
-                        "deploy",
                         environment,
-                        timeout=900,
+                        retry_ifreload_busy=network_target is not None,
                     )
                     if result["exit_code"] != 0:
                         detail = result["stderr"] or result["stdout"] or f"exit code {result['exit_code']}"
@@ -2477,7 +2558,7 @@ class LiveProxmoxGateway:
                 pass
             # PVE 7 and some early PVE 8 builds reject
             # destroy-unreferenced-disks as an unknown schema property.
-            upid = api.delete(purge=1)
+            upid = self._delete_vm_after_stop(node, vmid)
             if upid:
                 delete_tasks.append((node, str(upid)))
             if len(delete_tasks) >= delete_batch:
