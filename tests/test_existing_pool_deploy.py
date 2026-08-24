@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from dashboard_backend.database import DashboardStore
-from dashboard_backend.proxmox_gateway import LiveProxmoxGateway
+from dashboard_backend.proxmox_gateway import LiveProxmoxGateway, stand_vm_name
 from dashboard_backend.service import ConflictError, DashboardService, ValidationError
 
 
@@ -44,8 +44,8 @@ class ExistingPoolServiceTests(unittest.TestCase):
         self.assertEqual(
             [vm["name"] for vm in stand["vms"]],
             [
-                f"shared-lab-deployer-{stand['id']}-1",
-                f"shared-lab-deployer-{stand['id']}-2",
+                stand_vm_name("Новая группа", stand["id"], 1, existing_pool=True),
+                stand_vm_name("Новая группа", stand["id"], 2, existing_pool=True),
             ],
         )
         thread.return_value.start.assert_called_once_with()
@@ -89,7 +89,7 @@ class ExistingPoolServiceTests(unittest.TestCase):
             return [{
                 "index": 1,
                 "vmid": 517,
-                "name": f"shared-lab-deployer-{stand['id']}-1",
+                "name": stand["vms"][0]["name"],
                 "node": "pve-2",
                 "status": "running",
                 "ip": selected_blueprint["allocated_ips"][0],
@@ -123,9 +123,30 @@ class ExistingPoolServiceTests(unittest.TestCase):
         self.assertEqual(stand["pool_id"], "Templates-MDK-02-01")
         self.assertEqual(
             stand["vms"][0]["name"],
-            f"Templates-MDK-02-01-deployer-{stand['id']}-1",
+            stand_vm_name(
+                "Стенд со смешанным регистром", stand["id"], 1,
+                existing_pool=True,
+            ),
         )
         thread.return_value.start.assert_called_once_with()
+
+    def test_new_pool_vm_names_follow_stand_name_not_pool_id(self) -> None:
+        with patch("dashboard_backend.service.threading.Thread") as thread:
+            stand = self.service.create_stand({
+                "blueprint_id": self.blueprint["id"],
+                "name": "Blyat",
+                "pool_id": "proverka",
+                "vm_count": 2,
+            })
+
+        self.assertEqual([vm["name"] for vm in stand["vms"]], ["Blyat-1", "Blyat-2"])
+        thread.return_value.start.assert_called_once_with()
+
+    def test_vm_name_transliterates_cyrillic_and_stays_pve_compatible(self) -> None:
+        self.assertEqual(stand_vm_name("Новая группа", 7, 1), "Novaya-gruppa-1")
+        shared = stand_vm_name("Новая группа", 7, 2, existing_pool=True)
+        self.assertEqual(shared, "Novaya-gruppa-deployer-7-2")
+        self.assertLessEqual(len(stand_vm_name("Очень длинное имя " * 10, 7, 2)), 63)
 
     def test_existing_pool_stand_is_assigned_to_selected_workspace(self) -> None:
         with patch("dashboard_backend.service.threading.Thread"):
@@ -318,6 +339,83 @@ class ExistingPoolServiceTests(unittest.TestCase):
 
 
 class ExistingPoolGatewaySafetyTests(unittest.TestCase):
+    def test_start_submission_retries_when_proxmox_worker_is_temporarily_busy(self) -> None:
+        gateway = LiveProxmoxGateway.__new__(LiveProxmoxGateway)
+        gateway.client = MagicMock()
+        vm_api = gateway.client.nodes.return_value.qemu.return_value
+        vm_api.status.start.post.side_effect = [
+            RuntimeError("500 Internal Server Error: got no worker upid - start worker failed"),
+            "UPID:pve-1:start-290",
+        ]
+        vm_api.status.current.get.return_value = {"status": "stopped"}
+
+        with patch("dashboard_backend.proxmox_gateway.time.sleep") as sleep:
+            result = gateway._submit_start_task("pve-1", 290)
+
+        self.assertEqual(result, "UPID:pve-1:start-290")
+        self.assertEqual(vm_api.status.start.post.call_count, 2)
+        sleep.assert_called_once_with(2)
+
+    def test_start_submission_accepts_ambiguous_response_when_vm_is_running(self) -> None:
+        gateway = LiveProxmoxGateway.__new__(LiveProxmoxGateway)
+        gateway.client = MagicMock()
+        vm_api = gateway.client.nodes.return_value.qemu.return_value
+        vm_api.status.start.post.side_effect = RuntimeError(
+            "500 Internal Server Error: got no worker upid - start worker failed"
+        )
+        vm_api.status.current.get.return_value = {"status": "running"}
+
+        with patch("dashboard_backend.proxmox_gateway.time.sleep") as sleep:
+            result = gateway._submit_start_task("pve-1", 290)
+
+        self.assertIsNone(result)
+        vm_api.status.start.post.assert_called_once_with()
+        sleep.assert_not_called()
+
+    def test_clone_submission_retries_when_worker_never_accepted_task(self) -> None:
+        gateway = LiveProxmoxGateway.__new__(LiveProxmoxGateway)
+        gateway.client = MagicMock()
+        clone = gateway.client.nodes.return_value.qemu.return_value.clone
+        clone.post.side_effect = [
+            RuntimeError("500 Internal Server Error: got no worker upid - start worker failed"),
+            "UPID:pve-1:clone-290",
+        ]
+        gateway.client.pools.return_value.get.return_value = {"members": []}
+        gateway.client.cluster.resources.get.return_value = []
+        params = {"newid": 290, "name": "Blyat-1", "full": 0, "pool": "proverka"}
+
+        with patch("dashboard_backend.proxmox_gateway.time.sleep") as sleep:
+            result = gateway._submit_clone_task(
+                "pve-1", 278, "proverka", 290, "Blyat-1", params,
+            )
+
+        self.assertEqual(result, "UPID:pve-1:clone-290")
+        self.assertEqual(clone.post.call_count, 2)
+        sleep.assert_called_once_with(2)
+
+    def test_clone_submission_does_not_duplicate_an_accepted_clone(self) -> None:
+        gateway = LiveProxmoxGateway.__new__(LiveProxmoxGateway)
+        gateway.client = MagicMock()
+        clone = gateway.client.nodes.return_value.qemu.return_value.clone
+        clone.post.side_effect = RuntimeError(
+            "500 Internal Server Error: got no worker upid - start worker failed"
+        )
+        gateway.client.pools.return_value.get.return_value = {
+            "members": [
+                {"type": "qemu", "vmid": 290, "name": "Blyat-1", "node": "pve-1"},
+            ],
+        }
+
+        with patch("dashboard_backend.proxmox_gateway.time.sleep") as sleep:
+            result = gateway._submit_clone_task(
+                "pve-1", 278, "proverka", 290, "Blyat-1",
+                {"newid": 290, "name": "Blyat-1", "full": 0, "pool": "proverka"},
+            )
+
+        self.assertIsNone(result)
+        clone.post.assert_called_once()
+        sleep.assert_not_called()
+
     def test_delete_vm_retries_after_running_destroy_race(self) -> None:
         gateway = LiveProxmoxGateway.__new__(LiveProxmoxGateway)
         gateway.client = MagicMock()

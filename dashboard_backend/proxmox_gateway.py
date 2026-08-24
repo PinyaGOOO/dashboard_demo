@@ -9,6 +9,7 @@ import re
 import shlex
 import threading
 import time
+import unicodedata
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -21,11 +22,47 @@ from .passwords import generate_password
 ProgressCallback = Callable[[int, str], None]
 
 
-def existing_pool_vm_name(pool_id: str, stand_id: int, index: int) -> str:
-    """Build a unique PVE-compatible VM name without exceeding its 63-char limit."""
-    suffix = f"-deployer-{int(stand_id)}-{int(index)}"
-    prefix = str(pool_id)[:max(1, 63 - len(suffix))]
+_CYRILLIC_VM_TRANSLITERATION = str.maketrans({
+    "А": "A", "Б": "B", "В": "V", "Г": "G", "Д": "D", "Е": "E",
+    "Ё": "E", "Ж": "Zh", "З": "Z", "И": "I", "Й": "Y", "К": "K",
+    "Л": "L", "М": "M", "Н": "N", "О": "O", "П": "P", "Р": "R",
+    "С": "S", "Т": "T", "У": "U", "Ф": "F", "Х": "Kh", "Ц": "Ts",
+    "Ч": "Ch", "Ш": "Sh", "Щ": "Sch", "Ъ": "", "Ы": "Y", "Ь": "",
+    "Э": "E", "Ю": "Yu", "Я": "Ya",
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e",
+    "ё": "e", "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k",
+    "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r",
+    "с": "s", "т": "t", "у": "u", "ф": "f", "х": "kh", "ц": "ts",
+    "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "", "ы": "y", "ь": "",
+    "э": "e", "ю": "yu", "я": "ya",
+})
+
+
+def stand_vm_name(
+    stand_name: str,
+    stand_id: int,
+    index: int,
+    *,
+    existing_pool: bool = False,
+) -> str:
+    """Build a PVE-compatible VM name from the operator-visible stand name."""
+    transliterated = str(stand_name or "").strip().translate(_CYRILLIC_VM_TRANSLITERATION)
+    ascii_name = unicodedata.normalize("NFKD", transliterated).encode(
+        "ascii", "ignore",
+    ).decode("ascii")
+    base = re.sub(r"[^A-Za-z0-9-]+", "-", ascii_name).strip("-")
+    if not base:
+        base = f"stand-{int(stand_id)}"
+    suffix = (
+        f"-deployer-{int(stand_id)}-{int(index)}"
+        if existing_pool else f"-{int(index)}"
+    )
+    prefix = base[:max(1, 63 - len(suffix))].rstrip("-") or "stand"
     return f"{prefix}{suffix}"
+
+
+def existing_pool_vm_name(stand_name: str, stand_id: int, index: int) -> str:
+    return stand_vm_name(stand_name, stand_id, index, existing_pool=True)
 
 
 class RollbackSnapshotError(RuntimeError):
@@ -534,9 +571,9 @@ class DemoProxmoxGateway:
                 # neighbouring demo stands never receive the same VMID.
                 "vmid": 2000 + int(stand["id"]) * 100 + index,
                 "name": (
-                    existing_pool_vm_name(stand["pool_id"], stand["id"], index)
+                    existing_pool_vm_name(stand["name"], stand["id"], index)
                     if str(stand.get("origin") or "deployed") == "existing"
-                    else f"{stand['pool_id']}-{index}"
+                    else stand_vm_name(stand["name"], stand["id"], index)
                 ),
                 "node": nodes[(int(stand["id"]) + index) % len(nodes)],
                 "ip": str(allocated_ips[index - 1]) if index <= len(allocated_ips) else self._ip_for(blueprint.get("subnet", ""), index),
@@ -841,6 +878,87 @@ class LiveProxmoxGateway:
         except ValueError:
             configured = default
         return max(1, min(configured, 12))
+
+    @staticmethod
+    def _worker_start_error(exc: Exception) -> bool:
+        detail = " ".join(str(exc).lower().split())
+        return "got no worker upid" in detail and "start worker failed" in detail
+
+    def _clone_was_accepted(
+        self,
+        pool_id: str,
+        vmid: int,
+        expected_name: str,
+    ) -> bool:
+        """Confirm an ambiguous clone response without trusting VMID alone."""
+        pool = self.client.pools(pool_id).get()
+        for member in pool.get("members", []):
+            if member.get("vmid") is None or int(member["vmid"]) != int(vmid):
+                continue
+            actual_name = str(member.get("name") or "")
+            if member.get("type") == "qemu" and actual_name == expected_name:
+                return True
+            raise RuntimeError(
+                f"VMID {vmid} появился с неожиданным именем {actual_name or 'без имени'}; "
+                "повтор клонирования отменён"
+            )
+        for resource in self.client.cluster.resources.get(type="vm"):
+            if resource.get("vmid") is None or int(resource["vmid"]) != int(vmid):
+                continue
+            raise RuntimeError(
+                f"VMID {vmid} уже занят вне ожидаемого pool {pool_id}; "
+                "повтор клонирования отменён"
+            )
+        return False
+
+    def _submit_clone_task(
+        self,
+        template_node: str,
+        template_vmid: int,
+        pool_id: str,
+        vmid: int,
+        expected_name: str,
+        params: dict[str, Any],
+    ) -> str | None:
+        for attempt in range(4):
+            try:
+                upid = self.client.nodes(template_node).qemu(template_vmid).clone.post(
+                    **params,
+                )
+                return str(upid) if upid else None
+            except Exception as exc:
+                worker_error = self._worker_start_error(exc)
+                already_exists = "already exists" in str(exc).lower()
+                if worker_error or already_exists:
+                    if self._clone_was_accepted(pool_id, vmid, expected_name):
+                        return None
+                if not worker_error or attempt >= 3:
+                    raise RuntimeError(
+                        f"Клонирование VM {vmid} ({expected_name}) не запустилось: {exc}"
+                    ) from exc
+                time.sleep(min((attempt + 1) * 2, 6))
+        return None
+
+    def _submit_start_task(self, node: str, vmid: int) -> str | None:
+        vm_api = self.client.nodes(node).qemu(vmid)
+        for attempt in range(4):
+            try:
+                upid = vm_api.status.start.post()
+                return str(upid) if upid else None
+            except Exception as exc:
+                if not self._worker_start_error(exc):
+                    raise RuntimeError(f"Запуск VM {vmid} не удался: {exc}") from exc
+                try:
+                    if str(vm_api.status.current.get().get("status") or "") == "running":
+                        return None
+                except Exception:
+                    pass
+                if attempt >= 3:
+                    raise RuntimeError(
+                        f"Запуск VM {vmid} не удался после повторных попыток: {exc}"
+                    ) from exc
+                time.sleep(min((attempt + 1) * 2, 6))
+        return None
 
     def _vm_inventory(
         self,
@@ -1803,8 +1921,8 @@ class LiveProxmoxGateway:
             for index in range(1, vm_count + 1):
                 target_node = target_nodes[(index - 1) % len(target_nodes)]
                 name = (
-                    existing_pool_vm_name(pool_id, stand["id"], index)
-                    if use_existing_pool else f"{pool_id}-{index}"
+                    existing_pool_vm_name(stand["name"], stand["id"], index)
+                    if use_existing_pool else stand_vm_name(stand["name"], stand["id"], index)
                 )
                 vm_ip = (
                     str(allocated_ips[index - 1])
@@ -1827,7 +1945,14 @@ class LiveProxmoxGateway:
                         "newid": new_vmid, "name": name, "full": 0,
                         "target": target_node, "pool": pool_id,
                     }
-                    upid = self.client.nodes(template_node).qemu(template_vmid).clone.post(**params)
+                    upid = self._submit_clone_task(
+                        template_node,
+                        template_vmid,
+                        pool_id,
+                        new_vmid,
+                        name,
+                        params,
+                    )
                 plans.append({
                     "index": index, "node": target_node, "vmid": new_vmid,
                     "name": name, "ip": vm_ip, "credential": credential,
@@ -1843,6 +1968,7 @@ class LiveProxmoxGateway:
             progress(38, f"Клонировано VM: {vm_count}")
 
             start_tasks: list[tuple[str, str]] = []
+            start_batch = self._batch_limit("PROXMOX_START_BATCH")
             try:
                 for plan in plans:
                     target_node = str(plan["node"])
@@ -1863,9 +1989,12 @@ class LiveProxmoxGateway:
                             current_network, requested_bridge,
                         )
                     vm_api.config.put(**config)
-                    upid = vm_api.status.start.post()
+                    upid = self._submit_start_task(target_node, new_vmid)
                     if upid:
                         start_tasks.append((target_node, str(upid)))
+                    if len(start_tasks) >= start_batch:
+                        self._wait_tasks(start_tasks, timeout=600)
+                        start_tasks.clear()
                 self._wait_tasks(start_tasks, timeout=600)
             except Exception as exc:
                 detail = str(exc)
@@ -2508,12 +2637,16 @@ class LiveProxmoxGateway:
             # A failed deploy can leave clones in the pool before their VMIDs
             # are committed to SQLite.  Recover only the names generated by
             # this deploy; an unrelated/manual member still blocks deletion.
-            generated_name = re.compile(rf"^{re.escape(pool_id)}-\d+$")
+            generated_names = {
+                str(vm.get("name") or "").strip()
+                for vm in stand.get("vms", [])
+                if str(vm.get("name") or "").strip()
+            }
             recoverable_vmids = {
                 int(member["vmid"])
                 for member in pool_members
                 if member.get("type") == "qemu"
-                and generated_name.fullmatch(str(member.get("name") or ""))
+                and str(member.get("name") or "").strip() in generated_names
             }
             unexpected_vmids = sorted(pool_vmids - recoverable_vmids - set(vmids))
             if unexpected_vmids:

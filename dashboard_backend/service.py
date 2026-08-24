@@ -21,6 +21,7 @@ from .proxmox_gateway import (
     LiveProxmoxGateway,
     RollbackSnapshotError,
     existing_pool_vm_name,
+    stand_vm_name,
 )
 
 
@@ -942,8 +943,8 @@ class DashboardService:
                 ip = allocated_ips[index - 1] if index <= len(allocated_ips) else ""
                 credential = credentials[index - 1]
                 vm_name = (
-                    existing_pool_vm_name(pool_id, stand_id, index)
-                    if use_existing_pool else f"{pool_id}-{index}"
+                    existing_pool_vm_name(name, stand_id, index)
+                    if use_existing_pool else stand_vm_name(name, stand_id, index)
                 )
                 vm_cursor = connection.execute(
                     """INSERT INTO stand_vms

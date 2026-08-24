@@ -896,6 +896,9 @@ code { padding: 2px 5px; color: #365d86; background: rgba(255,255,255,.6); borde
 .deploy-pool-toggle input:disabled { cursor: not-allowed; opacity: .55; }
 .deploy-target-fields { align-items: start; }
 .deploy-target-fields .field { min-width: 0; }
+.deploy-network-fields { align-items: start; }
+.deploy-network-fields .field { align-content: start; min-width: 0; }
+.deploy-network-fields .input { height: 43px; min-height: 43px; }
 .confirm-hero { display: grid; justify-items: center; margin: 2px 0 19px; text-align: center; }
 .confirm-hero > span { display: grid; width: 51px; height: 51px; color: var(--green); background: var(--green-soft); border-radius: 15px; place-items: center; }
 .confirm-hero > span svg { width: 22px; height: 22px; }

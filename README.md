@@ -114,6 +114,7 @@ Live-развёртывание:
 | `PROXMOX_SCHEDULER_STALE_SECONDS` | срок доверия к последнему успешному измерению до безопасного возврата к статическим лимитам | `20` |
 | `PROXMOX_PREFLIGHT_CONCURRENCY` | максимальное число одновременных запросов расчёта размещения до входа в очередь | `2` |
 | `PROXMOX_CLONE_BATCH` | одновременно запущенные задачи linked clone, от 1 до 12 | `6` |
+| `PROXMOX_START_BATCH` | одновременно запускаемые VM при развёртывании, от 1 до 12 | `6` |
 | `PROXMOX_DEPLOY_WORKERS` | параллельные bootstrap/QGA-операции, от 1 до 12 | `6` |
 | `PROXMOX_SNAPSHOT_BATCH` | одновременно создаваемые snapshots, от 1 до 12 | `6` |
 | `PROXMOX_ROLLBACK_BATCH` | одновременно откатываемые к `start` VM, от 1 до 12 | `4` |
