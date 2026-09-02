@@ -89,6 +89,7 @@ class DashboardService:
         self._web_activity_cache: dict[str, Any] | None = None
         self._web_activity_cache_at = 0.0
         self._mark_interrupted_rollbacks()
+        self._mark_interrupted_checks()
         if gateway.mode == "demo":
             self._resume_demo_deployments()
         else:
@@ -167,6 +168,44 @@ class DashboardService:
             )
             self.store.add_activity(
                 "deploy", "Развёртывание было прервано", str(stand["name"]), "error", "Система",
+            )
+
+    def _mark_interrupted_checks(self) -> None:
+        """Finish check records whose worker disappeared with the process."""
+        interrupted = self.store.query_all(
+            """SELECT r.id, r.stand_id, r.vmid, s.name AS stand_name
+            FROM check_runs r JOIN stands s ON s.id = r.stand_id
+            WHERE r.status = 'running'""",
+        )
+        if not interrupted:
+            return
+        finished = utc_now()
+        message = "Автопроверка была прервана перезапуском dashboard. Запустите её повторно."
+        with self.store.transaction() as connection:
+            for run in interrupted:
+                connection.execute(
+                    """UPDATE check_runs SET status = 'failed', output = ?, finished_at = ?
+                    WHERE id = ? AND status = 'running'""",
+                    (message, finished, int(run["id"])),
+                )
+                if run.get("vmid") is None:
+                    connection.execute(
+                        """UPDATE stands SET check_status = 'failed', last_check = ?, updated_at = ?
+                        WHERE id = ? AND check_status = 'running'""",
+                        (finished, finished, int(run["stand_id"])),
+                    )
+                else:
+                    connection.execute(
+                        """UPDATE stand_vms SET check_status = 'failed', last_check = ?
+                        WHERE stand_id = ? AND vmid = ? AND check_status = 'running'""",
+                        (finished, int(run["stand_id"]), int(run["vmid"])),
+                    )
+        for run in interrupted:
+            target = str(run["stand_name"])
+            if run.get("vmid") is not None:
+                target += f" · VM {int(run['vmid'])}"
+            self.store.add_activity(
+                "check", "Автопроверка была прервана", target, "error", "Система",
             )
 
     def _stand_operation_lock(self, stand_id: int) -> threading.RLock:

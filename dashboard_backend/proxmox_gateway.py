@@ -910,15 +910,13 @@ class LiveProxmoxGateway:
             if member.get("type") == "qemu" and actual_name == expected_name:
                 return True
             raise CloneVmidCollisionError(
-                f"VMID {vmid} появился с неожиданным именем {actual_name or 'без имени'}; "
-                "повтор клонирования отменён"
+                f"VMID {vmid} занят VM с неожиданным именем {actual_name or 'без имени'}"
             )
         for resource in self.client.cluster.resources.get(type="vm"):
             if resource.get("vmid") is None or int(resource["vmid"]) != int(vmid):
                 continue
             raise CloneVmidCollisionError(
-                f"VMID {vmid} уже занят вне ожидаемого pool {pool_id}; "
-                "повтор клонирования отменён"
+                f"VMID {vmid} уже занят вне ожидаемого pool {pool_id}"
             )
         return False
 
@@ -943,6 +941,10 @@ class LiveProxmoxGateway:
                 if worker_error or already_exists:
                     if self._clone_was_accepted(pool_id, vmid, expected_name):
                         return None
+                    if already_exists:
+                        raise CloneVmidCollisionError(
+                            f"VMID {vmid} уже занят и не принадлежит pool {pool_id}"
+                        ) from exc
                 if not worker_error or attempt >= 3:
                     raise RuntimeError(
                         f"Клонирование VM {vmid} ({expected_name}) не запустилось: {exc}"

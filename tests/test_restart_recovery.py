@@ -44,6 +44,35 @@ class RestartRecoveryTests(unittest.TestCase):
             self.assertEqual(vm["status"], "error")
             self.assertEqual(vm["credential_valid"], 0)
 
+    def test_interrupted_check_is_finished_instead_of_polling_forever(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            store = DashboardStore(Path(tempdir) / "dashboard.db", seed_demo=False)
+            now = utc_now()
+            stand_id = store.execute(
+                """INSERT INTO stands
+                (name, status, check_status, vm_count, created_at, updated_at)
+                VALUES (?, 'running', 'running', 1, ?, ?)""",
+                ("Проверяемый стенд", now, now),
+            )
+            run_id = store.execute(
+                """INSERT INTO check_runs
+                (stand_id, status, details, output, started_at)
+                VALUES (?, 'running', '[]', 'Ожидание', ?)""",
+                (stand_id, now),
+            )
+            gateway = MagicMock()
+            gateway.mode = "live"
+
+            with patch.object(DashboardService, "_start_scheduler_monitor"):
+                DashboardService(store, gateway)
+
+            stand = store.query_one("SELECT * FROM stands WHERE id = ?", (stand_id,))
+            run = store.query_one("SELECT * FROM check_runs WHERE id = ?", (run_id,))
+            self.assertEqual(stand["check_status"], "failed")
+            self.assertEqual(run["status"], "failed")
+            self.assertIn("перезапуском dashboard", run["output"])
+            self.assertIsNotNone(run["finished_at"])
+
 
 class LiveGatewayResilienceTests(unittest.TestCase):
     def test_api_timeout_defaults_to_twenty_seconds(self) -> None:
