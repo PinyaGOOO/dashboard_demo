@@ -83,6 +83,10 @@ class CredentialRestoreError(RuntimeError):
         self.restored_vmids = sorted({int(vmid) for vmid in restored_vmids})
 
 
+class CloneVmidCollisionError(RuntimeError):
+    """The candidate VMID was taken by a VM not owned by this deployment."""
+
+
 _VKLVIKL_NETWORK_MARKER = "# Сетевой bootstrap из исходного vklvikl.py."
 
 _LINUX_NETWORK_READY_SCRIPT = r"""#!/usr/bin/env bash
@@ -678,6 +682,13 @@ class LiveProxmoxGateway:
             raise RuntimeError("PROXMOX_PORT должен быть целым числом") from exc
         if not 1 <= self.port <= 65535:
             raise RuntimeError("PROXMOX_PORT должен быть в диапазоне 1..65535")
+        timeout_value = os.environ.get("PROXMOX_API_TIMEOUT", "20").strip()
+        try:
+            self.api_timeout = float(timeout_value)
+        except ValueError as exc:
+            raise RuntimeError("PROXMOX_API_TIMEOUT должен быть числом") from exc
+        if not 5 <= self.api_timeout <= 120:
+            raise RuntimeError("PROXMOX_API_TIMEOUT должен быть в диапазоне 5..120 секунд")
         self.user = os.environ.get("PROXMOX_USER", "").strip()
         self.token_name = os.environ.get("PROXMOX_TOKEN_NAME", "").strip()
         self.token_value = os.environ.get("PROXMOX_TOKEN_VALUE", "").strip()
@@ -695,7 +706,7 @@ class LiveProxmoxGateway:
         self.client = ProxmoxAPI(
             self.host, user=self.user, token_name=self.token_name,
             token_value=self.token_value, verify_ssl=self.verify_ssl,
-            port=self.port,
+            port=self.port, timeout=self.api_timeout,
         )
         self._metrics_history: deque[dict[str, Any]] = deque(maxlen=120)
         self._metrics_lock = threading.RLock()
@@ -898,14 +909,14 @@ class LiveProxmoxGateway:
             actual_name = str(member.get("name") or "")
             if member.get("type") == "qemu" and actual_name == expected_name:
                 return True
-            raise RuntimeError(
+            raise CloneVmidCollisionError(
                 f"VMID {vmid} появился с неожиданным именем {actual_name or 'без имени'}; "
                 "повтор клонирования отменён"
             )
         for resource in self.client.cluster.resources.get(type="vm"):
             if resource.get("vmid") is None or int(resource["vmid"]) != int(vmid):
                 continue
-            raise RuntimeError(
+            raise CloneVmidCollisionError(
                 f"VMID {vmid} уже занят вне ожидаемого pool {pool_id}; "
                 "повтор клонирования отменён"
             )
@@ -938,6 +949,48 @@ class LiveProxmoxGateway:
                     ) from exc
                 time.sleep(min((attempt + 1) * 2, 6))
         return None
+
+    def _allocate_clone_task(
+        self,
+        template_node: str,
+        template_vmid: int,
+        pool_id: str,
+        target_node: str,
+        expected_name: str,
+        created: list[tuple[str, int]],
+        expected_names: dict[int, str],
+    ) -> tuple[int, str | None]:
+        """Reserve by submission and transparently survive external nextid races."""
+        with self._clone_submit_lock:
+            for vmid_attempt in range(6):
+                new_vmid = int(self.client.cluster.nextid.get())
+                # Keep the candidate before POST so an accepted request with a
+                # lost HTTP response can be recovered from the expected pool.
+                created.append((target_node, new_vmid))
+                expected_names[new_vmid] = expected_name
+                params: dict[str, Any] = {
+                    "newid": new_vmid, "name": expected_name, "full": 0,
+                    "target": target_node, "pool": pool_id,
+                }
+                try:
+                    upid = self._submit_clone_task(
+                        template_node,
+                        template_vmid,
+                        pool_id,
+                        new_vmid,
+                        expected_name,
+                        params,
+                    )
+                    return new_vmid, upid
+                except CloneVmidCollisionError:
+                    # Ownership checks proved this is somebody else's VM.  Do
+                    # not let cleanup touch it; ask Proxmox for a fresh ID.
+                    created.remove((target_node, new_vmid))
+                    expected_names.pop(new_vmid, None)
+                    if vmid_attempt >= 5:
+                        raise
+                    time.sleep(0.2)
+        raise RuntimeError("Не удалось получить свободный VMID")  # pragma: no cover
 
     def _submit_start_task(self, node: str, vmid: int) -> str | None:
         vm_api = self.client.nodes(node).qemu(vmid)
@@ -2014,25 +2067,15 @@ class LiveProxmoxGateway:
                     credential["password"] = generate_password()
                 credential.setdefault("guest_username", "root")
                 credential.setdefault("web_username", "root@pam")
-                with self._clone_submit_lock:
-                    new_vmid = int(self.client.cluster.nextid.get())
-                    # Kept as a candidate before POST so an accepted request
-                    # with a lost HTTP response can be recovered from the pool.
-                    # Rollback still verifies pool ownership before deletion.
-                    created.append((target_node, new_vmid))
-                    expected_names[new_vmid] = name
-                    params: dict[str, Any] = {
-                        "newid": new_vmid, "name": name, "full": 0,
-                        "target": target_node, "pool": pool_id,
-                    }
-                    upid = self._submit_clone_task(
-                        template_node,
-                        template_vmid,
-                        pool_id,
-                        new_vmid,
-                        name,
-                        params,
-                    )
+                new_vmid, upid = self._allocate_clone_task(
+                    template_node,
+                    template_vmid,
+                    pool_id,
+                    target_node,
+                    name,
+                    created,
+                    expected_names,
+                )
                 plans.append({
                     "index": index, "node": target_node, "vmid": new_vmid,
                     "name": name, "ip": vm_ip, "credential": credential,

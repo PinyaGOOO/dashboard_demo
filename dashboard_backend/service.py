@@ -91,6 +91,8 @@ class DashboardService:
         self._mark_interrupted_rollbacks()
         if gateway.mode == "demo":
             self._resume_demo_deployments()
+        else:
+            self._mark_interrupted_deployments()
         self._start_scheduler_monitor()
 
     def _mark_interrupted_rollbacks(self) -> None:
@@ -135,6 +137,37 @@ class DashboardService:
             )
             self._jobs[stand_id] = thread
             thread.start()
+
+    def _mark_interrupted_deployments(self) -> None:
+        """Expose live jobs lost with the previous dashboard process.
+
+        A live deployment can already have submitted some Proxmox tasks when
+        the process stops, so replaying it automatically is unsafe.  Marking
+        it failed makes the state honest and enables the normal, ownership-
+        checked cleanup path instead of leaving the UI polling at 4% forever.
+        """
+        interrupted = self.store.query_all(
+            "SELECT id, name FROM stands WHERE status = 'provisioning'",
+        )
+        for stand in interrupted:
+            message = (
+                "Развёртывание было прервано перезапуском dashboard. "
+                "Проверьте задачи Proxmox и удалите стенд для безопасной очистки, "
+                "затем запустите развёртывание повторно."
+            )
+            stand_id = int(stand["id"])
+            self.store.execute(
+                "UPDATE stands SET status = 'error', last_error = ?, updated_at = ? WHERE id = ?",
+                (message, utc_now(), stand_id),
+            )
+            self.store.execute(
+                """UPDATE stand_vms SET status = 'error', credential_valid = 0
+                WHERE stand_id = ? AND status = 'provisioning'""",
+                (stand_id,),
+            )
+            self.store.add_activity(
+                "deploy", "Развёртывание было прервано", str(stand["name"]), "error", "Система",
+            )
 
     def _stand_operation_lock(self, stand_id: int) -> threading.RLock:
         """Serialize mutating requests for one stand across HTTP threads."""
