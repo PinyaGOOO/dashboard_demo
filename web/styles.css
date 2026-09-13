@@ -1000,6 +1000,13 @@ code { padding: 2px 5px; color: #365d86; background: rgba(255,255,255,.6); borde
 .vm-actions .button { width: 100%; min-width: 0; }
 .vm-actions .button--small { min-height: 37px; padding: 0 8px; font-size: 12px; }
 .vm-open-button { min-height: 43px; font-size: 13px; }
+.vm-open-button.is-last-opened,
+.vm-open-button.is-last-opened:hover {
+  color: #fff;
+  background: var(--green);
+  border-color: var(--green);
+  box-shadow: 0 6px 16px rgba(31, 147, 98, .24);
+}
 .mini-session-list { display: grid; }
 .mini-session-list > div { display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; min-height: 52px; align-items: center; gap: 8px; padding: 7px 10px; border-bottom: 1px solid var(--line); }
 .mini-session-list > div:last-child { border-bottom: 0; }

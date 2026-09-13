@@ -151,6 +151,7 @@ exit 75`;
     webActivity: null,
     webActivityLoading: false,
     bulkRollbackPending: new Map(),
+    lastOpenedVmKey: localStorage.getItem("deployer.lastOpenedVm") || "",
     loading: false,
     lastUpdated: null,
   };
@@ -1268,8 +1269,10 @@ exit 75`;
     const passwordHint = passwordUnverified
       ? "Повторите возврат к snapshot start: пароль скрыт до подтверждения QEMU Guest Agent."
       : "Смените пароль этой VM или загрузите защищённые доступы.";
+    const openKey = hasVmid ? `${Number(stand.id)}:${numericVmid}` : "";
+    const wasLastOpened = Boolean(openKey && state.lastOpenedVmKey === openKey);
     const accessButton = accessUrl && hasVmid && !standBusy
-      ? `<a class="button button--primary vm-open-button" href="${escapeHtml(accessUrl)}" target="_blank" rel="noopener noreferrer">${icon("external")}Перейти к стенду</a>`
+      ? `<a class="button button--primary vm-open-button ${wasLastOpened ? "is-last-opened" : ""}" href="${escapeHtml(accessUrl)}" target="_blank" rel="noopener noreferrer" data-open-vm data-open-vm-key="${openKey}" aria-pressed="${wasLastOpened ? "true" : "false"}"${wasLastOpened ? ` title="Последний открытый стенд"` : ""}>${icon("external")}Перейти к стенду</a>`
       : `<button class="button button--primary vm-open-button" type="button" disabled title="Web URL ещё не получен">${icon("chevron")}Перейти к стенду</button>`;
     return `<article class="vm-row">
       <span class="vm-state vm-state--${escapeHtml(vm.status)}"></span>
@@ -1343,6 +1346,20 @@ exit 75`;
       showModal({ title: importedPool ? `Пул ${stand.pool_id}` : "Карточка стенда", body, footer, size: "large", className: "stand-detail-modal" });
       modalRoot.querySelector(".modal")?.setAttribute("data-stand-detail-id", String(stand.id));
     }
+  }
+
+  function markVmAsLastOpened(button) {
+    const openKey = String(button?.dataset?.openVmKey || "").trim();
+    if (!openKey) return;
+    state.lastOpenedVmKey = openKey;
+    localStorage.setItem("deployer.lastOpenedVm", openKey);
+    document.querySelectorAll("[data-open-vm]").forEach(item => {
+      const selected = item.dataset.openVmKey === openKey;
+      item.classList.toggle("is-last-opened", selected);
+      item.setAttribute("aria-pressed", String(selected));
+      if (selected) item.title = "Последний открытый стенд";
+      else item.removeAttribute("title");
+    });
   }
 
   async function openStandDetail(id, { requestCredentials = false } = {}) {
@@ -2063,6 +2080,7 @@ exit 75`;
     else if (target.dataset.standFilter) { state.standFilter = target.dataset.standFilter; renderStands(); }
     else if (target.dataset.standDetail) openStandDetail(Number(target.dataset.standDetail));
     else if (target.dataset.loadStandCredentials) openStandDetail(Number(target.dataset.loadStandCredentials), { requestCredentials: true });
+    else if (target.matches("[data-open-vm]")) markVmAsLastOpened(target);
     else if (target.dataset.vmAction) {
       if (target.dataset.busy === "true") return;
       target.dataset.busy = "true"; target.disabled = true;
