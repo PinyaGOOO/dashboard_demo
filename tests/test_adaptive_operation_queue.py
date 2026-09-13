@@ -190,6 +190,51 @@ class AdaptiveOperationQueueTests(unittest.TestCase):
         self.assertLess(snapshot["effective_capacity"], snapshot["configured_capacity"])
         self.assertEqual(snapshot["pressure"]["state"], "throttled")
 
+    def test_node_pressure_does_not_subtract_control_reserve_twice(self) -> None:
+        queue = ProxmoxOperationQueue(
+            10, node_capacity=4, control_reserve=2,
+            node_control_reserve=1,
+        )
+        queue.update_pressure({
+            "sources": {"resources": True, "tasks": True},
+            "nodes": [
+                {
+                    "node": "depo", "status": "online",
+                    "cpu_ratio": 0.81, "memory_ratio": 0.5,
+                },
+                {"node": "fuji1", "status": "online", "cpu_ratio": 0.1},
+                {"node": "fuji2", "status": "online", "cpu_ratio": 0.1},
+                {"node": "fuji3", "status": "online", "cpu_ratio": 0.1},
+            ],
+            "tasks": [],
+        })
+
+        node = next(
+            item for item in queue.snapshot()["nodes"]
+            if item["name"] == "depo"
+        )
+        self.assertEqual(node["base_capacity"], 4)
+        self.assertEqual(node["effective_capacity"], 3)
+
+        # The pressure cap already withheld one slot. A three-unit heavy
+        # ticket must still start, while the control lane remains usable.
+        with queue.reserve(
+            "rollback", "large stand", 6,
+            node_weights={"depo": 3}, timeout=0.1,
+        ):
+            with queue.reserve(
+                "power", "emergency stop", 1,
+                node_weights={"depo": 1}, timeout=0.1,
+            ):
+                active = queue.snapshot()
+                depo = next(
+                    item for item in active["nodes"]
+                    if item["name"] == "depo"
+                )
+                self.assertEqual(depo["used"], 4)
+                self.assertEqual(active["lanes"]["heavy"]["used"], 6)
+                self.assertEqual(active["lanes"]["control"]["used"], 1)
+
     def test_unrelated_hot_shared_storage_does_not_reduce_global_capacity(self) -> None:
         queue = ProxmoxOperationQueue(
             10, node_capacity=4, storage_capacity=6,

@@ -730,7 +730,7 @@ class ProxmoxOperationQueue:
                 reasons.append("control_reserve")
 
         for name, requested in dict(ticket["node_weights"]).items():
-            _, effective = self._node_capacities_locked(name, fresh)
+            base, effective = self._node_capacities_locked(name, fresh)
             if effective <= 0:
                 # Node control reserve has the same semantics as the global
                 # reserve and cannot bypass a hard offline/zero-capacity node.
@@ -747,7 +747,18 @@ class ProxmoxOperationQueue:
             else:
                 if int(usage["nodes"].get(name, 0)) + int(requested) > effective:
                     reasons.append(f"node:{name}")
-                reserve = min(self.node_control_reserve, effective)
+                # Dynamic pressure has already reduced the node's advertised
+                # capacity.  Withholding the control reserve from that smaller
+                # value again can make the largest normally valid ticket
+                # impossible to admit forever while a busy node stays hot.
+                # Keep the dedicated reserve only at the static/base limit;
+                # control work may still use its own lane above a throttled
+                # effective limit, matching the global reserve semantics.
+                reserve = (
+                    min(self.node_control_reserve, effective)
+                    if effective >= base
+                    else 0
+                )
                 heavy_limit = max(0, effective - reserve)
                 heavy_used = int(usage["lanes"]["heavy"]["nodes"].get(name, 0))
                 if heavy_used + int(requested) > heavy_limit:
