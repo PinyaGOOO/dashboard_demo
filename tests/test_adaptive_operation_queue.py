@@ -4,10 +4,70 @@ import threading
 import time
 import unittest
 
-from dashboard_backend.operation_queue import ProxmoxOperationQueue
+from dashboard_backend.operation_queue import DeploymentCapacityBlocked, ProxmoxOperationQueue
 
 
 class AdaptiveOperationQueueTests(unittest.TestCase):
+    def test_deploy_pauses_only_for_its_critical_target_and_can_retry(self) -> None:
+        queue = ProxmoxOperationQueue()
+        queue.update_pressure({"nodes": [
+            {"node": "depo", "memory_percent": 97}, {"node": "fuji1", "cpu_percent": 25},
+        ]})
+        with self.assertRaisesRegex(DeploymentCapacityBlocked, "depo.*RAM 97%"):
+            with queue.reserve("deploy", "A", 1, node_weights={"depo": 1}, pause_on_overload=True):
+                self.fail("started on overloaded node")
+        self.assertEqual(queue.snapshot()["queued_count"], 0)
+        with queue.reserve("deploy", "B", 1, node_weights={"fuji1": 1}, pause_on_overload=True):
+            self.assertEqual(queue.snapshot()["active_count"], 1)
+        queue.update_pressure({"nodes": [{"node": "depo", "memory_percent": 62}]})
+        with queue.reserve("deploy", "A", 1, node_weights={"depo": 1}, pause_on_overload=True):
+            self.assertEqual(queue.snapshot()["active_count"], 1)
+
+    def test_external_saturation_returns_to_operator_before_waiting(self) -> None:
+        queue = ProxmoxOperationQueue(4, control_reserve=0)
+        queue.update_pressure({"tasks": [
+            {"upid": f"UPID:depo:{i}", "type": "qmclone", "node": "depo"} for i in range(2)
+        ]})
+        queued = []
+        with self.assertRaisesRegex(DeploymentCapacityBlocked, "В кластере"):
+            with queue.reserve("deploy", "A", 1, on_queued=queued.append, pause_on_overload=True):
+                self.fail("started despite saturation")
+        self.assertEqual(queued, [])
+        self.assertEqual(queue.snapshot()["used"], 0)
+
+    def test_internal_contention_gets_bounded_wait(self) -> None:
+        queue = ProxmoxOperationQueue(4, control_reserve=0)
+        with queue.reserve("deploy", "already running", 4):
+            positions = []
+            with self.assertRaisesRegex(DeploymentCapacityBlocked, "Очередь"):
+                with queue.reserve("deploy", "pending", 2, pause_on_overload=True,
+                                   timeout=0.05, on_queued=positions.append):
+                    self.fail("started before capacity was available")
+            self.assertEqual(positions, [1])
+            self.assertEqual(queue.snapshot()["queued_count"], 0)
+
+    def test_live_admission_requires_current_resource_telemetry_after_queue_wait(self) -> None:
+        queue = ProxmoxOperationQueue(4, control_reserve=0)
+        queue.update_pressure({"nodes": [{"node": "depo", "cpu_percent": 20}]})
+        with queue.reserve("snapshot", "active", 4):
+            def lose_resource_metrics(_position):
+                queue.update_pressure({"sources": {"resources": False, "tasks": True}, "tasks": []})
+
+            with self.assertRaisesRegex(DeploymentCapacityBlocked, "нагрузка Proxmox неизвестна"):
+                with queue.reserve("deploy", "A", 1, node_weights={"depo": 1},
+                                   pause_on_overload=True, require_fresh_pressure=True,
+                                   on_queued=lose_resource_metrics):
+                    self.fail("started after losing resource telemetry")
+            self.assertEqual(queue.snapshot()["queued_count"], 0)
+
+    def test_live_admission_requires_placement_node_in_sample(self) -> None:
+        queue = ProxmoxOperationQueue()
+        queue.update_pressure({"nodes": [{"node": "depo", "cpu_percent": 20}]})
+        with self.assertRaisesRegex(DeploymentCapacityBlocked, "выбранных узлов: fuji1"):
+            with queue.reserve("deploy", "A", 1, node_weights={"fuji1": 1},
+                               pause_on_overload=True, require_fresh_pressure=True):
+                self.fail("started on an unobserved target node")
+
     def test_blocked_old_ticket_does_not_hold_unrelated_node(self) -> None:
         queue = ProxmoxOperationQueue(10, max_bypass_seconds=0.01)
         active_entered = threading.Event()

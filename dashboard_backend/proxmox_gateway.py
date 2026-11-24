@@ -11,7 +11,7 @@ import threading
 import time
 import unicodedata
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
@@ -71,6 +71,10 @@ class RollbackSnapshotError(RuntimeError):
     def __init__(self, message: str, affected_vmids: list[int]):
         super().__init__(message)
         self.affected_vmids = sorted({int(vmid) for vmid in affected_vmids})
+
+
+class SnapshotOutcomeUnknown(RuntimeError):
+    """The snapshot worker may still be writing to the guest's disks."""
 
 
 class CredentialRestoreError(RuntimeError):
@@ -427,7 +431,7 @@ class IntegrationInfo:
 class DemoProxmoxGateway:
     mode = "demo"
 
-    def scheduler_snapshot(self) -> dict[str, Any]:
+    def scheduler_snapshot(self, *, force: bool = False) -> dict[str, Any]:
         resources: list[dict[str, Any]] = []
         for index, (node, cpu, memory) in enumerate((
             ("pve-01", 0.48, 0.62),
@@ -510,6 +514,10 @@ class DemoProxmoxGateway:
         if pool_id not in pools:
             raise RuntimeError(f"Пул Proxmox {pool_id} не найден")
         return pools[pool_id]
+
+    def pool_inventory(self, pool_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+        known = {pool["pool_id"] for pool in self.list_pools()}
+        return {name: self.pool_members(name) for name in sorted(known.intersection(pool_ids))}
 
     def cluster_metrics(self, tracked_vmids: list[int] | None = None) -> dict[str, Any]:
         phase = time.time() / 24
@@ -620,11 +628,20 @@ class DemoProxmoxGateway:
     def power_action(self, vmids: list[int], action: str) -> None:
         time.sleep(0.25)
 
+    def shutdown_idle_vm(self, vm: dict[str, Any]) -> None:
+        time.sleep(0.05)
+
     def rotate_password(self, vmids: list[int], username: str, password: str) -> None:
         time.sleep(0.35)
 
-    def create_snapshot(self, vmids: list[int], name: str, description: str = "") -> None:
+    def create_snapshot(
+        self, vmids: list[int], name: str, description: str = "",
+        *, on_completed: Callable[[int], None] | None = None,
+    ) -> None:
         time.sleep(0.25)
+        if on_completed:
+            for vmid in dict.fromkeys(vmids):
+                on_completed(vmid)
 
     def rollback_snapshot(
         self,
@@ -720,6 +737,9 @@ class LiveProxmoxGateway:
         # Keep allocation and clone submission indivisible between concurrent
         # dashboard deployment threads.
         self._clone_submit_lock = threading.Lock()
+        self._snapshot_limit = self._batch_limit("PROXMOX_SNAPSHOT_BATCH")
+        # Manual pool snapshots and deployment baselines share storage bandwidth.
+        self._snapshot_slots = threading.BoundedSemaphore(self._snapshot_limit)
 
     def integration_info(self) -> IntegrationInfo:
         endpoint = self.host if self.port == 443 else f"{self.host}:{self.port}"
@@ -729,7 +749,7 @@ class LiveProxmoxGateway:
         except Exception as exc:
             return IntegrationInfo("live", False, endpoint, "Proxmox VE", str(exc))
 
-    def scheduler_snapshot(self) -> dict[str, Any]:
+    def scheduler_snapshot(self, *, force: bool = False) -> dict[str, Any]:
         """Return cached, read-only admission telemetry from Proxmox.
 
         Resource and task endpoints are intentionally independent: a missing
@@ -741,7 +761,7 @@ class LiveProxmoxGateway:
         now = time.monotonic()
         with self._scheduler_snapshot_lock:
             cached = self._scheduler_snapshot_cache
-            if cached is not None and now - self._scheduler_snapshot_cache_at < 5.0:
+            if not force and cached is not None and now - self._scheduler_snapshot_cache_at < 5.0:
                 return _copy_scheduler_snapshot(cached)
 
             warnings: list[str] = []
@@ -825,22 +845,53 @@ class LiveProxmoxGateway:
         try:
             pool = self.client.pools(pool_id).get()
         except Exception as exc:
-            raise RuntimeError(f"Пул Proxmox {pool_id} не найден") from exc
+            raise RuntimeError(f"Не удалось прочитать состав пула Proxmox {pool_id}") from exc
+        if not isinstance(pool, dict) or not isinstance(pool.get("members"), list):
+            raise RuntimeError(f"Proxmox вернул неполный состав пула {pool_id}")
+        if pool.get("poolid", pool_id) != pool_id:
+            raise RuntimeError(f"Proxmox вернул другой пул при чтении {pool_id}")
         members: list[dict[str, Any]] = []
-        for member in pool.get("members", []):
-            if member.get("type") != "qemu" or member.get("vmid") is None or int(member.get("template") or 0) == 1:
+        seen: set[int] = set()
+        for member in pool["members"]:
+            if not isinstance(member, dict) or not member.get("type"):
+                raise RuntimeError(f"Proxmox вернул неполную запись в пуле {pool_id}")
+            if member["type"] != "qemu" or int(member.get("template") or 0) == 1:
                 continue
-            maxmem = max(float(member.get("maxmem") or 0), 1)
+            vmid = _scheduler_integer(member.get("vmid"))
+            if vmid is None or vmid <= 0 or vmid in seen:
+                raise RuntimeError(f"Proxmox вернул некорректный VMID в пуле {pool_id}")
+            seen.add(vmid)
+            maxmem = max(_scheduler_number(member.get("maxmem")), 1)
             members.append({
-                "vmid": int(member["vmid"]),
-                "name": str(member.get("name") or f"vm-{member['vmid']}"),
+                "vmid": vmid,
+                "name": str(member.get("name") or f"vm-{vmid}"),
                 "node": str(member.get("node") or ""),
-                "status": str(member.get("status") or "stopped"),
-                "cpu": round(float(member.get("cpu") or 0) * 100, 1),
-                "ram": round(float(member.get("mem") or 0) / maxmem * 100, 1),
+                "status": str(member.get("status") or "unknown"),
+                "cpu": round(_scheduler_number(member.get("cpu")) * 100, 1),
+                "ram": round(_scheduler_number(member.get("mem")) / maxmem * 100, 1),
                 "ip": "",
             })
         return sorted(members, key=lambda item: item["vmid"])
+
+    def pool_inventory(self, pool_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+        """Read each distinct pool once; a missing key means the read failed.
+
+        The cluster resources list hides individual VMs without VM.Audit.
+        Pool.Audit on the pool endpoint provides its authoritative membership.
+        """
+        names = sorted(set(pool_ids) - {""})
+        if not names:
+            return {}
+        result: dict[str, list[dict[str, Any]]] = {}
+        with ThreadPoolExecutor(max_workers=min(3, len(names)), thread_name_prefix="pve-pools") as workers:
+            futures = {workers.submit(self.pool_members, name): name for name in names}
+            for future in as_completed(futures):
+                try:
+                    result[futures[future]] = future.result()
+                except (RuntimeError, TypeError, ValueError):
+                    # Omit unreadable/malformed pools so their last inventory survives.
+                    continue
+        return result
 
     def _wait_task(self, node: str, upid: str, timeout: int = 1800) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
@@ -2229,25 +2280,27 @@ class LiveProxmoxGateway:
                         )
 
             deployed.sort(key=lambda item: int(item["vmid"]))
-            snapshot_tasks: list[tuple[str, str]] = []
-            snapshot_batch = self._batch_limit("PROXMOX_SNAPSHOT_BATCH")
-            for item in deployed:
-                node = str(item["node"])
-                upid = self.client.nodes(node).qemu(int(item["vmid"])).snapshot.post(
-                    snapname="start",
-                    description="Начальное состояние после развёртывания",
-                )
-                if upid:
-                    snapshot_tasks.append((node, str(upid)))
-                if len(snapshot_tasks) >= snapshot_batch:
-                    self._wait_tasks(snapshot_tasks, timeout=1800)
-                    snapshot_tasks.clear()
-            self._wait_tasks(snapshot_tasks, timeout=1800)
+            confirmed = 0
+
+            def baseline_done(_vmid: int) -> None:
+                nonlocal confirmed
+                confirmed += 1
+                progress(90 + round(confirmed / vm_count * 7), f"Созданы снимки start: {confirmed} из {vm_count}")
+
+            self._snapshot_group(
+                {int(item["vmid"]): str(item["node"]) for item in deployed},
+                "start", "Начальное состояние после развёртывания", baseline_done,
+            )
             for item in deployed:
                 item["last_snapshot"] = "start"
-            progress(97, "Начальные снимки start созданы")
             progress(100, "Стенд готов")
             return deployed
+        except SnapshotOutcomeUnknown as exc:
+            # A lost submission response or a timeout can leave a running UPID.
+            # Deployment cleanup stops guests, clears locks and deletes disks.
+            raise RuntimeError(
+                f"{exc}. Пул {pool_id} и VM сохранены. Проверьте задачи снимков в Proxmox перед очисткой."
+            ) from exc
         except Exception as exc:
             remaining, cleanup_errors = self._cleanup_failed_deploy(
                 created, pool_id, expected_marker,
@@ -2263,6 +2316,19 @@ class LiveProxmoxGateway:
 
     def _locate_vm(self, vmid: int) -> str:
         return str(self._vm_inventory([vmid])[int(vmid)]["node"])
+
+    def shutdown_idle_vm(self, vm: dict[str, Any]) -> None:
+        node, vmid = vm["node"], int(vm["vmid"])
+        api = self.client.nodes(node).qemu(vmid)
+        config = api.config.get()
+        if config.get("name") != vm["name"] or int(config.get("template") or 0) or config.get("lock"):
+            raise RuntimeError(f"Нельзя выключить VM {vmid}: имя, тип VM или блокировка изменились")
+        upid = api.status.shutdown.post(timeout=60, forceStop=0)
+        if not upid:
+            raise RuntimeError(f"Proxmox не подтвердил запуск выключения VM {vmid}")
+        self._wait_task(node, str(upid), timeout=90)
+        if api.status.current.get().get("status") != "stopped":
+            raise RuntimeError(f"Proxmox не подтвердил остановку VM {vmid}")
 
     def power_action(self, vmids: list[int], action: str) -> None:
         # The dashboard's Stop button is an operator action for an entire lab.
@@ -2295,22 +2361,83 @@ class LiveProxmoxGateway:
             node = str(inventory[int(vmid)]["node"])
             self.client.nodes(node).qemu(vmid).agent("set-user-password").post(username=username, password=password)
 
-    def create_snapshot(self, vmids: list[int], name: str, description: str = "") -> None:
+    def create_snapshot(
+        self, vmids: list[int], name: str, description: str = "",
+        *, on_completed: Callable[[int], None] | None = None,
+    ) -> None:
         inventory = self._vm_inventory(vmids)
-        tasks: list[tuple[str, str]] = []
-        batch_size = self._batch_limit("PROXMOX_SNAPSHOT_BATCH")
-        for vmid in vmids:
-            node = str(inventory[int(vmid)]["node"])
-            upid = self.client.nodes(node).qemu(vmid).snapshot.post(
-                snapname=name,
-                description=description,
-            )
-            if upid:
-                tasks.append((node, str(upid)))
-            if len(tasks) >= batch_size:
-                self._wait_tasks(tasks, timeout=1800)
-                tasks.clear()
-        self._wait_tasks(tasks, timeout=1800)
+        self._snapshot_group({vmid: item["node"] for vmid, item in inventory.items()},
+                             name, description, on_completed)
+
+    def _snapshot_group(
+        self, placements: dict[int, str], name: str, description: str,
+        on_completed: Callable[[int], None] | None,
+    ) -> None:
+        if not placements:
+            return
+        # Interleave nodes so a pool ordered by node does not send the whole
+        # first window to the same host while the others have capacity.
+        by_node: dict[str, deque[int]] = {}
+        for vmid, node in placements.items():
+            by_node.setdefault(node, deque()).append(vmid)
+        remaining: deque[int] = deque()
+        while by_node:
+            for node, group in list(by_node.items()):
+                remaining.append(group.popleft())
+                if not group:
+                    del by_node[node]
+
+        failed = threading.Event()
+
+        def snapshot_vm(vmid: int) -> bool:
+            node = placements[vmid]
+            with self._snapshot_slots:
+                if failed.is_set():
+                    return False
+                try:
+                    upid = self.client.nodes(node).qemu(vmid).snapshot.post(
+                        snapname=name, description=description, vmstate=0,
+                    )
+                except Exception as exc:
+                    failed.set()
+                    raise SnapshotOutcomeUnknown(f"VM {vmid} ({node}), отправка не подтверждена: {exc}") from exc
+                if not isinstance(upid, str) or not upid.startswith("UPID:"):
+                    failed.set()
+                    raise SnapshotOutcomeUnknown(f"VM {vmid} ({node}): Proxmox не вернул UPID снимка")
+                try:
+                    self._wait_tasks([(node, upid)], timeout=1800)
+                except TimeoutError as exc:
+                    failed.set()
+                    raise SnapshotOutcomeUnknown(f"VM {vmid} ({node}), {upid}: {exc}") from exc
+                except Exception as exc:
+                    failed.set()
+                    raise RuntimeError(f"VM {vmid} ({node}), {upid}: {exc}") from exc
+                return True
+
+        errors: list[Exception] = []
+        workers = min(len(remaining), self._snapshot_limit)
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pve-snapshot") as executor:
+            pending = {}
+            while pending or (remaining and not failed.is_set()):
+                while remaining and len(pending) < workers and not failed.is_set():
+                    vmid = remaining.popleft()
+                    pending[executor.submit(snapshot_vm, vmid)] = vmid
+                if not pending:
+                    break
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    vmid = pending.pop(future)
+                    try:
+                        if future.result() and on_completed:
+                            on_completed(vmid)
+                    except Exception as exc:
+                        failed.set()
+                        errors.append(exc)
+        if errors:
+            message = f"Снимок {name} не завершён: " + "; ".join(map(str, errors))
+            if any(isinstance(error, SnapshotOutcomeUnknown) for error in errors):
+                raise SnapshotOutcomeUnknown(message)
+            raise RuntimeError(message)
 
     def rollback_snapshot(
         self,

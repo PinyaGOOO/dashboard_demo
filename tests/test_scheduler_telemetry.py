@@ -116,6 +116,15 @@ class SchedulerNormalizationTests(unittest.TestCase):
 
 
 class SchedulerSnapshotTests(unittest.TestCase):
+    def test_forced_snapshot_reads_resources_again_for_operator_retry(self) -> None:
+        gateway = _live_gateway([{"type": "node", "node": "depo", "cpu": 0.99}], [])
+        self.assertEqual(gateway.scheduler_snapshot()["nodes"][0]["cpu_percent"], 99)
+        gateway.client.cluster.resources.get.return_value = [
+            {"type": "node", "node": "depo", "cpu": 0.25}
+        ]
+        self.assertEqual(gateway.scheduler_snapshot(force=True)["nodes"][0]["cpu_percent"], 25)
+        self.assertEqual(gateway.client.cluster.resources.get.call_count, 2)
+
     def test_live_snapshot_is_cached_for_five_seconds_and_defensively_copied(self) -> None:
         gateway = _live_gateway(
             [{

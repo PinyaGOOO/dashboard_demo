@@ -13,6 +13,10 @@ from typing import Any, Callable, Iterator
 QueuedCallback = Callable[[int], None]
 
 
+class DeploymentCapacityBlocked(RuntimeError):
+    """Deployment has not acquired its reservation and is safe to retry."""
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -645,7 +649,7 @@ class ProxmoxOperationQueue:
         # a vanished sampler must not permanently freeze the queue.
         return self._external_tasks if self._external_is_fresh_locked(now) else []
 
-    def _usage_locked(self, now: float) -> dict[str, Any]:
+    def _usage_locked(self, now: float, *, include_internal: bool = True) -> dict[str, Any]:
         lanes = {
             "control": {"global": 0, "nodes": {}, "storages": {}},
             "heavy": {"global": 0, "nodes": {}, "storages": {}},
@@ -666,8 +670,9 @@ class ProxmoxOperationQueue:
                     target["storages"].get(name, 0) + int(resource_weight)
                 )
 
-        for item in self._active.values():
-            add(item)
+        if include_internal:
+            for item in self._active.values():
+                add(item)
         external = self._external_locked(now)
         for item in external:
             add(item)
@@ -770,6 +775,42 @@ class ProxmoxOperationQueue:
                 reasons.append(f"storage:{name}")
         return list(dict.fromkeys(reasons))
 
+    def _deployment_pressure_reason_locked(self, ticket: Mapping[str, Any], now: float) -> str:
+        fresh, _, _ = self._telemetry_locked(now)
+        if fresh:
+            # At the scheduler's highest load band even one additional VM
+            # can exhaust the target, although a one-unit ticket might fit.
+            resources = [("Кластер", self._cluster_pressure)]
+            resources.extend(
+                (f"Узел {name}", self._node_pressure.get(name, {}))
+                for name in ticket["node_weights"]
+            )
+            resources.extend(
+                (f"Хранилище {name}", self._storage_pressure.get(name, {}))
+                for name in ticket["storage_weights"]
+            )
+            for label, resource in resources:
+                if resource.get("state") == "throttled" and self._resource_peak(resource) >= 95:
+                    metrics = ", ".join(
+                        f"{metric} {resource[key]:g}%"
+                        for metric, key in (("CPU", "cpu_percent"), ("RAM", "memory_percent"), ("диск", "used_percent"))
+                        if key in resource
+                    )
+                    return f"{label}: критическая нагрузка ({metrics})."
+
+        # Local reservations may finish shortly. Pause immediately only when
+        # the ticket would still be blocked if those reservations all ended.
+        usage = self._usage_locked(now, include_internal=False)
+        reasons = self._blocking_reasons_locked(ticket, usage, fresh)
+        for reason in reasons:
+            kind, separator, name = reason.partition(":")
+            if separator:
+                resource = f"хранилище {name}" if kind == "storage" else f"узел {name}"
+                return f"Недостаточно свободных ресурсов Proxmox для развёртывания ({resource})."
+        if reasons:
+            return "В кластере Proxmox недостаточно свободных ресурсов для развёртывания."
+        return ""
+
     def _fits_locked(self, ticket: Mapping[str, Any], now: float) -> bool:
         fresh, _, _ = self._telemetry_locked(now)
         usage = self._usage_locked(now)
@@ -854,6 +895,8 @@ class ProxmoxOperationQueue:
         lane: str | None = None,
         timeout: float | None = None,
         cancel_event: threading.Event | None = None,
+        pause_on_overload: bool = False,
+        require_fresh_pressure: bool = False,
     ) -> Iterator[dict[str, Any]]:
         selected_lane = self._lane(kind, lane)
         heavy_limit = max(1, self.capacity - self.control_reserve)
@@ -887,6 +930,8 @@ class ProxmoxOperationQueue:
             "queued_at": _utc_now(),
             "queued_monotonic": time.monotonic(),
         }
+        if pause_on_overload and timeout is None:
+            timeout = 60.0
         if timeout is None:
             deadline = None
         else:
@@ -911,9 +956,28 @@ class ProxmoxOperationQueue:
                             "Proxmox operation was cancelled while queued"
                         )
                     if deadline is not None and now >= deadline:
+                        if pause_on_overload:
+                            raise DeploymentCapacityBlocked(
+                                f"Очередь Proxmox не выделила ресурсы для развёртывания за {timeout_value:g} с."
+                            )
                         raise TimeoutError(
                             "Timed out waiting for Proxmox operation capacity"
                         )
+                    if require_fresh_pressure:
+                        fresh, _, _ = self._telemetry_locked(now)
+                        if not fresh or self._pressure_stale_hint or not self._pressure_sources.get("resources"):
+                            raise DeploymentCapacityBlocked(
+                                "Актуальная нагрузка Proxmox неизвестна. Проверьте связь с кластером."
+                            )
+                        missing_nodes = set(normalized_nodes) - self._node_pressure.keys()
+                        if missing_nodes:
+                            raise DeploymentCapacityBlocked(
+                                "Нет данных о нагрузке выбранных узлов: " + ", ".join(sorted(missing_nodes))
+                            )
+                    if pause_on_overload:
+                        reason = self._deployment_pressure_reason_locked(ticket, now)
+                        if reason:
+                            raise DeploymentCapacityBlocked(reason)
                     if self._can_start_locked(ticket, now):
                         self._waiting.remove(ticket)
                         ticket["started_at"] = _utc_now()

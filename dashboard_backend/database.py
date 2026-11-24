@@ -120,6 +120,22 @@ class DashboardStore:
             updated_at TEXT NOT NULL,
             FOREIGN KEY (blueprint_id) REFERENCES blueprints(id) ON DELETE SET NULL
         );
+        -- Exists only while no Proxmox deployment mutations have begun.
+        CREATE TABLE IF NOT EXISTS pending_deployments (
+            stand_id INTEGER PRIMARY KEY REFERENCES stands(id) ON DELETE CASCADE,
+            plan TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS snapshot_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stand_id INTEGER NOT NULL REFERENCES stands(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            vmid INTEGER,
+            status TEXT NOT NULL,
+            total INTEGER NOT NULL,
+            done INTEGER NOT NULL DEFAULT 0,
+            error TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_snapshot_runs_stand ON snapshot_runs(stand_id, id DESC);
         CREATE TABLE IF NOT EXISTS stand_vms (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             stand_id INTEGER NOT NULL,

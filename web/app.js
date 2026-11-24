@@ -134,6 +134,7 @@ exit 75`;
   };
   const statusLabels = {
     running: "Работает", stopped: "Остановлен", provisioning: "Развёртывается", resetting: "Восстанавливается",
+    awaiting_confirmation: "Ждёт решения",
     error: "Ошибка", passed: "Пройдено", warning: "Есть замечания", failed: "Не пройдено",
     idle: "Ожидание", active: "Активна", ended: "Завершена", draft: "Черновик",
     archived: "В архиве", online: "Онлайн", checking: "Проверяется", info: "Информация",
@@ -339,8 +340,9 @@ exit 75`;
   }
 
   function pageHeader(title, subtitle, actions = "") {
+    const workspace = workspaces.find(item => item.id === state.workspace) || workspaces[0];
     return `<div class="page-header">
-      <div class="page-header__copy"><h2 class="page-title">${escapeHtml(title)}</h2><p class="page-subtitle">${escapeHtml(subtitle)}</p></div>
+      <div class="page-header__copy"><span class="section-kicker">${escapeHtml(workspace.name)} <i>/</i> DEPLOYER</span><h2 class="page-title">${escapeHtml(title)}</h2><p class="page-subtitle">${escapeHtml(subtitle)}</p></div>
       ${actions ? `<div class="page-actions">${actions}</div>` : ""}
     </div>`;
   }
@@ -353,14 +355,14 @@ exit 75`;
     </article>`;
   }
 
-  function gauge(value, label, color = "#ed6c23") {
+  function gauge(value, label, color = "var(--accent)") {
     const safe = clamp(value);
     const radius = 59;
     const circumference = 2 * Math.PI * radius;
     const dash = circumference * safe / 100;
     return `<div class="gauge">
       <svg viewBox="0 0 150 150" role="img" aria-label="${escapeHtml(label)}: ${safe}%">
-        <circle cx="75" cy="75" r="${radius}" fill="none" stroke="#edf0f3" stroke-width="11"/>
+        <circle cx="75" cy="75" r="${radius}" fill="none" stroke="var(--surface-strong)" stroke-width="11"/>
         <circle cx="75" cy="75" r="${radius}" fill="none" stroke="${color}" stroke-width="11" stroke-linecap="round"
           stroke-dasharray="${dash} ${circumference - dash}" transform="rotate(-90 75 75)"/>
       </svg>
@@ -389,25 +391,23 @@ exit 75`;
     const ticks = [0, 25, 50, 75, 100];
     const grid = ticks.map(value => {
       const y = top + innerH - value / maxValue * innerH;
-      return `<line x1="${left}" y1="${y}" x2="${width - right}" y2="${y}" stroke="#e8ebee" stroke-width="1" vector-effect="non-scaling-stroke"/>`;
+      return `<line x1="${left}" y1="${y}" x2="${width - right}" y2="${y}" stroke="var(--line)" stroke-width="1" vector-effect="non-scaling-stroke"/>`;
     }).join("");
     const yLabels = ticks.map(value => {
       const y = top + innerH - value / maxValue * innerH;
       return `<span class="chart__axis-label chart__axis-label--y" style="top:${(y / height * 100).toFixed(3)}%">${value}%</span>`;
     }).join("");
     const maxXLabels = window.innerWidth < 700 ? 3 : 6;
-    const labelStep = Math.max(1, Math.ceil((history.length - 1) / Math.max(maxXLabels - 1, 1)));
-    const labelIndexes = [];
-    for (let index = 0; index < history.length; index += labelStep) labelIndexes.push(index);
-    if (labelIndexes.at(-1) !== history.length - 1) labelIndexes.push(history.length - 1);
+    const labelCount = Math.min(history.length, maxXLabels);
+    const labelIndexes = Array.from({length: labelCount}, (_, i) => Math.round(i * (history.length - 1) / Math.max(1, labelCount - 1)));
     const xLabels = labelIndexes.map((index, position) => {
       const x = point(history[index], index, "total")[0];
       const edgeClass = position === 0 ? " is-first" : position === labelIndexes.length - 1 ? " is-last" : "";
       return `<span class="chart__axis-label chart__axis-label--x${edgeClass}" style="left:${(x / width * 100).toFixed(3)}%">${escapeHtml(history[index].time)}</span>`;
     }).join("");
     return `<div class="chart" style="height:${height}px" role="img" aria-label="График нагрузки кластера"><svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true" focusable="false">
-      <defs><linearGradient id="examArea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ed6c23" stop-opacity=".20"/><stop offset="1" stop-color="#ed6c23" stop-opacity="0"/></linearGradient></defs>
-      ${grid}<path d="${areaPath}" fill="url(#examArea)"/><path d="${toPath(total)}" fill="none" stroke="#9099a6" stroke-width="2" vector-effect="non-scaling-stroke"/><path d="${toPath(exam)}" fill="none" stroke="#ed6c23" stroke-width="2.5" vector-effect="non-scaling-stroke"/>
+      <defs><linearGradient id="examArea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--accent)" stop-opacity=".20"/><stop offset="1" stop-color="var(--accent)" stop-opacity="0"/></linearGradient></defs>
+      ${grid}<path d="${areaPath}" fill="url(#examArea)" stroke="none"/><path d="${toPath(total)}" fill="none" stroke="var(--ink-muted)" stroke-width="2" vector-effect="non-scaling-stroke"/><path d="${toPath(exam)}" fill="none" stroke="var(--accent)" stroke-width="2.5" vector-effect="non-scaling-stroke"/>
     </svg>${yLabels}${xLabels}</div>`;
   }
 
@@ -425,19 +425,21 @@ exit 75`;
       total_vms: stands.reduce((total, stand) => total + Number(stand.actual_vm_count || 0), 0),
       average_score: Math.round(scores.reduce((total, score) => total + score, 0) / Math.max(scores.length, 1)),
     };
-    const active = stands.filter(stand => ["running", "provisioning", "resetting"].includes(stand.status));
+    const active = stands.filter(stand => ["running", "provisioning", "resetting", "awaiting_confirmation"].includes(stand.status));
     const cluster = metrics.cluster;
     const modeLabel = integration.mode === "live" ? "Данные Proxmox в реальном времени" : "Безопасный демонстрационный контур";
     const historyTitle = integration.mode === "live" ? "Последние измерения нагрузки" : "Нагрузка кластера за 24 часа";
     const historySubtitle = integration.mode === "live" ? "История текущего процесса: весь кластер и вклад стендов" : "Весь кластер и вклад стендов демоэкзамена";
     app.innerHTML = `<section class="page">
-      ${pageHeader("Операционный обзор", "Состояние экзаменационных стендов и кластера на одном экране.", `<button class="button button--primary" data-open-deploy>${icon("plus")}Развернуть стенд</button>`)}
-      <div class="mode-banner mode-banner--${integration.mode}">
-        <div><span class="mode-banner__dot"></span><strong>${escapeHtml(integration.cluster)}</strong><span>${escapeHtml(modeLabel)}</span></div>
-        <small>Обновлено ${relativeTime(metrics.updated_at)}</small>
-      </div>
+      <header class="overview-hero">
+        <div class="overview-hero__copy"><div class="hero-kicker"><i aria-hidden="true"></i>${escapeHtml(integration.cluster)} <span>/</span> ${integration.mode === "live" ? "LIVE" : "DEMO"}</div>
+          <h2>Обзор <em>кластера</em></h2><p>${escapeHtml(modeLabel)}. Обновлено ${relativeTime(metrics.updated_at)}.</p>
+          <button class="button button--primary" data-open-deploy>${icon("plus")}Развернуть стенд</button>
+        </div>
+        <img class="overview-hero__orb" src="/orb.svg" alt="" width="540" height="310">
+      </header>
       <div class="metric-grid">
-        ${metricCard("Активные стенды", `${overview.active_stands}<small> / ${overview.total_stands}</small>`, `<span class="metric-card__trend">●</span> ${active.some(s => ["provisioning", "resetting"].includes(s.status)) ? "идёт фоновая операция" : "все операции штатно"}`, "server")}
+        ${metricCard("Активные стенды", `${overview.active_stands}<small> / ${overview.total_stands}</small>`, `<span class="metric-card__trend">●</span> ${active.some(s => s.status === "awaiting_confirmation") ? "развёртывание ждёт решения" : active.some(s => ["provisioning", "resetting"].includes(s.status)) ? "идёт фоновая операция" : "все операции штатно"}`, "server")}
         ${metricCard("Виртуальные машины", overview.total_vms, "учитываются в стендах", "server", "blue")}
         ${metricCard("Средний результат", `${overview.average_score}%`, `По ${stands.filter(stand => stand.check_score != null).length} последним результатам`, "check", "green")}
         ${metricCard("Нагрузка стендов", `${formatNumber(cluster.exam_cpu, 1)}%`, `${formatNumber(cluster.cpu, 1)}% CPU всего кластера`, "activity", "purple")}
@@ -476,7 +478,7 @@ exit 75`;
   function overviewStand(stand) {
     return `<button class="overview-stand" data-stand-detail="${stand.id}" type="button">
       <span class="overview-stand__state overview-stand__state--${escapeHtml(stand.status)}">${icon("server")}</span>
-      <span class="overview-stand__identity"><strong>${escapeHtml(stand.name)}</strong><small>${escapeHtml(stand.blueprint_code || "Без сценария")} · ${escapeHtml(stand.pool_id)}</small></span>
+      <span class="overview-stand__identity"><strong>${escapeHtml(stand.name)}</strong><small>${escapeHtml(stand.blueprint_code || "Без сценария")} · ${escapeHtml(stand.pool_id)}<span data-extra-count-for="${Number(stand.id)}">${poolExtraLabel(stand)}</span></small></span>
       <span class="overview-stand__users">${icon("server")}<strong>${stand.actual_vm_count || 0}</strong> VM</span>
       <span class="overview-stand__check">${stand.check_score == null ? "—" : `${stand.check_score}%`}<small>проверка</small></span>
       <span>${statusChip(stand.status)}</span>${icon("chevron", "overview-stand__arrow")}
@@ -493,7 +495,7 @@ exit 75`;
     const workspaceItems = workspaceStands();
     let stands = workspaceItems;
     if (state.standFilter !== "all") {
-      if (state.standFilter === "attention") stands = stands.filter(stand => stand.status === "error" || ["warning", "failed"].includes(stand.check_status));
+      if (state.standFilter === "attention") stands = stands.filter(standNeedsAttention);
       else if (state.standFilter === "provisioning") stands = stands.filter(stand => ["provisioning", "resetting"].includes(stand.status));
       else stands = stands.filter(stand => stand.status === state.standFilter);
     }
@@ -506,7 +508,7 @@ exit 75`;
       running: workspaceItems.filter(item => item.status === "running").length,
       provisioning: workspaceItems.filter(item => ["provisioning", "resetting"].includes(item.status)).length,
       stopped: workspaceItems.filter(item => item.status === "stopped").length,
-      attention: workspaceItems.filter(item => item.status === "error" || ["warning", "failed"].includes(item.check_status)).length,
+      attention: workspaceItems.filter(standNeedsAttention).length,
     };
     app.innerHTML = `<section class="page">
       ${pageHeader("Стенды", "Управляйте пулами, виртуальными машинами, доступами и автопроверками.", `<button class="button button--danger" data-rollback-all-stands ${workspaceItems.length ? "" : "disabled"}>${icon("refresh")}Вернуть все стенды к start</button><button class="button" data-import-pool>${icon("plus")}Добавить существующий pool</button><button class="button button--primary" data-open-deploy>${icon("plus")}Развернуть стенд</button>`)}
@@ -529,13 +531,38 @@ exit 75`;
     });
   }
 
+  function standNeedsAttention(stand) {
+    return ["error", "awaiting_confirmation"].includes(stand.status) || ["warning", "failed"].includes(stand.check_status) || stand.snapshot_status === "error";
+  }
+
+  function snapshotBusy(stand) {
+    return ["queued", "running"].includes(stand?.snapshot_status);
+  }
+
+  function snapshotChanged(before, after) {
+    return ["snapshot_status", "snapshot_name", "snapshot_done", "snapshot_total", "snapshot_error"]
+      .some(key => (before?.[key] ?? null) !== (after?.[key] ?? null));
+  }
+
+  function snapshotStatus(stand, compact = false) {
+    const labels = { queued: "Снимок в очереди", running: "Создаётся снимок", done: "Снимок создан", error: "Ошибка снимка" };
+    const title = labels[stand.snapshot_status];
+    if (!title) return "";
+    const count = `${formatNumber(stand.snapshot_done)} / ${formatNumber(stand.snapshot_total)} VM`;
+    if (compact) return `<small class="snapshot-status snapshot-status--${stand.snapshot_status}" title="${escapeHtml(stand.snapshot_error || stand.snapshot_name || "")}">${title} · ${count}</small>`;
+    const type = stand.snapshot_status === "error" ? "error" : stand.snapshot_status === "done" ? "success" : "info";
+    return `<div class="alert alert--${type}" role="status">${icon("copy")}<div><strong>${title} · ${count}</strong><p class="mono">${escapeHtml(stand.snapshot_name || "")}</p>${stand.snapshot_error ? `<p>${escapeHtml(stand.snapshot_error)}</p>` : ""}</div></div>`;
+  }
+
   function standRow(stand) {
     return `<tr class="clickable-row" data-stand-detail="${stand.id}">
-      <td><div class="entity-cell"><span class="entity-icon">${icon("server")}</span><span><strong class="cell-title">${escapeHtml(stand.name)}</strong><small class="cell-subtitle mono">${escapeHtml(stand.pool_id)} · ${escapeHtml(stand.node || "авто")}${stand.origin === "imported" ? " · подключён" : ""}</small></span></div></td>
-      <td>${statusChip(stand.status)}${["provisioning", "resetting"].includes(stand.status) ? `<div class="inline-progress"><div class="progress"><div class="progress__bar progress__bar--blue" style="width:${clamp(stand.progress)}%"></div></div><small>${stand.progress}%</small></div>` : ""}</td>
+      <td><div class="entity-cell"><span class="entity-icon">${icon("server")}</span><span><strong class="cell-title">${escapeHtml(stand.name)}</strong><small class="cell-subtitle mono">${escapeHtml(stand.pool_id)} · ${escapeHtml(stand.node || "авто")}${stand.origin === "imported" ? " · подключён" : ""}<span data-extra-count-for="${Number(stand.id)}">${poolExtraLabel(stand)}</span></small></span></div></td>
+      <td>${statusChip(stand.status)}${snapshotStatus(stand, true)}${["provisioning", "resetting"].includes(stand.status) ? `<div class="inline-progress"><div class="progress"><div class="progress__bar progress__bar--blue" style="width:${clamp(stand.progress)}%"></div></div><small>${stand.progress}%</small></div>` : ""}</td>
       <td><div class="resource-pair">${resourceBar("CPU", stand.cpu)}${resourceBar("RAM", stand.ram, "blue")}</div></td>
       <td>${stand.check_status === "running" ? statusChip("checking", "Выполняется") : stand.check_score == null && stand.check_status === "failed" ? statusChip("failed", "Ошибка запуска") : stand.check_score == null ? `<span class="muted">Не запускалась</span>` : `<div class="score-cell"><strong class="score score--${stand.check_score >= 90 ? "good" : stand.check_score >= 70 ? "warn" : "bad"}">${stand.check_score}%</strong><small>${relativeTime(stand.last_check)}</small></div>`}</td>
-      <td class="cell-actions"><button class="button button--small table-check-button" data-stand-action="run_check" data-stand-id="${stand.id}" type="button" ${stand.status !== "running" ? "disabled" : ""}>${icon("check")}Автопроверка</button><button class="icon-button" data-stand-detail="${stand.id}" title="Открыть">${icon("chevron")}</button></td>
+      <td class="cell-actions">${stand.status === "awaiting_confirmation"
+        ? `<button class="button button--small" data-stand-detail="${stand.id}" type="button">${icon("alert")}Выбрать действие</button>`
+        : `<button class="button button--small table-check-button" data-stand-action="run_check" data-stand-id="${stand.id}" type="button" ${stand.status !== "running" ? "disabled" : ""}>${icon("check")}Автопроверка</button><button class="icon-button" data-stand-detail="${stand.id}" title="Открыть">${icon("chevron")}</button>`}</td>
     </tr>`;
   }
 
@@ -621,14 +648,14 @@ exit 75`;
     const { metrics, stands, integration } = state.data;
     const cluster = metrics.cluster;
     const topStands = [...stands].filter(stand => stand.status === "running").sort((a, b) => b.cpu - a.cpu);
-    const historySubtitle = integration.mode === "live" ? "Измерения текущего процесса; оранжевым — управляемые VM" : "Почасовые значения; оранжевым — VM из управляемых пулов стендов";
+    const historySubtitle = integration.mode === "live" ? "Измерения текущего процесса; сиреневым — управляемые VM" : "Почасовые значения; сиреневым — VM из управляемых пулов стендов";
     const clusterHealthy = integration.connected && cluster.online_nodes === cluster.total_nodes && cluster.cpu < 85 && cluster.ram < 90;
     app.innerHTML = `<section class="page">
       ${pageHeader("Инфраструктура", "Фактическая загрузка Proxmox и оценка вклада экзаменационных VM в ресурсы кластера.", `<button class="button" data-refresh>${icon("refresh")}Обновить метрики</button>`)}
       <div class="infra-hero card"><div class="infra-hero__copy"><span class="infra-kicker">${escapeHtml(integration.cluster)} · ${integration.mode === "live" ? "LIVE" : "DEMO"}</span><h3>${clusterHealthy ? "Кластер работает стабильно" : "Инфраструктура требует внимания"}</h3><p>${cluster.online_nodes} из ${cluster.total_nodes} нод онлайн. Экзаменационные стенды используют <strong>${formatNumber(cluster.exam_cpu, 1)}%</strong> доступной CPU-ёмкости и <strong>${formatNumber(cluster.exam_ram, 1)}%</strong> памяти.</p>
         <div class="infra-tags"><span>${icon("server")} ${metrics.nodes.reduce((sum, node) => sum + node.running_vms, 0)} VM работают</span><span>${icon("activity")} ${100 - Math.round(cluster.cpu)}% CPU в резерве</span><span>${icon("shield")} TLS ${integration.mode === "live" ? "проверяется" : "не требуется"}</span></div></div>
-        <div class="infra-hero__share">${gauge(cluster.exam_cpu, "вклад стендов", "#ed6c23")}</div></div>
-      <div class="gauge-grid card"><div>${gauge(cluster.cpu, "CPU кластера", "#ed6c23")}</div><div>${gauge(cluster.ram, "RAM кластера", "#397fbc")}</div><div>${gauge(cluster.disk, "Хранилище", "#7b61a8")}</div><div>${gauge(cluster.exam_ram, "RAM стендов", "#2a9d69")}</div></div>
+        <div class="infra-hero__share">${gauge(cluster.exam_cpu, "вклад стендов", "var(--accent)")}</div></div>
+      <div class="gauge-grid card"><div>${gauge(cluster.cpu, "CPU кластера", "var(--accent)")}</div><div>${gauge(cluster.ram, "RAM кластера", "var(--blue)")}</div><div>${gauge(cluster.disk, "Хранилище", "var(--purple)")}</div><div>${gauge(cluster.exam_ram, "RAM стендов", "var(--green)")}</div></div>
       ${operationQueueCard(state.data.operation_queue)}
       <article class="card"><div class="card__header"><div class="card__heading"><h3 class="card__title">Динамика использования CPU</h3><p class="card__subtitle">${historySubtitle}</p></div><div class="chart-legend"><span class="chart-legend__item"><i class="chart-legend__dot chart-legend__dot--muted"></i>Кластер</span><span class="chart-legend__item"><i class="chart-legend__dot"></i>Демоэкзамен</span></div></div><div class="card__body">${lineChart(metrics.history, 270)}</div></article>
       <div class="content-grid content-grid--infra">
@@ -937,15 +964,39 @@ exit 75`;
     refreshButtons.forEach(button => button.classList.add("is-spinning"));
     try {
       const data = await api("/api/bootstrap");
+      const previous = new Map((state.data?.stands || []).map(stand => [Number(stand.id), stand]));
+      const oldWaiting = new Set(workspaceStands().filter(stand => stand.status === "awaiting_confirmation").map(stand => stand.id));
       state.data = data;
       state.lastUpdated = new Date();
       syncOperationPolling();
-      if (silent) updateShell(); else render();
+      if (silent) {
+        const waiting = workspaceStands().filter(stand => stand.status === "awaiting_confirmation");
+        const waitingChanged = waiting.length !== oldWaiting.size || waiting.some(stand => !oldWaiting.has(stand.id));
+        for (const stand of waiting.filter(item => !oldWaiting.has(item.id))) {
+          toast(`Развёртывание «${stand.name}» приостановлено. Откройте стенд, чтобы выбрать действие.`, "warning", 7000);
+        }
+        const snapshotUpdates = workspaceStands().filter(stand => snapshotChanged(previous.get(Number(stand.id)), stand));
+        if (state.route === "stands") {
+          if (waitingChanged || snapshotUpdates.some(stand => standNeedsAttention(stand) !== standNeedsAttention(previous.get(Number(stand.id)) || {}))) renderStands();
+          else snapshotUpdates.forEach(updateStandInStateAndView);
+        }
+        if (waitingChanged && state.route === "overview") renderOverview();
+        if (oldWaiting.has(activeStandDetailId) && !waiting.some(stand => stand.id === activeStandDetailId)) {
+          if (data.stands.some(stand => stand.id === activeStandDetailId)) openStandDetail(activeStandDetailId);
+          else closeModal();
+        }
+        const summaries = new Map(data.stands.map(stand => [Number(stand.id), stand]));
+        for (const label of app.querySelectorAll("[data-extra-count-for]")) {
+          label.textContent = poolExtraLabel(summaries.get(Number(label.dataset.extraCountFor)));
+        }
+        updateShell();
+      } else render();
     } catch (error) {
       if (!state.data) {
         app.innerHTML = `<section class="page"><div class="load-error">${icon("alert")}<h2>Не удалось загрузить дашборд</h2><p>${escapeHtml(error.message)}</p><button class="button button--primary" data-refresh>${icon("refresh")}Повторить</button></div></section>`;
       } else if (!silent) toast(error.message, "error");
     } finally {
+      if (activeStandDetailId !== null) await refreshOpenPoolInventory(activeStandDetailId);
       state.loading = false;
       refreshButtons.forEach(button => button.classList.remove("is-spinning"));
     }
@@ -1132,7 +1183,10 @@ exit 75`;
           model.start_ip = parseIpv4Cidr(model.subnet)?.address || "";
           const stand = await api("/api/stands", { method: "POST", body: model });
           state.ipam = null;
-          closeModal(); toast(`Стенд «${stand.name}» поставлен на развёртывание`); state.route = "stands"; window.location.hash = "stands"; await loadData(); await openStandDetail(stand.id);
+          closeModal();
+          if (stand.status === "awaiting_confirmation") toast(`Развёртывание «${stand.name}» ждёт вашего решения`, "warning");
+          else toast(`Стенд «${stand.name}» поставлен на развёртывание`);
+          state.route = "stands"; window.location.hash = "stands"; await loadData(); await openStandDetail(stand.id);
         } catch (error) { button.disabled = false; button.classList.remove("is-loading"); toast(error.message, "error"); }
       });
     };
@@ -1260,7 +1314,8 @@ exit 75`;
     const password = credential?.password || credential?.access_password || "";
     const accessUrl = safeAccessUrl(vm.access_url || vm.web_url);
     const hasStartSnapshot = vmHasStartSnapshot(vm);
-    const standBusy = ["provisioning", "resetting"].includes(stand.status) || Boolean(stand.bulk_rollback_pending);
+    const changingPower = ["provisioning", "resetting"].includes(stand.status) || Boolean(stand.bulk_rollback_pending);
+    const standBusy = changingPower || snapshotBusy(stand);
     const canRollbackVm = hasVmid && hasStartSnapshot && Boolean(vm.credential_recoverable)
       && !standBusy && stand.check_status !== "running" && vm.check_status !== "running";
     const passwordUnverified = credentialState === "loaded" && !password
@@ -1271,7 +1326,7 @@ exit 75`;
       : "Смените пароль этой VM или загрузите защищённые доступы.";
     const openKey = hasVmid ? `${Number(stand.id)}:${numericVmid}` : "";
     const wasLastOpened = Boolean(openKey && state.lastOpenedVmKey === openKey);
-    const accessButton = accessUrl && hasVmid && !standBusy
+    const accessButton = accessUrl && hasVmid && !changingPower
       ? `<a class="button button--primary vm-open-button ${wasLastOpened ? "is-last-opened" : ""}" href="${escapeHtml(accessUrl)}" target="_blank" rel="noopener noreferrer" data-open-vm data-open-vm-key="${openKey}" aria-pressed="${wasLastOpened ? "true" : "false"}"${wasLastOpened ? ` title="Последний открытый стенд"` : ""}>${icon("external")}Перейти к стенду</a>`
       : `<button class="button button--primary vm-open-button" type="button" disabled title="Web URL ещё не получен">${icon("chevron")}Перейти к стенду</button>`;
     return `<article class="vm-row">
@@ -1282,9 +1337,68 @@ exit 75`;
     </article>`;
   }
 
+  function poolExtraLabel(stand) {
+    const count = Number(stand?.pool_extra_vm_count ?? stand?.pool_extra_vms?.length ?? 0);
+    return count > 0 ? ` · +${formatNumber(count)} VM в пуле` : "";
+  }
+
+  function poolInventoryMarkup(stand) {
+    const extras = stand.pool_extra_vms || [];
+    const notice = {
+      pending: "Проверяем состав пула в Proxmox…",
+      unavailable: "Состав пула временно недоступен.",
+      stale: "Proxmox не ответил. Показан последний известный состав.",
+    }[stand.pool_inventory_state] || "";
+    if (!extras.length && !notice) return "";
+    const rows = extras.map(vm => `<li><span><strong>${escapeHtml(vm.name)}</strong><small>VMID ${Number(vm.vmid)} · ${escapeHtml(vm.node || "—")}</small></span>${statusChip(vm.status || "unknown")}</li>`).join("");
+    return `<section><div class="detail-section-title"><div><h4>Дополнительные VM в пуле</h4><small>${escapeHtml(notice || "Обнаружены в Proxmox. Доступны для просмотра.")}</small></div></div>${rows ? `<ul class="pool-inventory-list">${rows}</ul>` : ""}</section>`;
+  }
+
+  async function refreshOpenPoolInventory(id) {
+    const detail = modalRoot.querySelector(`.modal[data-stand-detail-id="${Number(id)}"]`);
+    const inventory = detail?.querySelector("[data-pool-inventory]");
+    const cached = standCredentialCache.get(Number(id));
+    if (!inventory || !cached || standNeedsLivePolling(cached.stand)) return;
+    const token = standDetailRequestToken;
+    let stand;
+    try { stand = await api(`/api/stands/${id}`, { promptAdmin: false }); }
+    catch {
+      const hadInventory = ["fresh", "stale"].includes(cached.stand.pool_inventory_state);
+      stand = { ...cached.stand, pool_inventory_state: hadInventory ? "stale" : "unavailable", pool_inventory_vmids: null };
+    }
+    if (token !== standDetailRequestToken || !inventory.isConnected) return;
+    if (snapshotChanged(cached.stand, stand)) {
+      updateStandInStateAndView(stand);
+      renderStandDetailModal(stand, cached.credentials, cached.credentialState, cached.credentialError, { updateExisting: true });
+      if (standNeedsLivePolling(stand)) scheduleStandDetailPoll(id, cached.credentials, cached.credentialState, cached.credentialError);
+      return;
+    }
+    const markup = poolInventoryMarkup(stand);
+    if (poolInventoryMarkup(cached.stand) !== markup) inventory.innerHTML = markup;
+    inventory.hidden = !markup;
+    const count = detail.querySelector("[data-detail-extra-count]");
+    if (count) count.textContent = poolExtraLabel(stand);
+    cached.stand.pool_extra_vms = stand.pool_extra_vms;
+    cached.stand.pool_extra_vm_count = stand.pool_extra_vm_count;
+    cached.stand.pool_inventory_state = stand.pool_inventory_state;
+    cached.stand.pool_inventory_vmids = stand.pool_inventory_vmids;
+    const deleteButton = detail.querySelector("[data-delete-pool-stands]");
+    if (deleteButton) deleteButton.disabled = !canDeletePoolMembers(stand);
+  }
+
+  function canDeletePoolMembers(stand) {
+    return !["provisioning", "resetting", "awaiting_confirmation"].includes(stand.status)
+      && !stand.bulk_rollback_pending && !snapshotBusy(stand)
+      && stand.pool_inventory_state === "fresh"
+      && Array.isArray(stand.pool_inventory_vmids) && stand.pool_inventory_vmids.length > 0;
+  }
+
   function renderStandDetailModal(stand, credentials = new Map(), credentialState = "locked", credentialError = "", { updateExisting = false } = {}) {
+    const awaitingDecision = stand.status === "awaiting_confirmation";
+    const inventory = poolInventoryMarkup(stand);
     const runCount = stand.vms.filter(vm => vm.status === "running").length;
-    const standBusy = ["provisioning", "resetting"].includes(stand.status) || Boolean(stand.bulk_rollback_pending);
+    const changingPower = ["provisioning", "resetting"].includes(stand.status) || Boolean(stand.bulk_rollback_pending);
+    const standBusy = changingPower || snapshotBusy(stand);
     const missingStartCount = stand.vms.filter(vm => !vmHasStartSnapshot(vm)).length;
     const missingCredentialCount = stand.vms.filter(vm => !vm.credential_recoverable).length;
     const canRollbackStart = stand.vms.length > 0 && !standBusy && !missingStartCount && !missingCredentialCount
@@ -1293,7 +1407,7 @@ exit 75`;
       ? `Snapshot start отсутствует у ${missingStartCount} VM`
       : missingCredentialCount ? `Сохранённый пароль отсутствует у ${missingCredentialCount} VM`
       : standBusy ? "Дождитесь завершения фоновой операции" : "Все VM будут возвращены к snapshot start";
-    standCredentialCache.set(Number(stand.id), { stand, credentials });
+    standCredentialCache.set(Number(stand.id), { stand, credentials, credentialState, credentialError });
     const credentialCount = stand.vms.filter(vm => credentials.get(Number(vm.vmid))?.password || credentials.get(Number(vm.vmid))?.access_password).length;
     const credentialControl = credentialState === "loaded"
       ? `<button class="button button--small" type="button" data-copy-stand-access="${stand.id}" ${credentialCount ? "" : "disabled"}>${icon("copy")}Все IP, логины и пароли</button><button class="button button--small" type="button" data-print-stand-access="${stand.id}" ${credentialCount ? "" : "disabled"}>${icon("printer")}Распечатать доступы</button>`
@@ -1303,16 +1417,22 @@ exit 75`;
       : credentialState === "error" ? `<div class="alert alert--warning">${icon("alert")}<div><strong>Не удалось получить сохранённые доступы.</strong><br>${escapeHtml(credentialError || "Можно сменить пароль отдельно у нужной VM.")}</div></div>` : "";
     const body = `<div class="stand-detail">
       <div class="stand-detail__hero"><div class="stand-detail__icon">${icon("server")}</div><div><div class="stand-detail__title"><h3>${escapeHtml(stand.name)}</h3>${statusChip(stand.status)}</div><p class="mono">${escapeHtml(stand.pool_id)} · ${escapeHtml(stand.blueprint_name || "Без сценария")} · ${escapeHtml(stand.node)}</p></div></div>
-      ${standBusy ? `<div class="deploy-detail"><div><strong>${stand.status === "resetting" ? "Возврат к исходному состоянию" : "Развёртывание выполняется"}</strong><span>${stand.progress}%</span></div><div class="progress"><div class="progress__bar progress__bar--blue" style="width:${stand.progress}%"></div></div><small>${stand.status === "resetting" ? "VM откатываются к snapshot start и запускаются заново." : "Мастер продолжает работу в фоне."} Окно можно закрыть крестиком.</small></div>` : ""}
+      ${awaitingDecision ? `<div class="alert alert--warning" role="status">${icon("alert")}<div><strong>Развёртывание приостановлено</strong><p>${escapeHtml(stand.last_error || "Кластер пока не может принять задачу.")}</p><p>Запланировано VM: ${formatNumber(stand.vm_count)}. Вы можете повторно проверить нагрузку или удалить задачу.</p></div></div>` : `
+      ${snapshotStatus(stand)}
+      ${changingPower ? `<div class="deploy-detail"><div><strong>${stand.status === "resetting" ? "Возврат к исходному состоянию" : "Развёртывание выполняется"}</strong><span>${stand.progress}%</span></div><div class="progress"><div class="progress__bar progress__bar--blue" style="width:${stand.progress}%"></div></div><small>${stand.status === "resetting" ? "VM откатываются к snapshot start и запускаются заново." : "Мастер продолжает работу в фоне."} Окно можно закрыть крестиком.</small></div>` : ""}
       ${stand.status === "error" && stand.last_error ? `<div class="alert alert--error">${icon("alert")}<div><strong>Причина ошибки операции</strong><br><span class="mono">${escapeHtml(stand.last_error)}</span></div></div>` : ""}
-      <div class="detail-stat-grid"><div><span>Машины</span><strong>${runCount} / ${stand.vm_count}</strong><small>запущено</small></div><div><span>CPU</span><strong>${formatNumber(stand.cpu, 1)}%</strong><small>текущая оценка</small></div><div><span>RAM</span><strong>${formatNumber(stand.ram, 1)}%</strong><small>на ноде</small></div><div><span>Режим работы</span><strong>Бессрочно</strong><small>автоотключение выключено</small></div></div>
-      <div class="detail-actions"><button class="button" data-stand-action="${stand.status === "stopped" ? "start" : "stop"}" data-stand-id="${stand.id}" ${!["running", "stopped"].includes(stand.status) || !stand.vms.length ? "disabled" : ""}>${icon("power")}${stand.status === "stopped" ? "Запустить" : "Остановить"}</button><button class="button" data-stand-action="restart" data-stand-id="${stand.id}" ${stand.status !== "running" ? "disabled" : ""}>${icon("refresh")}Перезапустить</button><button class="button" data-stand-action="snapshot" data-stand-id="${stand.id}" ${!stand.vms.length || standBusy ? "disabled" : ""}>${icon("copy")}Снимок всех VM</button><button class="button" data-stand-action="rollback_start" data-stand-id="${stand.id}" title="${escapeHtml(rollbackTitle)}" ${canRollbackStart ? "" : "disabled"}>${icon("refresh")}Вернуть к изначальному состоянию</button><button class="button" data-stand-action="password" data-stand-id="${stand.id}" ${stand.status !== "running" ? "disabled" : ""}>${icon("lock")}Пароль всех VM</button><button class="button" data-edit-stand="${stand.id}" ${standBusy ? "disabled" : ""}>${icon("edit")}Параметры</button><button class="button button--dark" data-stand-action="run_check" data-stand-id="${stand.id}" ${stand.status !== "running" ? "disabled" : ""}>${icon("check")}Автопроверка</button></div>
+      <div class="detail-stat-grid"><div><span>Машины</span><strong>${runCount} / ${stand.vm_count}</strong><small>запущено<span data-detail-extra-count>${poolExtraLabel(stand)}</span></small></div><div><span>CPU</span><strong>${formatNumber(stand.cpu, 1)}%</strong><small>текущая оценка</small></div><div><span>RAM</span><strong>${formatNumber(stand.ram, 1)}%</strong><small>на ноде</small></div><div><span>Режим работы</span><strong>Бессрочно</strong><small>автоотключение выключено</small></div></div>
+      <div class="detail-actions"><button class="button" data-stand-action="${stand.status === "stopped" ? "start" : "stop"}" data-stand-id="${stand.id}" ${standBusy || !["running", "stopped"].includes(stand.status) || !stand.vms.length ? "disabled" : ""}>${icon("power")}${stand.status === "stopped" ? "Запустить" : "Остановить"}</button><button class="button" data-stand-action="restart" data-stand-id="${stand.id}" ${standBusy || stand.status !== "running" ? "disabled" : ""}>${icon("refresh")}Перезапустить</button><button class="button" data-stand-action="snapshot" data-stand-id="${stand.id}" ${!stand.vms.length || standBusy ? "disabled" : ""}>${icon("copy")}Снимок всех VM</button><button class="button" data-stand-action="rollback_start" data-stand-id="${stand.id}" title="${escapeHtml(rollbackTitle)}" ${canRollbackStart ? "" : "disabled"}>${icon("refresh")}Вернуть к изначальному состоянию</button><button class="button" data-stand-action="password" data-stand-id="${stand.id}" ${standBusy || stand.status !== "running" ? "disabled" : ""}>${icon("lock")}Пароль всех VM</button><button class="button" data-edit-stand="${stand.id}" ${standBusy ? "disabled" : ""}>${icon("edit")}Параметры</button><button class="button button--dark" data-stand-action="run_check" data-stand-id="${stand.id}" ${standBusy || stand.status !== "running" ? "disabled" : ""}>${icon("check")}Автопроверка</button></div>
       ${credentialNotice}
       <div class="detail-columns detail-columns--single"><section><div class="detail-section-title"><div><h4>Виртуальные машины</h4><small>Доступы можно копировать по одному или одной кнопкой в формате IP | логин | пароль</small></div><div class="detail-section-tools">${credentialControl}</div></div><div class="vm-list">${stand.vms.map(vm => renderVmRow(stand, vm, credentials.get(Number(vm.vmid)), credentialState)).join("") || `<p class="muted-block">Машины ещё не созданы</p>`}</div></section></div>
-      <div class="detail-meta"><span>${icon("activity")} Создан ${dateTime(stand.created_at)}</span><span>${icon("lock")} Пароль менялся ${relativeTime(stand.password_updated_at)}</span><span>${icon("users")} Ответственный: ${escapeHtml(stand.owner)}</span></div>
+      <div class="detail-columns detail-columns--single" data-pool-inventory aria-live="polite" ${inventory ? "" : "hidden"}>${inventory}</div>
+      `}
+      <div class="detail-meta"><span>${icon("activity")} Создан ${dateTime(stand.created_at)}</span><span>${icon("users")} Ответственный: ${escapeHtml(stand.owner)}</span>${awaitingDecision ? "" : `<span>${icon("lock")} Пароль менялся ${relativeTime(stand.password_updated_at)}</span>`}</div>
     </div>`;
     const importedPool = stand.origin === "imported";
-    const footer = `${importedPool ? `<button class="button button--danger" data-delete-pool-stands="${stand.id}" type="button" ${standBusy || !stand.vms.length ? "disabled" : ""}>${icon("trash")}Удалить все стенды</button>` : ""}<button class="button ${importedPool ? "" : "button--danger"}" data-delete-stand="${stand.id}" type="button" ${standBusy ? "disabled" : ""}>${icon(importedPool ? "info" : "trash")}${importedPool ? "Убрать pool из списка" : "Удалить стенд"}</button><button class="button" data-close-modal type="button">Закрыть</button>`;
+    const footer = awaitingDecision
+      ? `<button class="button button--danger" data-stand-action="cancel_deploy" data-stand-id="${stand.id}" type="button">${icon("trash")}Удалить задачу</button><button class="button button--primary" data-stand-action="retry_deploy" data-stand-id="${stand.id}" type="button">${icon("refresh")}Повторить запуск</button>`
+      : `${importedPool ? `<button class="button button--danger" data-delete-pool-stands="${stand.id}" type="button" ${canDeletePoolMembers(stand) ? "" : "disabled"}>${icon("trash")}Удалить все стенды</button>` : ""}<button class="button ${importedPool ? "" : "button--danger"}" data-delete-stand="${stand.id}" type="button" ${standBusy ? "disabled" : ""}>${icon(importedPool ? "info" : "trash")}${importedPool ? "Убрать pool из списка" : "Удалить стенд"}</button><button class="button" data-close-modal type="button">Закрыть</button>`;
     const existing = updateExisting ? modalRoot.querySelector(`.modal[data-stand-detail-id="${Number(stand.id)}"]`) : null;
     if (existing) {
       existing.querySelector(".modal__title").textContent = importedPool ? `Пул ${stand.pool_id}` : "Карточка стенда";
@@ -1374,14 +1494,17 @@ exit 75`;
       let credentials = new Map();
       let credentialState = "loaded";
       let credentialError = "";
-      try {
-        const payload = await api(`/api/stands/${id}/credentials`, { promptAdmin: requestCredentials });
-        credentials = normalizeVmCredentials(payload);
-      } catch (error) {
-        credentialState = error.status === 401 ? "locked" : "error";
-        credentialError = error.message;
+      if (stand.status !== "awaiting_confirmation") {
+        try {
+          const payload = await api(`/api/stands/${id}/credentials`, { promptAdmin: requestCredentials });
+          credentials = normalizeVmCredentials(payload);
+        } catch (error) {
+          credentialState = error.status === 401 ? "locked" : "error";
+          credentialError = error.message;
+        }
       }
       if (requestToken !== standDetailRequestToken || activeStandDetailId !== numericId) return;
+      updateStandInStateAndView(stand);
       renderStandDetailModal(stand, credentials, credentialState, credentialError, { updateExisting });
       if (standNeedsLivePolling(stand)) scheduleStandDetailPoll(numericId, credentials, credentialState, credentialError);
     } catch (error) {
@@ -1393,6 +1516,7 @@ exit 75`;
 
   function standNeedsLivePolling(stand) {
     return ["provisioning", "resetting"].includes(stand?.status)
+      || snapshotBusy(stand)
       || stand?.check_status === "running"
       || (stand?.vms || []).some(vm => vm.check_status === "running")
       || Boolean(stand?.bulk_rollback_pending)
@@ -1402,8 +1526,24 @@ exit 75`;
   function updateStandInStateAndView(stand) {
     const index = state.data?.stands?.findIndex(item => Number(item.id) === Number(stand.id)) ?? -1;
     if (index < 0) return;
-    state.data.stands[index] = { ...state.data.stands[index], ...stand };
+    const previous = state.data.stands[index];
+    const previousStatus = previous.status;
+    state.data.stands[index] = { ...previous, ...stand };
+    if (snapshotBusy(previous) && String(stand.workspace || "demoexam") === state.workspace && ["done", "error"].includes(stand.snapshot_status)) {
+      const failed = stand.snapshot_status === "error";
+      toast(failed ? `Не удалось завершить снимок «${stand.name}». ${stand.snapshot_error || ""}` : `Снимок «${stand.name}» готов: ${formatNumber(stand.snapshot_done)} VM.`, failed ? "error" : "success");
+    }
+    if (previousStatus !== stand.status && [previousStatus, stand.status].includes("awaiting_confirmation") && String(stand.workspace || "demoexam") === state.workspace) {
+      if (stand.status === "awaiting_confirmation") toast(`Развёртывание «${stand.name}» приостановлено. Откройте стенд, чтобы выбрать действие.`, "warning", 7000);
+      if (state.route === "stands") renderStands();
+      if (state.route === "overview") renderOverview();
+      return;
+    }
     if (state.route !== "stands") return;
+    if (standNeedsAttention(previous) !== standNeedsAttention(state.data.stands[index]) && String(stand.workspace || "demoexam") === state.workspace) {
+      renderStands();
+      return;
+    }
     const currentRow = document.querySelector(`tr[data-stand-detail="${Number(stand.id)}"]`);
     if (!currentRow) return;
     const container = document.createElement("tbody");
@@ -1578,7 +1718,7 @@ exit 75`;
         let nextCredentials = credentials;
         let nextCredentialState = credentialState;
         let nextCredentialError = credentialError;
-        if (credentialState === "loaded") {
+        if (credentialState === "loaded" && stand.status !== "awaiting_confirmation") {
           try {
             nextCredentials = normalizeVmCredentials(await api(`/api/stands/${id}/credentials`, { promptAdmin: false }));
             nextCredentialError = "";
@@ -1586,6 +1726,7 @@ exit 75`;
             nextCredentialError = error.message;
           }
         }
+        if (activeStandDetailId !== Number(id) || !modalRoot.querySelector(`.modal[data-stand-detail-id="${Number(id)}"]`)) return;
         updateStandInStateAndView(stand);
         renderStandDetailModal(stand, nextCredentials, nextCredentialState, nextCredentialError, { updateExisting: true });
         if (standNeedsLivePolling(stand)) {
@@ -1700,7 +1841,71 @@ exit 75`;
     });
   }
 
+  async function openDeploymentDecision(id, action) {
+    const retry = action === "retry_deploy";
+    const stand = state.data?.stands.find(item => item.id === id);
+    const name = stand?.name || `Стенд #${id}`;
+    showModal({
+      title: retry ? "Повторить развёртывание?" : "Удалить задачу развёртывания?",
+      subtitle: name,
+      body: retry
+        ? `<fieldset class="relief-selection"><legend>Какие стенды можно выключить?</legend><p>Отметьте только те стенды, про которые вы знаете, что они свободны. Отсутствие веб-активности само по себе этого не гарантирует.</p><div data-relief-candidates aria-live="polite">Загрузка списка…</div></fieldset><p class="field-hint">Deployer проверит нагрузку ещё раз. Чтобы повторить запуск без выключения, оставьте список пустым.</p>`
+        : `<p>Deployer отменит развёртывание «${escapeHtml(name)}» и освободит зарезервированные для него IP-адреса.</p>`,
+      footer: `<button class="button" data-stand-detail="${id}" type="button">Назад</button><button id="deployment-decision" class="button ${retry ? "button--primary" : "button--danger"}" type="button">${retry ? "Повторить запуск" : "Удалить задачу"}</button>`,
+    });
+    const dialog = modalRoot.querySelector(".modal");
+    const submit = dialog.querySelector("#deployment-decision");
+    const choices = dialog.querySelector("[data-relief-candidates]");
+    const selected = () => [...dialog.querySelectorAll("[data-relief-id]:checked")].map(item => Number(item.value));
+    choices?.addEventListener("change", () => {
+      const count = selected().length;
+      submit.textContent = count ? `Выключить стенды (${count}) и повторить` : "Повторить запуск";
+    });
+    submit.addEventListener("click", async () => {
+      if (submit.disabled) return;
+      submit.disabled = true;
+      const body = retry ? { action, stop_stand_ids: selected() } : { action };
+      try {
+        await api(`/api/stands/${id}/actions`, { method: "POST", body });
+        if (!retry) {
+          state.ipam = null;
+          standCredentialCache.delete(id);
+        }
+        if (dialog.isConnected) closeModal();
+        toast(retry ? "Повторный запуск запрошен" : "Задача развёртывания удалена");
+        await loadData();
+        if (retry && !modalRoot.querySelector(".modal-backdrop:not(.is-closing)")) await openStandDetail(id);
+      } catch (error) {
+        submit.disabled = false;
+        toast(error.message, "error");
+        if ([404, 409].includes(error.status)) {
+          if (dialog.isConnected) closeModal();
+          await loadData();
+        }
+      }
+    });
+    if (!retry) return;
+    try {
+      const result = await api(`/api/stands/${id}/relief-candidates`, { promptAdmin: false });
+      choices.innerHTML = result.stands.map(item => `<label><input type="checkbox" data-relief-id value="${Number(item.id)}"><span>${escapeHtml(item.name)}</span><small>${formatNumber(item.vm_count)} VM</small></label>`).join("")
+        || "Подходящих стендов для выключения нет.";
+    } catch (error) {
+      choices.textContent = `Список недоступен. ${error.message}`;
+      if (error.status === 401) {
+        const unlock = document.createElement("button");
+        unlock.className = "button button--small";
+        unlock.type = "button";
+        unlock.textContent = "Ввести административный токен";
+        unlock.addEventListener("click", async () => {
+          if (await requestAdminToken()) await openDeploymentDecision(id, action);
+        });
+        choices.append(unlock);
+      }
+    }
+  }
+
   async function performStandAction(id, action) {
+    if (["retry_deploy", "cancel_deploy"].includes(action)) { await openDeploymentDecision(id, action); return; }
     if (action === "password") { openPasswordModal(id); return; }
     if (action === "rollback_start") { await openRollbackStartModal(id); return; }
     const labels = { start: "Запускаем стенд…", stop: "Останавливаем стенд…", restart: "Перезапускаем стенд…", snapshot: "Создаём снимок…", run_check: "Запускаем автопроверку…" };
@@ -1709,7 +1914,8 @@ exit 75`;
       if (action === "snapshot") payload.name = `manual-${new Date().toISOString().slice(0, 19).replaceAll(":", "-")}`;
       const result = await api(`/api/stands/${id}/actions`, { method: "POST", body: payload });
       toast(result.message || labels[action]);
-      if (action === "run_check") { await loadData({ silent: true }); await openStandDetail(id); }
+      if (action === "snapshot") { await trackSnapshot(id, result.stand); }
+      else if (action === "run_check") { await loadData({ silent: true }); await openStandDetail(id); }
       else { closeModal(); await loadData(); }
     } catch (error) { toast(error.message, "error"); }
   }
@@ -1729,11 +1935,18 @@ exit 75`;
       if (action === "snapshot") payload.name = `manual-${new Date().toISOString().slice(0, 19).replaceAll(":", "-")}`;
       const result = await api(`/api/stands/${standId}/vms/${vmid}/actions`, { method: "POST", body: payload });
       toast(result.message || labels[action] || "Операция выполнена");
+      if (action === "snapshot") { await trackSnapshot(standId, result.stand); return; }
       await loadData({ silent: true });
       await openStandDetail(standId);
     } catch (error) {
       toast(error.message, "error");
     }
+  }
+
+  async function trackSnapshot(id, stand) {
+    if (stand) updateStandInStateAndView(stand);
+    syncOperationPolling();
+    if (activeStandDetailId === Number(id)) await openStandDetail(id);
   }
 
   async function openStandEditor(id) {
@@ -1927,11 +2140,15 @@ exit 75`;
   }
 
   async function confirmDeletePoolStands(id) {
-    const stand = state.data.stands.find(item => item.id === Number(id));
+    const stand = standCredentialCache.get(Number(id))?.stand;
     if (!stand || stand.origin !== "imported") return;
+    if (!canDeletePoolMembers(stand)) {
+      toast("Для удаления нужен актуальный состав пула.", "warning");
+      return;
+    }
     const confirmationTarget = stand.pool_id;
-    const vmCount = Number(stand.actual_vm_count ?? stand.vm_count ?? stand.vms?.length ?? 0);
-    const body = `<div class="danger-confirm"><span>${icon("trash")}</span><h3>Удалить все стенды из pool?</h3><p>Будут безвозвратно удалены <strong>${vmCount} VM</strong> и их диски из pool <strong class="mono">${escapeHtml(confirmationTarget)}</strong>. Сам pool останется в Proxmox и продолжит отображаться в Deployer.</p><label class="field"><span class="field-label">Введите название pool для подтверждения</span><input class="input mono" id="delete-pool-stands-confirm-name" autocomplete="off" placeholder="${escapeHtml(confirmationTarget)}"></label></div>`;
+    const vmids = [...stand.pool_inventory_vmids];
+    const body = `<div class="danger-confirm"><span>${icon("trash")}</span><h3>Удалить все стенды из pool?</h3><p>Будут безвозвратно удалены <strong>${vmids.length} VM</strong> и их диски из pool <strong class="mono">${escapeHtml(confirmationTarget)}</strong>, включая VM, добавленные вручную. Сам pool останется в Proxmox.</p><p class="mono">VMID: ${vmids.map(id => escapeHtml(id)).join(", ")}</p><label class="field"><span class="field-label">Введите название pool для подтверждения</span><input class="input mono" id="delete-pool-stands-confirm-name" autocomplete="off" placeholder="${escapeHtml(confirmationTarget)}"></label></div>`;
     showModal({
       title: "Удаление всех стендов pool",
       subtitle: "Необратимая операция",
@@ -1944,7 +2161,7 @@ exit 75`;
     button.addEventListener("click", async () => {
       button.disabled = true;
       try {
-        const result = await api(`/api/stands/${id}/actions`, { method: "POST", body: { action: "delete_pool_stands" } });
+        const result = await api(`/api/stands/${id}/actions`, { method: "POST", body: { action: "delete_pool_stands", expected_pool_vmids: vmids } });
         state.ipam = null;
         closeModal();
         toast(result.message || "Все стенды pool удалены", "warning");

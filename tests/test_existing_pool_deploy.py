@@ -264,6 +264,35 @@ class ExistingPoolServiceTests(unittest.TestCase):
         self.assertEqual(queue["used"], 0)
         self.assertEqual(queue["queued_count"], 0)
 
+    def test_pool_delete_compares_confirmation_with_live_members_before_admission(self) -> None:
+        self.gateway.pool_members.return_value = [
+            {"vmid": 410, "name": "router-1", "node": "pve-1", "status": "running"},
+        ]
+        stand = self.service.import_pool({"pool_id": "shared-lab"})
+        self.gateway.pool_members.return_value.append(
+            {"vmid": 411, "name": "router-2", "node": "pve-1", "status": "running"},
+        )
+        with patch.object(self.service, "_stand_admitted_operation") as admission:
+            for expected in ([410], [], [411, 412]):
+                with self.subTest(expected=expected), self.assertRaisesRegex(ConflictError, "Состав пула изменился"):
+                    self.service.stand_action(stand["id"], "delete_pool_stands", {"expected_pool_vmids": expected})
+            with self.assertRaises(ValidationError):
+                self.service.stand_action(stand["id"], "delete_pool_stands", {"expected_pool_vmids": None})
+            admission.assert_not_called()
+        self.gateway.delete_stand.assert_not_called()
+        result = self.service.stand_action(stand["id"], "delete_pool_stands", {"expected_pool_vmids": [411, 410]})
+        self.assertEqual(result["deleted_count"], 2)
+
+    def test_pool_delete_with_empty_confirmed_and_empty_live_pool(self) -> None:
+        self.gateway.pool_members.return_value = [
+            {"vmid": 410, "name": "router-1", "node": "pve-1", "status": "stopped"},
+        ]
+        stand = self.service.import_pool({"pool_id": "shared-lab"})
+        self.gateway.pool_members.return_value = []
+        with self.assertRaisesRegex(ConflictError, "нет VM"):
+            self.service.stand_action(stand["id"], "delete_pool_stands", {"expected_pool_vmids": []})
+        self.gateway.delete_stand.assert_not_called()
+
     def test_pool_delete_rejects_reused_vmid_after_scheduler_preflight(self) -> None:
         original = [
             {"vmid": 416, "name": "owned-router", "node": "pve-1", "status": "running"},

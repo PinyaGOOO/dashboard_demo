@@ -95,7 +95,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         parts = [part for part in parsed.path.strip("/").split("/") if part]
         query = parse_qs(parsed.query)
         sensitive = method == "GET" and (
-            (bool(parts) and parts[-1] == "credentials")
+            (bool(parts) and parts[-1] in {"credentials", "relief-candidates"})
             or parts == ["api", "web-activity"]
         )
         if not self._authorized(method, sensitive=sensitive):
@@ -130,7 +130,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             elif len(parts) == 4 and parts[:2] == ["api", "blueprints"] and parts[3] == "duplicate" and method == "POST":
                 self._json(self.service.duplicate_blueprint(int(parts[2])), HTTPStatus.CREATED)
             elif parts == ["api", "stands"] and method == "GET":
-                self._json(self.service.list_stands())
+                self._json(self.service.list_stands(include_pool_inventory=True))
             elif parts == ["api", "stands"] and method == "POST":
                 self._json(self.service.create_stand(self._body()), HTTPStatus.ACCEPTED)
             elif parts == ["api", "stands", "actions"] and method == "POST":
@@ -150,7 +150,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             elif parts == ["api", "pools", "import"] and method == "POST":
                 self._json(self.service.import_pool(self._body()), HTTPStatus.CREATED)
             elif len(parts) == 3 and parts[:2] == ["api", "stands"] and method == "GET":
-                self._json(self.service.get_stand(int(parts[2])))
+                self._json(self.service.get_stand(int(parts[2]), include_pool_inventory=True))
             elif len(parts) == 3 and parts[:2] == ["api", "stands"] and method == "PATCH":
                 self._json(self.service.update_stand(int(parts[2]), self._body()))
             elif len(parts) == 3 and parts[:2] == ["api", "stands"] and method == "DELETE":
@@ -158,14 +158,16 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             elif len(parts) == 4 and parts[:2] == ["api", "stands"] and parts[3] == "actions" and method == "POST":
                 body = self._body()
                 action = str(body.get("action", ""))
-                status = HTTPStatus.ACCEPTED if action == "rollback_start" else HTTPStatus.OK
+                status = HTTPStatus.ACCEPTED if action in {"rollback_start", "retry_deploy", "snapshot"} else HTTPStatus.OK
                 self._json(self.service.stand_action(int(parts[2]), action, body), status)
+            elif len(parts) == 4 and parts[:2] == ["api", "stands"] and parts[3] == "relief-candidates" and method == "GET":
+                self._json(self.service.relief_candidates(int(parts[2])))
             elif len(parts) == 4 and parts[:2] == ["api", "stands"] and parts[3] == "credentials" and method == "GET":
                 self._json(self.service.stand_credentials(int(parts[2])))
             elif len(parts) == 6 and parts[:2] == ["api", "stands"] and parts[3] == "vms" and parts[5] == "actions" and method == "POST":
                 body = self._body()
                 action = str(body.get("action", ""))
-                status = HTTPStatus.ACCEPTED if action in {"run_check", "rollback_start"} else HTTPStatus.OK
+                status = HTTPStatus.ACCEPTED if action in {"run_check", "rollback_start", "snapshot"} else HTTPStatus.OK
                 self._json(self.service.vm_action(int(parts[2]), int(parts[4]), action, body), status)
             elif len(parts) == 6 and parts[:2] == ["api", "stands"] and parts[3] == "vms" and parts[5] == "credentials" and method == "GET":
                 self._json(self.service.vm_credentials(int(parts[2]), int(parts[4])))
@@ -220,6 +222,7 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nОстановка сервера…")
     finally:
+        service.stop_monitors()
         server.server_close()
 
 

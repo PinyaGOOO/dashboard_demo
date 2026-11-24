@@ -12,9 +12,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
+from . import deploy_relief
 from .database import DashboardStore, utc_now
-from .operation_queue import ProxmoxOperationQueue
+from .operation_queue import DeploymentCapacityBlocked, ProxmoxOperationQueue
 from .passwords import PROXMOX_PASSWORD_MAX_LENGTH, generate_password
+from .pool_inventory import PoolInventory
 from .proxmox_gateway import (
     CredentialRestoreError,
     DemoProxmoxGateway,
@@ -46,6 +48,7 @@ class DashboardService:
     def __init__(self, store: DashboardStore, gateway: Gateway):
         self.store = store
         self.gateway = gateway
+        self.pool_inventory = PoolInventory(store, gateway)
         def env_int(name: str, default: int, low: int = 1, high: int = 100) -> int:
             try:
                 value = int(os.environ.get(name, str(default)))
@@ -88,8 +91,21 @@ class DashboardService:
         self._web_activity_lock = threading.Lock()
         self._web_activity_cache: dict[str, Any] | None = None
         self._web_activity_cache_at = 0.0
+        self.store.execute(
+            """UPDATE snapshot_runs SET status = 'error',
+               error = CASE WHEN status = 'queued' THEN 'Deployer перезапущен до начала снимка.'
+               ELSE 'Deployer перезапущен во время снимка. Проверьте задачи и снимки VM в Proxmox.' END
+               WHERE status IN ('queued','running')"""
+        )
         self._mark_interrupted_rollbacks()
         self._mark_interrupted_checks()
+        # A persisted plan proves we had not crossed the clone boundary when
+        # this process restarted. Stop for confirmation even in demo mode.
+        for item in self.store.query_all(
+            """SELECT s.id FROM stands s JOIN pending_deployments p ON p.stand_id = s.id
+            WHERE s.status = 'provisioning'"""
+        ):
+            self._pause_deployment(item["id"], "Deployer перезапущен до начала клонирования. Подтвердите повторный запуск.")
         if gateway.mode == "demo":
             self._resume_demo_deployments()
         else:
@@ -220,6 +236,8 @@ class DashboardService:
         kind: str,
         label: str,
         weight: int,
+        *,
+        only_if_idle: bool = False,
         **queue_kwargs: Any,
     ) -> Iterator[dict[str, Any]]:
         """Own one stand turn, then reserve cluster capacity without phantoms.
@@ -239,6 +257,8 @@ class DashboardService:
             "cancel_event": threading.Event(),
         }
         with self._stand_gate_condition:
+            if only_if_idle and (self._stand_gate_owner.get(safe_stand_id) or self._stand_gate_waiting.get(safe_stand_id)):
+                raise ConflictError("Для выбранного стенда уже выполняется операция")
             self._stand_gate_waiting.setdefault(safe_stand_id, []).append(ticket)
             self._stand_gate_condition.notify_all()
 
@@ -343,6 +363,15 @@ class DashboardService:
             daemon=True,
         )
         self._scheduler_monitor_thread.start()
+        # Pool reads may take several seconds on installations with many pools.
+        # Keep them off both the pressure sampler and the HTTP request threads.
+        threading.Thread(
+            target=self.pool_inventory.monitor, args=(self._scheduler_monitor_stop,),
+            name="proxmox-pool-inventory", daemon=True,
+        ).start()
+
+    def stop_monitors(self) -> None:
+        self._scheduler_monitor_stop.set()
 
     def _scheduler_monitor_loop(self) -> None:
         while not self._scheduler_monitor_stop.is_set():
@@ -408,9 +437,13 @@ class DashboardService:
         # Placement discovery can fan out into several cluster reads. Limit
         # concurrent preflights so a wave of HTTP requests cannot overload the
         # Proxmox API before it even reaches admission control.
-        with self._deployment_preflight_slots:
+        if not self._deployment_preflight_slots.acquire(timeout=60):
+            raise DeploymentCapacityBlocked("Очередь проверки размещения занята более 60 с. Подтвердите повторный запуск.")
+        try:
             scope_started_at = time.monotonic()
             raw_scope = scope_method(stand, blueprint)
+        finally:
+            self._deployment_preflight_slots.release()
         if not isinstance(raw_scope, dict):
             return self._operation_scope(
                 "deploy", stand.get("vms", []),
@@ -435,14 +468,19 @@ class DashboardService:
                 if not name:
                     continue
                 try:
-                    count = max(1, int(raw_count))
+                    count = int(raw_count)
                 except (TypeError, ValueError):
                     count = 1
-                result[name] = min(limit, 1 + (count - 1) // 8)
+                if count > 0:
+                    result[name] = min(limit, 1 + (count - 1) // 8)
             return result
 
+        node_weights = scaled(raw_scope.get("node_weights"), node_limit)
+        # Even when all guests land elsewhere, the clone worker runs on the source.
+        if raw_scope.get("template_node"):
+            node_weights.setdefault(str(raw_scope["template_node"]), 1)
         return {
-            "node_weights": scaled(raw_scope.get("node_weights"), node_limit),
+            "node_weights": node_weights,
             "storage_weights": scaled(raw_scope.get("storage_weights"), storage_capacity),
             "lane": "heavy",
         }
@@ -713,12 +751,18 @@ class DashboardService:
         self.store.execute("DELETE FROM blueprints WHERE id = ?", (blueprint_id,))
         self.store.add_activity("script", "Сценарий удалён", blueprint["name"], "warning")
 
-    def list_stands(self) -> list[dict[str, Any]]:
+    def list_stands(self, *, include_pool_inventory: bool = False) -> list[dict[str, Any]]:
         sql = """
         SELECT s.*, b.name AS blueprint_name, b.code AS blueprint_code, b.category AS blueprint_category,
+               r.status AS snapshot_status, r.name AS snapshot_name, r.done AS snapshot_done,
+               r.total AS snapshot_total, r.error AS snapshot_error, r.vmid AS snapshot_vmid,
                (SELECT COUNT(*) FROM stand_vms v WHERE v.stand_id = s.id) AS actual_vm_count
         FROM stands s LEFT JOIN blueprints b ON b.id = s.blueprint_id
-        ORDER BY CASE s.status WHEN 'provisioning' THEN 0 WHEN 'resetting' THEN 0 WHEN 'error' THEN 1 WHEN 'running' THEN 2 ELSE 3 END,
+        LEFT JOIN snapshot_runs r ON r.id = COALESCE(
+            (SELECT id FROM snapshot_runs WHERE stand_id = s.id AND status = 'running' ORDER BY id LIMIT 1),
+            (SELECT id FROM snapshot_runs WHERE stand_id = s.id AND status = 'queued' ORDER BY id LIMIT 1),
+            (SELECT id FROM snapshot_runs WHERE stand_id = s.id ORDER BY id DESC LIMIT 1))
+        ORDER BY CASE s.status WHEN 'awaiting_confirmation' THEN 0 WHEN 'provisioning' THEN 0 WHEN 'resetting' THEN 0 WHEN 'error' THEN 1 WHEN 'running' THEN 2 ELSE 3 END,
                  s.updated_at DESC
         """
         stands = self.store.query_all(sql)
@@ -726,15 +770,24 @@ class DashboardService:
             pending = set(self._bulk_rollback_pending)
         for stand in stands:
             stand["bulk_rollback_pending"] = int(stand["id"]) in pending
+        if include_pool_inventory:
+            self._describe_pool_inventory(stands)
         return stands
 
-    def get_stand(self, stand_id: int) -> dict[str, Any]:
+    def _describe_pool_inventory(self, stands: list[dict], *, detail: bool = False) -> None:
+        if isinstance(self.gateway, DemoProxmoxGateway):
+            self.pool_inventory.refresh()
+        self.pool_inventory.describe(stands, detail=detail)
+
+    def get_stand(self, stand_id: int, *, include_pool_inventory: bool = False) -> dict[str, Any]:
         stand = next((item for item in self.list_stands() if int(item["id"]) == stand_id), None)
         if not stand:
             raise NotFoundError("Стенд не найден")
         raw_vms = self.store.query_all("SELECT * FROM stand_vms WHERE stand_id = ? ORDER BY id", (stand_id,))
         stand["vms"] = [self._public_vm(vm) for vm in raw_vms]
         stand["checks"] = self.store.query_all("SELECT * FROM check_runs WHERE stand_id = ? ORDER BY started_at DESC LIMIT 10", (stand_id,))
+        if include_pool_inventory:
+            self._describe_pool_inventory([stand], detail=True)
         return stand
 
     @staticmethod
@@ -1037,29 +1090,94 @@ class DashboardService:
                         (stand_id, int(vm_cursor.lastrowid), ip, subnet,
                          prefix_length, index, now, now),
                     )
-        deployment = dict(blueprint)
-        deployment.update({
-            "vm_count": vm_count,
-            "subnet": subnet,
-            "start_ip": canonical_start,
-            "allocated_ips": allocated_ips,
-            "bridge": bridge,
-            "clone_type": "linked",
-            "storage": "",
-            "credentials": credentials,
-            "use_existing_pool": use_existing_pool,
-        })
+            deployment = dict(blueprint, vm_count=vm_count, subnet=subnet, start_ip=canonical_start,
+                              allocated_ips=allocated_ips, bridge=bridge, clone_type="linked",
+                              storage="", use_existing_pool=use_existing_pool)
+            connection.execute(
+                "INSERT INTO pending_deployments (stand_id, plan) VALUES (?, ?)",
+                (stand_id, json.dumps(deployment, ensure_ascii=False)),
+            )
+        deployment["credentials"] = credentials
         self.store.add_activity("deploy", "Развёртывание запущено", f"{name} · {blueprint['name']} · {vm_count} VM", "progress")
+        self._launch_deployment(stand_id, deployment)
+        return self.get_stand(stand_id)
+
+    def _launch_deployment(
+        self, stand_id: int, deployment: dict[str, Any], stop_stand_ids: list[int] | None = None,
+    ) -> None:
         thread = threading.Thread(
             target=self._deploy_job,
             args=(stand_id, deployment),
+            kwargs={"stop_stand_ids": stop_stand_ids},
             name=f"deploy-{stand_id}",
             daemon=True,
         )
         with self._job_lock:
             self._jobs[stand_id] = thread
-        thread.start()
+        try:
+            thread.start()
+        except Exception:
+            with self._job_lock:
+                self._jobs.pop(stand_id, None)
+            self._pause_deployment(stand_id, "Не удалось запустить обработчик развёртывания. Повторите запуск.")
+            raise
+
+    def _pause_deployment(self, stand_id: int, reason: str) -> bool:
+        with self.store.transaction() as connection:
+            changed = connection.execute(
+                """UPDATE stands SET status = 'awaiting_confirmation', progress = 0, last_error = ?,
+                updated_at = ? WHERE id = ? AND status = 'provisioning'
+                AND EXISTS (SELECT 1 FROM pending_deployments WHERE stand_id = ?)""",
+                (reason[-1000:], utc_now(), stand_id, stand_id),
+            ).rowcount
+            if not changed:
+                return False
+            connection.execute(
+                "UPDATE stand_vms SET status = 'awaiting_confirmation' WHERE stand_id = ? AND vmid IS NULL",
+                (stand_id,),
+            )
+        self.store.add_activity("deploy", "Развёртывание ожидает подтверждения", f"Стенд #{stand_id}: {reason}", "warning")
+        return True
+
+    def _confirm_deployment(self, stand_id: int, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+        ids = payload.get("stop_stand_ids", [])
+        if not isinstance(ids, list) or any(type(i) is not int or i <= 0 or i == stand_id for i in ids):
+            raise ValidationError("Некорректный список стендов для выключения")
+        with self.store.transaction() as connection:
+            row = connection.execute(
+                """SELECT s.name, p.plan FROM stands s JOIN pending_deployments p ON p.stand_id = s.id
+                WHERE s.id = ? AND s.status = 'awaiting_confirmation'
+                AND NOT EXISTS (SELECT 1 FROM stand_vms WHERE stand_id = s.id AND vmid IS NOT NULL)""",
+                (stand_id,),
+            ).fetchone()
+            if row is None:
+                raise ConflictError("Задача уже обработана или не ожидает подтверждения")
+            if action == "cancel_deploy":
+                # Cascades release the placeholders and IPAM reservations.
+                connection.execute("DELETE FROM stands WHERE id = ?", (stand_id,))
+            else:
+                deployment = json.loads(row["plan"])
+                credentials = connection.execute(
+                    """SELECT credential_username AS guest_username, web_username, credential_password AS password
+                    FROM stand_vms WHERE stand_id = ? ORDER BY id""", (stand_id,),
+                ).fetchall()
+                deployment["credentials"] = [dict(vm) for vm in credentials]
+                connection.execute(
+                    "UPDATE stands SET status = 'provisioning', progress = 0, last_error = '', updated_at = ? WHERE id = ?",
+                    (utc_now(), stand_id),
+                )
+                connection.execute("UPDATE stand_vms SET status = 'provisioning' WHERE stand_id = ?", (stand_id,))
+        if action == "cancel_deploy":
+            self.store.add_activity("deploy", "Задача развёртывания удалена", row["name"], "info")
+            return {"ok": True}
+        self.store.add_activity("deploy", "Повторный запуск подтверждён", row["name"], "progress")
+        self._launch_deployment(stand_id, deployment, list(dict.fromkeys(ids)))
         return self.get_stand(stand_id)
+
+    def relief_candidates(self, stand_id: int) -> dict[str, Any]:
+        if self.get_stand(stand_id)["status"] != "awaiting_confirmation":
+            raise ConflictError("Задача не ожидает подтверждения")
+        return deploy_relief.candidates(self, stand_id)
 
     def update_stand(self, stand_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         self._assert_not_bulk_rollback_pending(stand_id)
@@ -1094,6 +1212,11 @@ class DashboardService:
 
         now = utc_now()
         with self.store.transaction() as connection:
+            state = connection.execute("SELECT status FROM stands WHERE id = ?", (stand_id,)).fetchone()
+            if not state:
+                raise NotFoundError("Стенд не найден")
+            if state["status"] in {"provisioning", "awaiting_confirmation"}:
+                raise ConflictError("Параметры уже зарезервированы для развёртывания")
             vm_rows = connection.execute(
                 "SELECT * FROM stand_vms WHERE stand_id = ? ORDER BY id", (stand_id,),
             ).fetchall()
@@ -1173,12 +1296,33 @@ class DashboardService:
         self.store.add_activity("edit", "Параметры стенда обновлены", detail, "success")
         return self.get_stand(stand_id)
 
-    def _deploy_job(self, stand_id: int, blueprint: dict[str, Any]) -> None:
+    def _deploy_job(
+        self, stand_id: int, blueprint: dict[str, Any], *, stop_stand_ids: list[int] | None = None,
+    ) -> None:
         heartbeat_stop = threading.Event()
         heartbeat_thread: threading.Thread | None = None
         try:
             stand = self.get_stand(stand_id)
             blueprint = dict(blueprint)
+            if stop_stand_ids:
+                try:
+                    deploy_relief.stop_selected(self, stand_id, stop_stand_ids)
+                except Exception as exc:
+                    raise DeploymentCapacityBlocked(f"Подготовка к повторному запуску остановлена. {exc}") from exc
+            if isinstance(self.gateway, LiveProxmoxGateway) or (
+                stop_stand_ids is not None and isinstance(self.gateway, DemoProxmoxGateway)
+            ):
+                # The first request can race the monitoring thread at startup.
+                # On retry, discard the sample that preceded confirmed stops.
+                unknown = "Нагрузка Proxmox неизвестна: не удалось получить свежие показатели узлов."
+                try:
+                    telemetry = self.gateway.scheduler_snapshot(force=stop_stand_ids is not None)
+                    self._operation_queue.update_pressure(telemetry)
+                except Exception as exc:
+                    self._operation_queue.mark_pressure_error(str(exc))
+                    raise DeploymentCapacityBlocked(unknown) from exc
+                if telemetry.get("stale") or not telemetry.get("sources", {}).get("resources") or not telemetry.get("nodes"):
+                    raise DeploymentCapacityBlocked(unknown)
             vm_count = int(blueprint.get("vm_count") or stand.get("vm_count") or 1)
             credentials = blueprint.get("credentials")
             if not isinstance(credentials, list) or len(credentials) < vm_count:
@@ -1245,7 +1389,8 @@ class DashboardService:
                 scope_kwargs = self._deployment_operation_scope(stand, blueprint, vm_count)
                 with self._operation_queue.reserve(
                     "deploy", str(stand["name"]), self._operation_weight("deploy", vm_count),
-                    vm_count=vm_count, on_queued=queued,
+                    vm_count=vm_count, on_queued=queued, pause_on_overload=True,
+                    require_fresh_pressure=isinstance(self.gateway, LiveProxmoxGateway),
                     **scope_kwargs,
                 ) as admission:
                     has_scope = isinstance(blueprint.get("_scheduler_scope"), dict)
@@ -1269,6 +1414,9 @@ class DashboardService:
                     else:
                         heartbeat_thread.start()
                         try:
+                            # From this point a Proxmox task may exist even if
+                            # the process dies before it records the VMID.
+                            self.store.execute("DELETE FROM pending_deployments WHERE stand_id = ?", (stand_id,))
                             vms = self.gateway.deploy(stand, blueprint, progress)
                         finally:
                             heartbeat_stop.set()
@@ -1276,7 +1424,7 @@ class DashboardService:
                 if retry_scope:
                     scope_refreshes += 1
                     if scope_refreshes >= 3:
-                        raise RuntimeError(
+                        raise DeploymentCapacityBlocked(
                             "Не удалось подтвердить актуальное размещение после ожидания "
                             "очереди Proxmox. Повторите развёртывание после снижения нагрузки."
                         )
@@ -1438,6 +1586,9 @@ class DashboardService:
             heartbeat_stop.set()
             if heartbeat_thread and heartbeat_thread.is_alive():
                 heartbeat_thread.join(timeout=1)
+            if isinstance(exc, DeploymentCapacityBlocked) and self._pause_deployment(stand_id, str(exc)):
+                return
+            self.store.execute("DELETE FROM pending_deployments WHERE stand_id = ?", (stand_id,))
             self.store.execute(
                 "UPDATE stands SET status = 'error', last_error = ?, updated_at = ? WHERE id = ?",
                 (str(exc)[-1000:], utc_now(), stand_id),
@@ -1449,7 +1600,9 @@ class DashboardService:
             self.store.add_activity("deploy", "Ошибка развёртывания", f"Стенд #{stand_id}: {exc}", "error", "Система")
         finally:
             with self._job_lock:
-                self._jobs.pop(stand_id, None)
+                # An immediate confirmation can already own a new worker.
+                if self._jobs.get(stand_id) is threading.current_thread():
+                    self._jobs.pop(stand_id, None)
 
     def stand_action(
         self,
@@ -1462,7 +1615,11 @@ class DashboardService:
         if not _bulk_reserved:
             self._assert_not_bulk_rollback_pending(stand_id)
         prepared_payload = dict(payload or {})
+        if action in {"retry_deploy", "cancel_deploy"}:
+            return self._confirm_deployment(stand_id, action, prepared_payload)
         stand = self.get_stand(stand_id)
+        if stand["status"] == "awaiting_confirmation":
+            raise ConflictError("Развёртывание ожидает подтверждения или удаления задачи")
         if stand["status"] in {"provisioning", "resetting"}:
             label = "развёртывания" if stand["status"] == "provisioning" else "возврата к исходному состоянию"
             raise ConflictError(f"Действие недоступно во время {label}")
@@ -1471,18 +1628,16 @@ class DashboardService:
                 raise ConflictError("Для стенда уже выполняется фоновая операция")
 
         queue_vms = [vm for vm in stand.get("vms", []) if vm.get("vmid") is not None]
+        if action == "snapshot":
+            return self._enqueue_snapshot(stand, queue_vms, prepared_payload)
         queue_kind = {
             "start": "power",
             "stop": "power",
             "restart": "power",
-            "snapshot": "snapshot",
             "delete_pool_stands": "delete",
             "rotate_password": "password",
         }.get(action)
-        if action == "snapshot":
-            # Keep the generated name stable while the request is queued.
-            prepared_payload["name"] = self._snapshot_label(prepared_payload.get("name"))
-        if action in {"start", "stop", "restart", "snapshot", "rotate_password"} and not queue_vms:
+        if action in {"start", "stop", "restart", "rotate_password"} and not queue_vms:
             raise ConflictError("В стенде нет VM для выполнения операции")
         if action == "rotate_password" and stand["status"] != "running":
             raise ConflictError("Смена пароля доступна только для запущенного стенда")
@@ -1497,11 +1652,16 @@ class DashboardService:
                 dict(vm) for vm in self.gateway.pool_members(str(stand["pool_id"]))
                 if vm.get("vmid") is not None
             ]
+            current_vmids = sorted(int(vm["vmid"]) for vm in queue_vms)
+            if "expected_pool_vmids" in prepared_payload:
+                expected = prepared_payload["expected_pool_vmids"]
+                if not isinstance(expected, list) or any(type(vmid) is not int or vmid <= 0 for vmid in expected):
+                    raise ValidationError("Ожидался список положительных VMID пула")
+                if sorted(expected) != current_vmids:
+                    raise ConflictError("Состав пула изменился. Обновите карточку и подтвердите текущий список VM.")
             if not queue_vms:
                 raise ConflictError("В pool нет VM для удаления")
-            prepared_payload["_scheduler_pool_vmids"] = sorted(
-                int(vm["vmid"]) for vm in queue_vms
-            )
+            prepared_payload["_scheduler_pool_vmids"] = current_vmids
             prepared_payload["_scheduler_pool_placements"] = sorted(
                 (
                     int(vm["vmid"]),
@@ -1513,9 +1673,7 @@ class DashboardService:
         vm_count = len(queue_vms)
         if queue_kind:
             queue_label = f"{stand['name']} · {action}"
-            if action == "snapshot":
-                queue_label = f"{stand['name']} · {prepared_payload['name']}"
-            elif action == "delete_pool_stands":
+            if action == "delete_pool_stands":
                 queue_label = f"{stand['pool_id']} · удалить все VM"
             with self._stand_admitted_operation(
                 stand_id,
@@ -1573,26 +1731,6 @@ class DashboardService:
             labels = {"start": "Стенд запущен", "stop": "Стенд остановлен", "restart": "Стенд перезапущен"}
             self.store.add_activity("power", labels[action], stand["name"], "success")
             return {"stand": self.get_stand(stand_id), "message": labels[action]}
-        if action == "snapshot":
-            label = self._snapshot_label(payload.get("name"))
-            if not vmids:
-                raise ConflictError("В стенде нет VM для создания снимка")
-            description = str(payload.get("description", ""))[:255]
-            with self._operation_reservation(
-                _queue_reserved,
-                "snapshot", f"{stand['name']} · {label}", self._operation_weight("snapshot", len(vmids)),
-                vm_count=len(vmids),
-                **self._operation_scope("snapshot", stand.get("vms", []), vm_count=len(vmids)),
-            ):
-                self.gateway.create_snapshot(vmids, label, description)
-            self.store.execute(
-                """UPDATE stand_vms SET last_snapshot = ?,
-                has_start_snapshot = CASE WHEN ? = 'start' THEN 1 ELSE has_start_snapshot END
-                WHERE stand_id = ?""",
-                (label, label, stand_id),
-            )
-            self.store.add_activity("snapshot", "Создан снимок", f"{stand['name']} · {label}", "success")
-            return {"stand": self.get_stand(stand_id), "message": f"Снимок «{label}» создан на всех VM"}
         if action == "delete_pool_stands":
             if str(stand.get("origin") or "") != "imported":
                 raise ValidationError("Удаление всех VM доступно только для подключённой карточки pool")
@@ -2102,6 +2240,94 @@ class DashboardService:
             raise ValidationError("Имя снимка: до 64 латинских букв, цифр, '-' или '_'")
         return label
 
+    def _enqueue_snapshot(
+        self, stand: dict, vms: list[dict], payload: dict, *, vmid: int | None = None,
+    ) -> dict[str, Any]:
+        if not vms:
+            raise ConflictError("В стенде нет VM для создания снимка")
+        if stand["check_status"] == "running" or any(vm["check_status"] == "running" for vm in vms):
+            raise ConflictError("Сначала дождитесь завершения автопроверки")
+        label = self._snapshot_label(payload.get("name"))
+        description = str(payload.get("description", ""))[:255]
+        stand_id = int(stand["id"])
+        with self.store.transaction() as connection:
+            duplicate = connection.execute(
+                """SELECT 1 FROM snapshot_runs WHERE stand_id = ? AND name = ?
+                   AND status IN ('queued','running') AND (vmid IS NULL OR ? IS NULL OR vmid = ?)""",
+                (stand_id, label, vmid, vmid),
+            ).fetchone()
+            if duplicate:
+                raise ConflictError(f"Создание снимка «{label}» уже запрошено")
+            run_id = connection.execute(
+                "INSERT INTO snapshot_runs (stand_id,name,vmid,status,total) VALUES (?,?,?,'queued',?)",
+                (stand_id, label, vmid, len(vms)),
+            ).lastrowid
+        worker = threading.Thread(
+            target=self._snapshot_job, args=(run_id, stand_id, stand["name"], vms, vmid, label, description),
+            name=f"snapshot-{stand_id}-{run_id}", daemon=True,
+        )
+        try:
+            worker.start()
+        except Exception:
+            self.store.execute("UPDATE snapshot_runs SET status='error', error=? WHERE id=?",
+                               ("Не удалось запустить обработчик снимка", run_id))
+            raise
+        result = {"stand": self.get_stand(stand_id), "accepted": True, "run_id": run_id,
+                  "message": f"Создание снимка «{label}» поставлено в очередь"}
+        if vmid is not None:
+            result["vm"] = vms[0]
+        return result
+
+    def _snapshot_job(
+        self, run_id: int, stand_id: int, stand_name: str, vms: list[dict], single_vmid: int | None,
+        label: str, description: str,
+    ) -> None:
+        targets = {int(vm["vmid"]): vm for vm in vms}
+        confirmed: set[int] = set()
+        scope = f"{stand_name} · {label}" if single_vmid is None else f"{stand_name} · VM {single_vmid} · {label}"
+
+        def completed(vmid: int) -> None:
+            if vmid in confirmed:
+                return
+            with self.store.transaction() as connection:
+                connection.execute(
+                    """UPDATE stand_vms SET last_snapshot = ?,
+                       has_start_snapshot = CASE WHEN ? = 'start' THEN 1 ELSE has_start_snapshot END
+                       WHERE stand_id = ? AND vmid = ? AND id = ?""",
+                    (label, label, stand_id, vmid, targets[vmid]["id"]),
+                )
+                connection.execute("UPDATE snapshot_runs SET done = done + 1 WHERE id = ?", (run_id,))
+            confirmed.add(vmid)
+
+        try:
+            with self._stand_admitted_operation(
+                stand_id, "snapshot", scope, self._operation_weight("snapshot", len(vms)),
+                vm_count=len(vms), **self._operation_scope("snapshot", vms),
+            ):
+                self._assert_not_bulk_rollback_pending(stand_id)
+                stand = self.get_stand(stand_id)
+                with self._job_lock:
+                    if stand_id in self._jobs or stand["status"] in {"resetting", "provisioning", "awaiting_confirmation"}:
+                        raise ConflictError("Для стенда выполняется фоновая операция")
+                current = {v["vmid"]: v for v in stand["vms"] if v["vmid"] is not None}
+                if (single_vmid is None and current.keys() != targets.keys()) or any(
+                    vmid not in current or any(vm[key] != current[vmid][key] for key in ("id", "node", "name"))
+                    for vmid, vm in targets.items()
+                ):
+                    raise ConflictError("Состав или размещение VM изменились во время ожидания снимка")
+                if stand["check_status"] == "running" or any(current[vmid]["check_status"] == "running" for vmid in targets):
+                    raise ConflictError("Идёт автопроверка. Повторите создание снимка после её завершения.")
+                self.store.execute("UPDATE snapshot_runs SET status = 'running' WHERE id = ?", (run_id,))
+                self.gateway.create_snapshot(list(targets), label, description, on_completed=completed)
+                if len(confirmed) != len(targets):
+                    raise RuntimeError("Proxmox подтвердил не все снимки")
+                self.store.execute("UPDATE snapshot_runs SET status = 'done' WHERE id = ?", (run_id,))
+                self.store.add_activity("snapshot", "Снимок создан", scope, "success")
+        except Exception as exc:
+            message = (str(exc) or type(exc).__name__)[-1500:]
+            self.store.execute("UPDATE snapshot_runs SET status = 'error', error = ? WHERE id = ?", (message, run_id))
+            self.store.add_activity("snapshot", "Ошибка создания снимка", f"{scope} · {message}", "error")
+
     def vm_action(
         self,
         stand_id: int,
@@ -2123,20 +2349,18 @@ class DashboardService:
         )
         if not vm:
             raise NotFoundError("VM не найдена в этом стенде")
-        queue_kind = {"snapshot": "snapshot", "rotate_password": "password"}.get(action)
         if action == "snapshot":
-            prepared_payload["name"] = self._snapshot_label(prepared_payload.get("name"))
+            return self._enqueue_snapshot(stand, [vm], prepared_payload, vmid=vmid)
         if action == "rotate_password" and (
             stand["status"] != "running" or vm.get("status") != "running"
         ):
             raise ConflictError("Смена пароля доступна только для запущенной VM")
-        if queue_kind:
-            suffix = prepared_payload.get("name") if action == "snapshot" else "смена пароля"
+        if action == "rotate_password":
             with self._stand_admitted_operation(
                 stand_id,
-                queue_kind, f"{stand['name']} · VM {vmid} · {suffix}",
-                self._operation_weight(queue_kind, 1), vm_count=1,
-                **self._operation_scope(queue_kind, [vm], vm_count=1),
+                "password", f"{stand['name']} · VM {vmid} · смена пароля",
+                self._operation_weight("password", 1), vm_count=1,
+                **self._operation_scope("password", [vm], vm_count=1),
             ):
                 self._assert_not_bulk_rollback_pending(stand_id)
                 return self._vm_action_locked(
@@ -2173,31 +2397,6 @@ class DashboardService:
             if not raw_vm:
                 raise NotFoundError("VM не найдена в этом стенде")
             return self._enqueue_rollback_start(stand, [raw_vm], f"VM {vmid}")
-        if action == "snapshot":
-            label = self._snapshot_label(payload.get("name"))
-            description = str(payload.get("description", ""))[:255]
-            with self._operation_reservation(
-                _queue_reserved,
-                "snapshot", f"{stand['name']} · VM {vmid} · {label}",
-                self._operation_weight("snapshot", 1), vm_count=1,
-                **self._operation_scope("snapshot", [vm], vm_count=1),
-            ):
-                self.gateway.create_snapshot([vmid], label, description)
-            self.store.execute(
-                """UPDATE stand_vms SET last_snapshot = ?,
-                has_start_snapshot = CASE WHEN ? = 'start' THEN 1 ELSE has_start_snapshot END
-                WHERE stand_id = ? AND vmid = ?""",
-                (label, label, stand_id, vmid),
-            )
-            self.store.add_activity(
-                "snapshot", "Создан снимок VM", f"{stand['name']} · VM {vmid} · {label}", "success",
-            )
-            refreshed = self.get_stand(stand_id)
-            return {
-                "stand": refreshed,
-                "vm": next(item for item in refreshed["vms"] if int(item.get("vmid") or -1) == vmid),
-                "message": f"Снимок «{label}» создан на VM {vmid}",
-            }
         if action == "rotate_password":
             if stand["status"] != "running" or vm.get("status") != "running":
                 raise ConflictError("Смена пароля доступна только для запущенной VM")
@@ -2262,6 +2461,9 @@ class DashboardService:
     def delete_stand(self, stand_id: int) -> None:
         self._assert_not_bulk_rollback_pending(stand_id)
         stand = self.get_stand(stand_id)
+        if stand["status"] == "awaiting_confirmation":
+            self._confirm_deployment(stand_id, "cancel_deploy", {})
+            return
         if stand["status"] in {"provisioning", "resetting"}:
             raise ConflictError("Нельзя удалить стенд во время фоновой операции")
         with self._job_lock:
@@ -2664,7 +2866,7 @@ class DashboardService:
 
     def bootstrap(self) -> dict[str, Any]:
         return {
-            "integration": self.integration(), "overview": self.overview(), "stands": self.list_stands(),
+            "integration": self.integration(), "overview": self.overview(), "stands": self.list_stands(include_pool_inventory=True),
             "blueprints": self.list_blueprints(), "templates": self.list_templates(), "pools": self.list_pools(),
             "checks": self.list_checks(),
             "metrics": self.metrics(), "activity": self.activity(),

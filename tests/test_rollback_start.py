@@ -156,6 +156,12 @@ class ServiceRollbackTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def _join_snapshots(self) -> None:
+        for worker in threading.enumerate():
+            if worker.name.startswith(f"snapshot-{self.stand_id}-"):
+                worker.join(3)
+                self.assertFalse(worker.is_alive())
+
     def _seed_stand(self) -> int:
         now = utc_now()
         stand_id = self.store.execute(
@@ -192,6 +198,9 @@ class ServiceRollbackTests(unittest.TestCase):
         snapshot_errors: list[BaseException] = []
         stop_errors: list[BaseException] = []
         power_called = threading.Event()
+        self.gateway.create_snapshot.side_effect = lambda ids, *args, on_completed: [
+            on_completed(vmid) for vmid in ids
+        ]
 
         def snapshot() -> None:
             try:
@@ -230,6 +239,7 @@ class ServiceRollbackTests(unittest.TestCase):
             snapshot_thread.join(timeout=2)
             if stop_thread.ident is not None:
                 stop_thread.join(timeout=2)
+            self._join_snapshots()
 
         self.assertFalse(snapshot_thread.is_alive())
         self.assertFalse(stop_thread.is_alive())
@@ -241,10 +251,12 @@ class ServiceRollbackTests(unittest.TestCase):
         release_first = threading.Event()
         errors: list[BaseException] = []
 
-        def create_snapshot(_vmids, label, _description) -> None:
+        def create_snapshot(vmids, label, _description, *, on_completed) -> None:
             if label == "first-local-gate":
                 first_entered.set()
                 release_first.wait(2)
+            for vmid in vmids:
+                on_completed(vmid)
 
         self.gateway.create_snapshot.side_effect = create_snapshot
 
@@ -278,12 +290,54 @@ class ServiceRollbackTests(unittest.TestCase):
             release_first.set()
             first.join(timeout=2)
             second.join(timeout=2)
+            self._join_snapshots()
 
         self.assertFalse(first.is_alive())
         self.assertFalse(second.is_alive())
         self.assertEqual(errors, [])
         self.assertEqual(self.service._stand_gate_waiting, {})
         self.assertEqual(self.service._stand_gate_owner, {})
+
+    def test_async_snapshot_returns_before_completion_and_preserves_partial_results(self) -> None:
+        entered, release = threading.Event(), threading.Event()
+
+        def snapshot(vmids, name, description, *, on_completed):
+            self.assertEqual(vmids, [274, 275])
+            on_completed(274)
+            entered.set()
+            release.wait(3)
+            raise RuntimeError("VM 275: storage timeout")
+
+        self.gateway.create_snapshot.side_effect = snapshot
+        result = self.service.stand_action(self.stand_id, "snapshot", {"name": "before-lesson"})
+        try:
+            self.assertTrue(result["accepted"])
+            self.assertTrue(entered.wait(1))
+            stand = self.service.get_stand(self.stand_id)
+            self.assertEqual((stand["snapshot_status"], stand["snapshot_done"], stand["snapshot_total"]), ("running", 1, 2))
+            with self.assertRaises(ConflictError):
+                self.service.stand_action(self.stand_id, "snapshot", {"name": "before-lesson"})
+        finally:
+            release.set()
+            self._join_snapshots()
+        stand = self.service.get_stand(self.stand_id)
+        self.assertEqual((stand["status"], stand["snapshot_status"], stand["snapshot_done"]), ("running", "error", 1))
+        self.assertIn("storage timeout", stand["snapshot_error"])
+        self.assertEqual([v["last_snapshot"] for v in stand["vms"]], ["before-lesson", "manual-1"])
+
+    def test_single_vm_snapshot_and_restart_recovery(self) -> None:
+        self.gateway.create_snapshot.side_effect = lambda vmids, *args, on_completed: on_completed(vmids[0])
+        result = self.service.vm_action(self.stand_id, 275, "snapshot", {"name": "vm-only"})
+        self._join_snapshots()
+        stand = self.service.get_stand(self.stand_id)
+        self.assertEqual(result["vm"]["vmid"], 275)
+        self.assertEqual((stand["snapshot_status"], stand["snapshot_done"], stand["snapshot_total"]), ("done", 1, 1))
+        self.assertEqual([v["last_snapshot"] for v in stand["vms"]], ["manual-1", "vm-only"])
+        self.store.execute("UPDATE snapshot_runs SET status='running', done=0 WHERE id=?", (result["run_id"],))
+        recovered = DashboardService(self.store, self.gateway).get_stand(self.stand_id)
+        self.assertEqual(recovered["snapshot_status"], "error")
+        self.assertIn("перезапущен", recovered["snapshot_error"])
+        self.gateway.create_snapshot.assert_called_once()
 
     def _seed_additional_stand(
         self,
@@ -821,6 +875,17 @@ class ServiceRollbackTests(unittest.TestCase):
 
 
 class RollbackApiTests(unittest.TestCase):
+    def test_manual_snapshot_routes_return_accepted(self) -> None:
+        for path, method in (("/api/stands/7/actions", "stand_action"), ("/api/stands/7/vms/274/actions", "vm_action")):
+            handler = DashboardHandler.__new__(DashboardHandler)
+            handler.path = path
+            handler.service = MagicMock()
+            handler._authorized = MagicMock(return_value=True)
+            handler._body = MagicMock(return_value={"action": "snapshot"})
+            handler._json = MagicMock()
+            handler._handle_api("POST")
+            handler._json.assert_called_once_with(getattr(handler.service, method).return_value, HTTPStatus.ACCEPTED)
+
     def test_bulk_rollback_action_returns_accepted(self) -> None:
         handler = DashboardHandler.__new__(DashboardHandler)
         handler.path = "/api/stands/actions"
