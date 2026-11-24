@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from dashboard_backend.consumer_monitor import ConsumerReportUnavailable
 from dashboard_backend.database import DashboardStore
 from dashboard_backend.proxmox_gateway import create_gateway
 from dashboard_backend.service import ConflictError, DashboardService, NotFoundError, ValidationError
@@ -96,7 +97,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         query = parse_qs(parsed.query)
         sensitive = method == "GET" and (
             (bool(parts) and parts[-1] in {"credentials", "relief-candidates"})
-            or parts == ["api", "web-activity"]
+            or parts in (["api", "web-activity"], ["api", "resource-consumers"])
         )
         if not self._authorized(method, sensitive=sensitive):
             self._json({"error": "Неверный административный токен", "code": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
@@ -110,6 +111,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self._json(self.service.overview())
             elif parts == ["api", "metrics"] and method == "GET":
                 self._json(self.service.metrics())
+            elif parts == ["api", "resource-consumers"] and method == "GET":
+                self._json(self.service.resource_consumers())
             elif parts == ["api", "operation-queue"] and method == "GET":
                 self._json(self.service.operation_queue())
             elif parts == ["api", "web-activity"] and method == "GET":
@@ -177,6 +180,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 body = self._body(); self._json(self.service.start_check(int(body.get("stand_id"))), HTTPStatus.ACCEPTED)
             else:
                 self._json({"error": "Маршрут API не найден", "code": "not_found"}, HTTPStatus.NOT_FOUND)
+        except ConsumerReportUnavailable as exc:
+            self._json({"error": str(exc), "code": "telemetry_unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
         except NotFoundError as exc:
             self._json({"error": str(exc), "code": "not_found"}, HTTPStatus.NOT_FOUND)
         except ConflictError as exc:

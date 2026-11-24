@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
 from . import deploy_relief
+from .consumer_monitor import ConsumerMonitor
 from .database import DashboardStore, utc_now
 from .operation_queue import DeploymentCapacityBlocked, ProxmoxOperationQueue
 from .passwords import PROXMOX_PASSWORD_MAX_LENGTH, generate_password
@@ -49,6 +50,7 @@ class DashboardService:
         self.store = store
         self.gateway = gateway
         self.pool_inventory = PoolInventory(store, gateway)
+        self.consumer_monitor = ConsumerMonitor(lambda: self.gateway.consumer_resources(), gateway.mode)
         def env_int(name: str, default: int, low: int = 1, high: int = 100) -> int:
             try:
                 value = int(os.environ.get(name, str(default)))
@@ -2800,6 +2802,9 @@ class DashboardService:
             self.store.execute("UPDATE check_runs SET status = 'failed', output = ?, finished_at = ? WHERE id = ?", (str(exc), finished, run_id))
             self.store.execute("UPDATE stands SET check_status = 'failed', last_check = ?, updated_at = ? WHERE id = ?", (finished, finished, stand_id))
             self.store.add_activity("check", "Ошибка автопроверки", f"Стенд #{stand_id}: {exc}", "error", "Система")
+
+    def resource_consumers(self) -> dict[str, Any]:
+        return self.consumer_monitor.report()
 
     def metrics(self) -> dict[str, Any]:
         vm_rows = self.store.query_all("SELECT vmid FROM stand_vms WHERE vmid IS NOT NULL")

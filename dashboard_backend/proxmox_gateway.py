@@ -431,7 +431,8 @@ class IntegrationInfo:
 class DemoProxmoxGateway:
     mode = "demo"
 
-    def scheduler_snapshot(self, *, force: bool = False) -> dict[str, Any]:
+    @staticmethod
+    def _demo_infrastructure_resources() -> list[dict[str, Any]]:
         resources: list[dict[str, Any]] = []
         for index, (node, cpu, memory) in enumerate((
             ("pve-01", 0.48, 0.62),
@@ -442,18 +443,54 @@ class DemoProxmoxGateway:
             resources.extend((
                 {
                     "type": "node", "node": node, "status": "online",
-                    "cpu": cpu, "maxcpu": 16, "mem": memory * 64 * 1024**3,
-                    "maxmem": 64 * 1024**3, "disk": (0.45 + index * 0.04) * 256 * 1024**3,
+                    "cpu": cpu, "maxcpu": 16, "mem": int(memory * 64 * 1024**3),
+                    "maxmem": 64 * 1024**3, "disk": int((0.45 + index * 0.04) * 256 * 1024**3),
                     "maxdisk": 256 * 1024**3, "uptime": (19 + index * 7) * 86400,
                 },
                 {
                     "type": "storage", "node": node, "storage": "demo-shared",
                     "status": "available", "shared": 1, "content": "images,rootdir",
-                    "plugintype": "nfs", "disk": (0.58 + index * 0.01) * 4 * 1024**4,
+                    "plugintype": "nfs", "disk": int(0.58 * 4 * 1024**4),
                     "maxdisk": 4 * 1024**4,
                 },
             ))
-        nodes, storages = _normalize_scheduler_resources(resources)
+        return resources
+
+    def consumer_resources(self) -> list[dict[str, Any]]:
+        """Synthetic /cluster/resources inventory; values use Proxmox units."""
+        rows = self._demo_infrastructure_resources()
+        gib = 1024**3
+        rows.append({
+            "type": "storage", "node": "pve-02", "storage": "local-ssd",
+            "status": "available", "shared": 0, "disk": 454 * gib, "maxdisk": 500 * gib,
+        })
+        # Some guests are deliberately outside the dashboard's seeded stands.
+        elapsed = time.monotonic()
+        for vmid, name, kind, node, pool, cores, cpu, used_gib, ram_gib, root_gib, read, write, rx, tx in (
+            (2301, "etl-worker", "qemu", "pve-02", "data-platform", 8, .92, 11, 16, 180, 26, 6, 3, 2),
+            (2302, "postgres-primary", "qemu", "pve-01", "services", 6, .48, 23, 24, 380, 12, 18, 2, 5),
+            (2303, "metrics-collector", "lxc", "pve-03", "services", 2, .33, 1.5, 2, 36, 1, 3, 14, .5),
+            (1111, "stand-1-1", "qemu", "pve-02", "de24-g2is", 4, .24, 4, 8, 64, 2, 1, .25, .125),
+            (1121, "stand-2-1", "qemu", "pve-01", "practice-3sa", 2, .12, 2, 4, 48, 1, .5, .5, .25),
+        ):
+            uptime = elapsed + vmid * 80
+            rows.append({
+                "type": kind, "vmid": vmid, "id": f"{kind}/{vmid}", "name": name,
+                "node": node, "pool": pool, "status": "running", "uptime": int(uptime),
+                "maxcpu": cores, "cpu": cpu, "mem": int(used_gib * gib), "maxmem": ram_gib * gib,
+                "maxdisk": root_gib * gib, "diskread": int(read * 1024**2 * uptime),
+                "diskwrite": int(write * 1024**2 * uptime),
+                "netin": int(rx * 1024**2 * uptime), "netout": int(tx * 1024**2 * uptime),
+            })
+        rows.append({
+            "type": "qemu", "vmid": 2304, "id": "qemu/2304", "name": "archive-offline",
+            "node": "pve-04", "status": "stopped", "uptime": 0, "maxcpu": 4,
+            "maxmem": 8 * gib, "maxdisk": 280 * gib,
+        })
+        return rows
+
+    def scheduler_snapshot(self, *, force: bool = False) -> dict[str, Any]:
+        nodes, storages = _normalize_scheduler_resources(self._demo_infrastructure_resources())
         return {
             "available": True,
             "partial": False,
@@ -748,6 +785,13 @@ class LiveProxmoxGateway:
             return IntegrationInfo("live", True, endpoint, os.environ.get("PROXMOX_CLUSTER_NAME", "Proxmox VE"), f"{len(nodes)} нод")
         except Exception as exc:
             return IntegrationInfo("live", False, endpoint, "Proxmox VE", str(exc))
+
+    def consumer_resources(self) -> list[dict[str, Any]]:
+        """One unfiltered, read-only inventory; scope is the PVE token's ACLs."""
+        resources = self.client.cluster.resources.get()
+        if not isinstance(resources, list) or any(not isinstance(row, dict) for row in resources):
+            raise RuntimeError("Proxmox вернул некорректный список ресурсов кластера")
+        return resources
 
     def scheduler_snapshot(self, *, force: bool = False) -> dict[str, Any]:
         """Return cached, read-only admission telemetry from Proxmox.

@@ -4,7 +4,7 @@
   const app = document.querySelector("#app");
   const modalRoot = document.querySelector("#modal-root");
   const toastRoot = document.querySelector("#toast-root");
-  const routes = ["overview", "stands", "blueprints", "checks", "ipam", "infrastructure"];
+  const routes = ["overview", "stands", "blueprints", "checks", "ipam", "infrastructure", "consumers"];
   const workspaces = [
     { id: "demoexam", name: "Демоэкзамен" },
     { id: "mdk02.01", name: "МДК02.01" },
@@ -131,6 +131,7 @@ exit 75`;
     checks: "Автопроверки",
     ipam: "IPAM",
     infrastructure: "Инфраструктура",
+    consumers: "Потребители ресурсов",
   };
   const statusLabels = {
     running: "Работает", stopped: "Остановлен", provisioning: "Развёртывается", resetting: "Восстанавливается",
@@ -261,7 +262,7 @@ exit 75`;
     const headers = { Accept: "application/json", ...(options.headers || {}) };
     const token = localStorage.getItem("demoops.adminToken");
     if (token) headers["X-Admin-Token"] = token;
-    const request = { method: options.method || "GET", headers };
+    const request = { method: options.method || "GET", headers, signal: options.signal };
     if (options.body !== undefined) {
       headers["Content-Type"] = "application/json";
       request.body = JSON.stringify(options.body);
@@ -339,10 +340,10 @@ exit 75`;
     </div>`;
   }
 
-  function pageHeader(title, subtitle, actions = "") {
+  function pageHeader(title, subtitle, actions = "", scope = null) {
     const workspace = workspaces.find(item => item.id === state.workspace) || workspaces[0];
     return `<div class="page-header">
-      <div class="page-header__copy"><span class="section-kicker">${escapeHtml(workspace.name)} <i>/</i> DEPLOYER</span><h2 class="page-title">${escapeHtml(title)}</h2><p class="page-subtitle">${escapeHtml(subtitle)}</p></div>
+      <div class="page-header__copy"><span class="section-kicker">${escapeHtml(scope ?? workspace.name)} <i>/</i> DEPLOYER</span><h2 class="page-title">${escapeHtml(title)}</h2><p class="page-subtitle">${escapeHtml(subtitle)}</p></div>
       ${actions ? `<div class="page-actions">${actions}</div>` : ""}
     </div>`;
   }
@@ -644,6 +645,151 @@ exit 75`;
     syncCheckPolling();
   }
 
+  // This is a cluster view, deliberately independent of the selected workspace and /api/bootstrap.
+  const consumerMetrics = {
+    cpu_cores: { label: "Процессор", column: "CPU", unit: "ядра", divisor: 1, icon: "activity" },
+    ram_bytes: { label: "Память", column: "RAM", unit: "ГиБ", divisor: 2 ** 30, icon: "server" },
+    io_bps: { label: "Дисковый обмен", column: "Чтение + запись", unit: "МиБ/с", divisor: 2 ** 20, icon: "refresh" },
+    net_bps: { label: "Сетевой трафик", column: "Приём + передача", unit: "МиБ/с", divisor: 2 ** 20, icon: "external" },
+    disk_capacity_bytes: { label: "Корневой диск", column: "Корневой диск", unit: "ГиБ", divisor: 2 ** 30, icon: "grid" },
+  };
+  const consumerView = { report: null, error: "", locked: false, request: null, timer: null, metric: "cpu_cores", query: "", kind: "", page: 0 };
+  const consumerPageSize = 10;
+  const numericSample = value => typeof value === "number" && Number.isFinite(value) && value >= 0;
+
+  function consumerValue(value, key, withUnit = true) {
+    if (!numericSample(value)) return "—";
+    const spec = consumerMetrics[key];
+    const n = value / spec.divisor;
+    const label = n > 0 && n < .01 ? "<0,01" : formatNumber(n, n < 10 ? 2 : 1);
+    return label + (withUnit ? " " + spec.unit : "");
+  }
+
+  function renderConsumers() {
+    if (app.querySelector("#consumer-page")) return;
+    app.innerHTML = `<section class="page consumer-page" id="consumer-page">
+      ${pageHeader("Потребители ресурсов", "Какие виртуальные машины и контейнеры нагружают Proxmox, на каких узлах и хранилищах остаётся резерв.",
+        `<button type="button" class="button" data-consumer-refresh>${icon("refresh")}Обновить</button>`, "Весь кластер")}
+      <div id="consumer-notice" role="status"></div>
+      <div id="consumer-report" hidden>
+        <section aria-labelledby="consumer-leaders-title">
+          <div class="consumer-section-lead"><h3 class="card__title" id="consumer-leaders-title">Лидеры по ресурсам</h3><p class="card__subtitle">Максимум по одному гостю для каждого показателя.</p></div>
+          <div class="consumer-podium">${Object.entries(consumerMetrics).map(([k,m]) => `<button type="button" class="consumer-leader" data-consumer-sort="${k}" aria-label="Рейтинг: ${m.label}"><span class="consumer-leader__head">${icon(m.icon)}${m.label}</span><strong data-leader-value>—</strong><small data-leader-name></small></button>`).join("")}</div></section>
+        <article class="card consumer-ranking">
+          <div class="card__header"><div><h3 class="card__title">Рейтинг машин и контейнеров</h3><p class="card__subtitle">Выберите показатель выше, чтобы отсортировать список по убыванию.</p></div></div>
+          <div class="consumer-tools"><label class="search-field">${icon("search")}<input id="consumer-search" type="search" placeholder="Имя, VMID или узел" aria-label="Поиск по имени, VMID или узлу"></label>
+            <select id="consumer-kind" class="input" aria-label="Тип ресурса"><option value="">Все типы</option><option value="qemu">Только QEMU</option><option value="lxc">Только LXC</option></select></div>
+          <div class="table-wrap" role="region" tabindex="0" aria-label="Таблица потребителей"><table class="data-table consumer-table"><thead><tr><th scope="col">Ресурс</th>${Object.entries(consumerMetrics).map(([k,m])=>`<th scope="col" data-consumer-column="${k}">${m.column}<small>${m.unit}</small></th>`).join("")}</tr></thead><tbody id="consumer-rows"></tbody></table></div>
+          <div class="card__footer"><span class="microcopy" id="consumer-count"></span><div class="consumer-pager"><button type="button" class="button button--small" data-consumer-prev>Назад</button><button type="button" class="button button--small" data-consumer-next>Далее</button></div></div>
+          <p class="consumer-note">CPU — число занятых ядер. Корневой диск — его настроенная ёмкость, а не занятое место. Для скорости обмена нужны два замера счётчиков. Прочерк означает, что данных нет.</p>
+        </article>
+        <article class="card consumer-advice"><div class="card__header"><div><h3 class="card__title">Возможности оптимизации</h3><p class="card__subtitle">Что проверить по этим измерениям. Deployer ничего не меняет в кластере.</p></div></div><div id="consumer-advice"></div></article>
+        <div class="consumer-capacity"><article class="card"><div class="card__header"><div><h3 class="card__title">Узлы</h3><p class="card__subtitle">Загрузка CPU и памяти, включая сам гипервизор.</p></div></div><div id="consumer-nodes"></div></article>
+        <article class="card"><div class="card__header"><div><h3 class="card__title">Хранилища</h3><p class="card__subtitle">Фактически занятое место, по убыванию заполненности.</p></div></div><div id="consumer-storages"></div></article></div>
+      </div></section>`;
+    const search = app.querySelector("#consumer-search"), kind = app.querySelector("#consumer-kind");
+    search.value = consumerView.query; kind.value = consumerView.kind;
+    search.addEventListener("input", () => { consumerView.query = search.value; consumerView.page = 0; paintConsumerRows(); });
+    kind.addEventListener("change", () => { consumerView.kind = kind.value; consumerView.page = 0; paintConsumerRows(); });
+    paintConsumers();
+    loadConsumers();
+  }
+
+  function paintConsumerRows() {
+    const view = consumerView, table = app.querySelector("#consumer-rows");
+    if (!table || !view.report) return;
+    const query = view.query.trim().toLocaleLowerCase(), metric = view.metric;
+    const rows = view.report.guests.filter(g => (!view.kind || g.kind === view.kind) &&
+      (!query || [g.name,g.vmid,g.node].some(v=>String(v ?? "").toLocaleLowerCase().includes(query))));
+    const rank = g => numericSample(g[metric]) ? g[metric] : -1;
+    rows.sort((a,b)=>rank(b)-rank(a) || Number(a.vmid)-Number(b.vmid));
+    view.page = Math.max(0,Math.min(view.page,Math.ceil(rows.length/consumerPageSize)-1));
+    const offset = view.page*consumerPageSize;
+    table.innerHTML = rows.slice(offset,offset+consumerPageSize).map(g => {
+      const title = escapeHtml(g.name || "Без имени");
+      const meta = [g.kind === "lxc" ? "LXC" : "QEMU", g.vmid].join(" ") + " · " + [g.node || "—", statusLabels[g.status] || g.status || "—"].join(" · ");
+      const values = Object.keys(consumerMetrics).map(k => `<td class="${metric === k ? "consumer-highlight" : ""}">${escapeHtml(consumerValue(g[k], k, false))}</td>`).join("");
+      return `<tr><td><strong class="cell-title">${title}</strong><small class="cell-subtitle">${escapeHtml(meta)}</small></td>${values}</tr>`;
+    }).join("") || `<tr><td colspan="${Object.keys(consumerMetrics).length + 1}" class="consumer-empty">${query || view.kind ? "По этому фильтру ресурсов не найдено." : "Нет видимых виртуальных машин и контейнеров."}</td></tr>`;
+    for (const th of app.querySelectorAll("[data-consumer-column]")) th.setAttribute("aria-sort",th.dataset.consumerColumn === metric ? "descending" : "none");
+    for (const button of app.querySelectorAll("[data-consumer-sort]")) button.setAttribute("aria-pressed",String(button.dataset.consumerSort === metric));
+    app.querySelector("#consumer-count").textContent = rows.length ? `${offset+1}–${Math.min(offset+consumerPageSize,rows.length)} из ${formatNumber(rows.length)}` : "0 результатов";
+    app.querySelector("[data-consumer-prev]").disabled = !view.page;
+    app.querySelector("[data-consumer-next]").disabled = offset+consumerPageSize >= rows.length;
+  }
+
+  function paintConsumers() {
+    const notice = app.querySelector("#consumer-notice");
+    if (!notice) return;
+    const { report, error, locked, request } = consumerView;
+    const refresh = app.querySelector("[data-consumer-refresh]");
+    refresh.classList.toggle("is-spinning", Boolean(request));
+    refresh.setAttribute("aria-busy",String(Boolean(request)));
+    app.querySelector("#consumer-report").hidden = !report;
+    const stamp = report ? parseDate(report.observed_at)?.toLocaleTimeString("ru-RU") : null;
+    const warning = [error, report?.warning].filter(Boolean).join(" ");
+    const heading = locked ? "Для просмотра нужен административный токен" : !report ? (error ? "Не удалось получить ресурсы" : "Собираем данные Proxmox…") : (error || report.stale ? "Показан предыдущий замер" : report.mode === "demo" ? "Демонстрационный кластер" : "Замер Proxmox");
+    const meta = [stamp ? `Данные на ${stamp}` : "", report?.coverage_note, warning].filter(Boolean).map(escapeHtml).join(" · ");
+    // Keep actionable controls mounted while a background refresh changes only data.
+    const nextNotice = `<div class="consumer-status ${warning || report?.stale || locked ? "consumer-status--warn" : ""}">${icon(locked ? "lock" : "activity")}<div><strong>${heading}</strong>${meta ? `<p>${meta}</p>` : ""}</div>${locked ? '<button class="button button--small" type="button" data-consumer-unlock>Ввести токен</button>' : ""}</div>`;
+    if (notice.dataset.markup !== nextNotice) { notice.innerHTML = nextNotice; notice.dataset.markup = nextNotice; }
+    if (!report) {
+      for (const id of ["consumer-rows","consumer-nodes","consumer-storages","consumer-advice"]) app.querySelector("#"+id).replaceChildren();
+      for (const line of app.querySelectorAll("[data-leader-name],[data-leader-value]")) line.textContent = "—";
+      return;
+    }
+    for (const button of app.querySelectorAll("[data-consumer-sort]")) {
+      const k = button.dataset.consumerSort;
+      const best = report.guests.reduce((a,g)=> numericSample(g[k]) && (!a || g[k]>a[k]) ? g : a,null);
+      button.querySelector("[data-leader-value]").textContent = best ? consumerValue(best[k],k) : "—";
+      button.querySelector("[data-leader-name]").textContent = best && best[k]>0 ? `${best.name || "Без имени"} · ${best.vmid}` : best ? "Нет нагрузки по замеру" : "Нет измерений";
+    }
+    paintConsumerRows();
+    const pct = v=>numericSample(v) ? formatNumber(v,1)+"%" : "—";
+    const meter = v=>numericSample(v) ? `<span class="consumer-meter" aria-hidden="true"><i style="width:${clamp(v)}%"></i></span>` : "";
+    app.querySelector("#consumer-nodes").innerHTML = report.nodes.map(n => `<div class="consumer-cap-row"><strong>${escapeHtml(n.name)}</strong><span>CPU ${pct(n.cpu_pct)}</span><span>RAM ${pct(n.ram_pct)}</span></div>`).join("") || '<p class="consumer-empty">Нет данных по узлам.</p>';
+    const storages = [...report.storages].sort((a,b)=>(b.used_pct ?? -1)-(a.used_pct ?? -1));
+    app.querySelector("#consumer-storages").innerHTML = storages.map(s => `<div class="consumer-cap-row consumer-storage"><span><strong>${escapeHtml(s.name)}</strong><small>${escapeHtml(s.node || "—")}</small></span><span>${escapeHtml(consumerValue(s.used_bytes,"ram_bytes",false))} / ${escapeHtml(consumerValue(s.total_bytes,"ram_bytes"))}</span><span>${pct(s.used_pct)}${meter(s.used_pct)}</span></div>`).join("") || '<p class="consumer-empty">Нет данных по хранилищам.</p>';
+    app.querySelector("#consumer-advice").innerHTML = report.recommendations.length ? report.recommendations.map((r,i)=>`<div class="consumer-tip"><span>${String(i+1).padStart(2,"0")}</span><div><strong>${escapeHtml(r.title)}</strong><p>${escapeHtml(r.detail)}</p></div></div>`).join("") : '<p class="consumer-empty">По доступным измерениям рекомендаций нет. Один замер не показывает длительность нагрузки.</p>';
+  }
+
+  function stopConsumerPolling() {
+    clearTimeout(consumerView.timer); consumerView.timer = null;
+    consumerView.request?.abort(); consumerView.request = null;
+  }
+
+  function clearConsumerReport() {
+    stopConsumerPolling();
+    Object.assign(consumerView,{report:null,error:"",locked:false,page:0});
+    if (state.route === "consumers") { paintConsumers(); loadConsumers(); }
+  }
+
+  async function loadConsumers() {
+    const v = consumerView;
+    if (state.route !== "consumers" || document.hidden || v.request) return;
+    clearTimeout(v.timer);
+    const controller = new AbortController(); v.request = controller;
+    const tokenAtRequest = localStorage.getItem("demoops.adminToken");
+    const refresh = app.querySelector("[data-consumer-refresh]");
+    refresh?.classList.add("is-spinning");
+    try {
+      const report = await api("/api/resource-consumers",{promptAdmin:false, signal:controller.signal});
+      if (controller.signal.aborted || tokenAtRequest !== localStorage.getItem("demoops.adminToken")) return;
+      if (!report || !["guests","nodes","storages","recommendations"].every(k=>Array.isArray(report[k]))) throw new Error("Некорректный формат отчёта.");
+      v.report=report; v.error=""; v.locked=false;
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      v.locked=err.status === 401;
+      if (v.locked || err.status === 403 || err.status === 503) v.report=null;
+      v.error=v.locked ? "" : err.message || "Источник недоступен.";
+    } finally {
+      if (v.request === controller) {
+        v.request=null; paintConsumers();
+        if (!v.locked && !document.hidden && state.route === "consumers") v.timer=setTimeout(loadConsumers,20000);
+      }
+    }
+  }
+
   function renderInfrastructure() {
     const { metrics, stands, integration } = state.data;
     const cluster = metrics.cluster;
@@ -651,7 +797,7 @@ exit 75`;
     const historySubtitle = integration.mode === "live" ? "Измерения текущего процесса; сиреневым — управляемые VM" : "Почасовые значения; сиреневым — VM из управляемых пулов стендов";
     const clusterHealthy = integration.connected && cluster.online_nodes === cluster.total_nodes && cluster.cpu < 85 && cluster.ram < 90;
     app.innerHTML = `<section class="page">
-      ${pageHeader("Инфраструктура", "Фактическая загрузка Proxmox и оценка вклада экзаменационных VM в ресурсы кластера.", `<button class="button" data-refresh>${icon("refresh")}Обновить метрики</button>`)}
+      ${pageHeader("Инфраструктура", "Фактическая загрузка Proxmox и оценка вклада экзаменационных VM в ресурсы кластера.", `<a class="button" href="#consumers">${icon("grid")}Потребители ресурсов</a><button class="button" data-refresh>${icon("refresh")}Обновить метрики</button>`)}
       <div class="infra-hero card"><div class="infra-hero__copy"><span class="infra-kicker">${escapeHtml(integration.cluster)} · ${integration.mode === "live" ? "LIVE" : "DEMO"}</span><h3>${clusterHealthy ? "Кластер работает стабильно" : "Инфраструктура требует внимания"}</h3><p>${cluster.online_nodes} из ${cluster.total_nodes} нод онлайн. Экзаменационные стенды используют <strong>${formatNumber(cluster.exam_cpu, 1)}%</strong> доступной CPU-ёмкости и <strong>${formatNumber(cluster.exam_ram, 1)}%</strong> памяти.</p>
         <div class="infra-tags"><span>${icon("server")} ${metrics.nodes.reduce((sum, node) => sum + node.running_vms, 0)} VM работают</span><span>${icon("activity")} ${100 - Math.round(cluster.cpu)}% CPU в резерве</span><span>${icon("shield")} TLS ${integration.mode === "live" ? "проверяется" : "не требуется"}</span></div></div>
         <div class="infra-hero__share">${gauge(cluster.exam_cpu, "вклад стендов", "var(--accent)")}</div></div>
@@ -922,14 +1068,17 @@ exit 75`;
   }
 
   function render() {
-    if (!state.data) return;
+    if (!state.data && state.route !== "consumers") {
+      if (app.querySelector("#consumer-page")) app.innerHTML = '<p class="muted-block">Загрузка данных…</p>';
+      return;
+    }
     document.querySelector("#page-title").textContent = routeTitles[state.route];
     document.querySelectorAll(".nav-link[data-route]").forEach(link => {
       const active = link.dataset.route === state.route;
       link.classList.toggle("is-active", active);
       if (active) link.setAttribute("aria-current", "page"); else link.removeAttribute("aria-current");
     });
-    const renderers = { overview: renderOverview, stands: renderStands, blueprints: renderBlueprints, checks: renderChecks, ipam: renderIpam, infrastructure: renderInfrastructure };
+    const renderers = { overview: renderOverview, stands: renderStands, blueprints: renderBlueprints, checks: renderChecks, ipam: renderIpam, infrastructure: renderInfrastructure, consumers: renderConsumers };
     renderers[state.route]();
     updateShell();
     syncQueuePolling();
@@ -992,7 +1141,7 @@ exit 75`;
         updateShell();
       } else render();
     } catch (error) {
-      if (!state.data) {
+      if (!state.data && state.route !== "consumers") {
         app.innerHTML = `<section class="page"><div class="load-error">${icon("alert")}<h2>Не удалось загрузить дашборд</h2><p>${escapeHtml(error.message)}</p><button class="button button--primary" data-refresh>${icon("refresh")}Повторить</button></div></section>`;
       } else if (!silent) toast(error.message, "error");
     } finally {
@@ -1063,6 +1212,7 @@ exit 75`;
         const token = modalRoot.querySelector("#admin-token-input").value.trim();
         if (token.length < 12) return;
         localStorage.setItem("demoops.adminToken", token);
+        clearConsumerReport();
         finish(token);
         if (manual) toast("Административный токен сохранён");
       });
@@ -1070,6 +1220,7 @@ exit 75`;
       modalRoot.querySelector(".modal__close").addEventListener("click", () => finish(null));
       modalRoot.querySelector("#remove-admin-token")?.addEventListener("click", () => {
         localStorage.removeItem("demoops.adminToken");
+        clearConsumerReport();
         finish(null);
         toast("Локальный административный токен удалён", "warning");
       });
@@ -2204,7 +2355,9 @@ exit 75`;
       window.clearTimeout(webActivityPollTimer);
       webActivityPollTimer = null;
     }
+    const leftConsumers = state.route === "consumers";
     state.route = route;
+    if (leftConsumers) clearConsumerReport();
     if (route === "ipam") state.ipam = null;
     window.location.hash = route;
     render();
@@ -2288,6 +2441,10 @@ exit 75`;
     if (!target) return;
     if (target.matches(".nav-link[data-route], .brand[data-route]")) { event.preventDefault(); navigate(target.dataset.route); }
     else if (target.dataset.navigate) navigate(target.dataset.navigate);
+    else if (target.hasAttribute("data-consumer-refresh")) loadConsumers();
+    else if (target.hasAttribute("data-consumer-unlock")) await requestAdminToken();
+    else if (target.dataset.consumerSort && Object.hasOwn(consumerMetrics,target.dataset.consumerSort)) { consumerView.metric=target.dataset.consumerSort; consumerView.page=0; paintConsumerRows(); }
+    else if (target.hasAttribute("data-consumer-prev") || target.hasAttribute("data-consumer-next")) { consumerView.page+=target.hasAttribute("data-consumer-next") ? 1 : -1; paintConsumerRows(); }
     else if (target.dataset.rollbackAllStands !== undefined) openRollbackAllStandsModal();
     else if (target.dataset.importPool !== undefined) openImportPoolModal();
     else if (target.matches("[data-open-deploy]")) openDeployWizard(target.dataset.openDeploy || null);
@@ -2382,7 +2539,7 @@ exit 75`;
   }
 
   document.querySelector("#quick-create")?.addEventListener("click", () => openDeployWizard());
-  document.querySelector("#global-refresh")?.addEventListener("click", () => loadData());
+  document.querySelector("#global-refresh")?.addEventListener("click", () => state.route === "consumers" ? loadConsumers() : loadData());
   document.querySelector("#operator-settings")?.addEventListener("click", () => requestAdminToken(true));
   document.querySelector("#workspace-switcher")?.addEventListener("click", event => {
     const menu = document.querySelector("#workspace-menu");
@@ -2420,6 +2577,10 @@ exit 75`;
     }
   });
   document.addEventListener("visibilitychange", () => {
+    if (state.route === "consumers") {
+      if (document.hidden) stopConsumerPolling();
+      else loadConsumers();
+    }
     if (!document.hidden) {
       syncOperationPolling();
       syncCheckPolling();
@@ -2430,6 +2591,8 @@ exit 75`;
   window.addEventListener("hashchange", () => { const route = getRoute(); if (route !== state.route) navigate(route); });
   window.addEventListener("beforeunload", event => { if (state.editorDirty) { event.preventDefault(); event.returnValue = ""; } });
 
+  window.addEventListener("storage", event => { if (event.key === "demoops.adminToken" || event.key === null) clearConsumerReport(); });
+  if (state.route === "consumers") render();
   loadData();
   window.setInterval(() => { if (!document.hidden) loadData({ silent: true }); }, 30000);
 })();
