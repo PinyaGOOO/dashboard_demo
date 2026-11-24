@@ -15,6 +15,7 @@ from dashboard_backend.consumer_monitor import ConsumerReportUnavailable
 from dashboard_backend.database import DashboardStore
 from dashboard_backend.proxmox_gateway import create_gateway
 from dashboard_backend.service import ConflictError, DashboardService, NotFoundError, ValidationError
+from dashboard_backend.student_mount import StudentMount
 
 
 ROOT = Path(__file__).resolve().parent
@@ -27,6 +28,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
     server_version = "DemoExamDashboard/1.0"
     service: DashboardService
     admin_token: str
+    student_mount: StudentMount | None = None
 
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, directory=str(WEB_ROOT), **kwargs)
@@ -38,10 +40,13 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "same-origin")
-        self.send_header("Cache-Control", "no-store" if self.path.startswith("/api/") else "no-cache")
+        if not self.path.startswith("/student-demo/") and self.path.split("?", 1)[0] != "/student-demo":
+            self.send_header("Cache-Control", "no-store" if self.path.startswith("/api/") else "no-cache")
         super().end_headers()
 
     def do_GET(self) -> None:
+        if self._student("GET"):
+            return
         if self.path.startswith("/api/"):
             self._handle_api("GET")
             return
@@ -50,14 +55,24 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self.path = "/index.html"
         super().do_GET()
 
+    def _student(self, method: str) -> bool:
+        return self.student_mount is not None and self.student_mount.handle(self, method)
+
+    def do_HEAD(self) -> None:
+        if not self._student("HEAD"):
+            super().do_HEAD()
+
     def do_POST(self) -> None:
-        self._handle_api("POST")
+        if not self._student("POST"):
+            self._handle_api("POST")
 
     def do_PATCH(self) -> None:
-        self._handle_api("PATCH")
+        if not self._student("PATCH"):
+            self._handle_api("PATCH")
 
     def do_DELETE(self) -> None:
-        self._handle_api("DELETE")
+        if not self._student("DELETE"):
+            self._handle_api("DELETE")
 
     def _authorized(self, method: str, *, sensitive: bool = False) -> bool:
         if (method == "GET" and not sensitive) or not self.admin_token:
@@ -212,7 +227,15 @@ def main() -> None:
         raise SystemExit(f"Не удалось инициализировать Proxmox: {exc}") from exc
     # Never insert synthetic VMIDs into a live inventory: a demo ID could
     # collide with a real guest and make lifecycle actions unsafe.
-    store = DashboardStore(args.db.resolve(), seed_demo=gateway.mode == "demo")
+    admin_db = args.db.resolve()
+    student_db = admin_db.with_name("student-demo-state.db")
+    if admin_db == student_db.resolve():
+        parser.error("Для административной базы и студенческого демо нужны разные файлы")
+    DashboardHandler.student_mount = StudentMount(
+        student_db, admin_db.with_name("student-demo-catalog.json"),
+        secure_cookie=gateway.mode == "live", example_if_missing=gateway.mode == "demo",
+    )
+    store = DashboardStore(admin_db, seed_demo=gateway.mode == "demo")
     service = DashboardService(store, gateway)
     DashboardHandler.service = service
     DashboardHandler.admin_token = os.environ.get("DASHBOARD_ADMIN_TOKEN", "")
