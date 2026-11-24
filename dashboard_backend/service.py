@@ -13,7 +13,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
 from . import deploy_relief
+from .stand_timer import StandTimer, deadline as stand_deadline, duration as parse_duration
 from .student_pilot_publish import publish_pilot_if_ready
+from .student_network import student_deployment_network
 from .consumer_monitor import ConsumerMonitor
 from .database import DashboardStore, utc_now
 from .operation_queue import DeploymentCapacityBlocked, ProxmoxOperationQueue
@@ -94,6 +96,7 @@ class DashboardService:
         self._web_activity_lock = threading.Lock()
         self._web_activity_cache: dict[str, Any] | None = None
         self._web_activity_cache_at = 0.0
+        self.stand_timer = StandTimer(self)
         self.store.execute(
             """UPDATE snapshot_runs SET status = 'error',
                error = CASE WHEN status = 'queued' THEN 'Deployer перезапущен до начала снимка.'
@@ -114,6 +117,9 @@ class DashboardService:
         else:
             self._mark_interrupted_deployments()
         self._start_scheduler_monitor()
+        if store.query_one("SELECT 1 FROM stand_timer_targets WHERE state='waiting' AND mode=? LIMIT 1",
+                           (gateway.mode,)):
+            self.stand_timer.start()
 
     def _mark_interrupted_rollbacks(self) -> None:
         """A background rollback cannot survive a dashboard process restart."""
@@ -375,6 +381,12 @@ class DashboardService:
 
     def stop_monitors(self) -> None:
         self._scheduler_monitor_stop.set()
+        if hasattr(self, "stand_timer"):
+            self.stand_timer.stop.set()
+
+    def set_stand_duration(self, stand_id: int, duration_minutes: int, *, expected_vmid: int,
+                           expected_pool: str, expected_ip: str) -> dict:
+        return self.stand_timer.set_existing(stand_id, duration_minutes, expected_vmid, expected_pool, expected_ip)
 
     def _scheduler_monitor_loop(self) -> None:
         while not self._scheduler_monitor_stop.is_set():
@@ -993,6 +1005,12 @@ class DashboardService:
         use_existing_pool = use_existing_value is True or str(use_existing_value).strip().lower() in {
             "1", "true", "yes", "on",
         }
+        try:
+            minutes = parse_duration(payload.get("duration_minutes"))
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+        if use_existing_pool and minutes is not None:
+            raise ValidationError("Для стенда со сроком требуется новый личный пул")
         raw_pool_id = str(payload.get("pool_id", "")).strip()
         if use_existing_pool and not raw_pool_id:
             raise ValidationError("Выберите существующий Proxmox pool")
@@ -1019,6 +1037,11 @@ class DashboardService:
             raise ValidationError("Количество VM должно быть от 1 до 50")
         subnet = str(payload.get("subnet", "")).strip()
         start_ip = str(payload.get("start_ip", "")).strip()
+        owner = str(payload.get("owner", "Администратор"))
+        try:
+            subnet, start_ip = student_deployment_network(owner, subnet, start_ip)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
         bridge = str(payload.get("bridge", "")).strip()
         if bridge and not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", bridge):
             raise ValidationError("Некорректное имя сетевого bridge")
@@ -1038,7 +1061,6 @@ class DashboardService:
         ]
         now = utc_now()
         requested_node = str(payload.get("node", "auto"))
-        owner = str(payload.get("owner", "Администратор"))
         workspace = self._workspace(payload.get("workspace"))
         # The stand, placeholder VM rows and addresses are committed together.
         # Concurrent requests therefore cannot reserve the same address.
@@ -1060,10 +1082,10 @@ class DashboardService:
                 """INSERT INTO stands
                 (name, blueprint_id, status, progress, node, pool_id, workspace, owner,
                  vm_count, cpu, ram, disk, ip_range, ip_start, check_status,
-                 expires_at, origin, created_at, updated_at)
-                VALUES (?, ?, 'provisioning', 4, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, 'idle', ?, ?, ?, ?)""",
+                 expires_at, duration_minutes, origin, created_at, updated_at)
+                VALUES (?, ?, 'provisioning', 4, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, 'idle', ?, ?, ?, ?, ?)""",
                 (name, blueprint_id, requested_node, pool_id, workspace, owner, vm_count,
-                 subnet, canonical_start, None,
+                 subnet, canonical_start, None, minutes,
                  "existing" if use_existing_pool else "deployed", now, now),
             )
             stand_id = int(cursor.lastrowid)
@@ -1494,6 +1516,16 @@ class DashboardService:
                     cleanup_error = f"; автоматический откат также завершился ошибкой: {exc}"
                 raise RuntimeError(f"Неполный результат развёртывания: {validation_error}{cleanup_error}")
             vms = normalized_vms
+            minutes = stand.get("duration_minutes")
+            tokens = {}
+            if minutes is not None:
+                for vm in vms:
+                    try:
+                        tokens[vm["vmid"]] = self.stand_timer.identity(vm)
+                    except Exception:
+                        # Never guess the identity later: a recycled VMID could
+                        # then bind a timer to another operator's guest.
+                        tokens[vm["vmid"]] = ""
             with self.store.transaction() as connection:
                 placeholder_rows = connection.execute(
                     "SELECT * FROM stand_vms WHERE stand_id = ? ORDER BY id", (stand_id,),
@@ -1574,14 +1606,22 @@ class DashboardService:
                              requested_interface.network.prefixlen, vm_index,
                              utc_now(), utc_now()),
                         )
-            primary_node = vms[0].get("node", "") if vms else ""
-            password_updated_at = utc_now() if any(vm.get("password") for vm in vms) else None
-            self.store.execute(
-                """UPDATE stands SET status = 'running', progress = 100, node = ?, cpu = 4.8,
-                ram = 8.2, last_error = '', password_updated_at = ?, expires_at = NULL,
-                updated_at = ? WHERE id = ?""",
-                (primary_node, password_updated_at, utc_now(), stand_id),
-            )
+                primary_node = vms[0].get("node", "") if vms else ""
+                password_updated_at = utc_now() if any(vm.get("password") for vm in vms) else None
+                if minutes is not None:
+                    for vm in vms:
+                        self.stand_timer.register(connection, stand_id, stand["pool_id"], vm, tokens[vm["vmid"]])
+                connection.execute(
+                    """UPDATE stands SET status = 'running', progress = 100, node = ?, cpu = 4.8,
+                    ram = 8.2, last_error = '', password_updated_at = ?, expires_at = ?,
+                    updated_at = ? WHERE id = ?""",
+                    (primary_node, password_updated_at, stand_deadline(minutes), utc_now(), stand_id),
+                )
+            if minutes is not None:
+                self.stand_timer.start()
+                if not all(tokens.values()):
+                    self.store.add_activity("power", "Не подтверждена идентичность VM",
+                        f"Стенд #{stand_id}: таймер не выключит неподтверждённые машины; проверьте UUID.", "warning")
             self.store.add_activity(
                 "deploy", "Стенд развёрнут", f"{stand['name']} · {vm_count} VM", "success", "Система",
             )
@@ -1732,6 +1772,10 @@ class DashboardService:
                 **self._operation_scope("power", stand.get("vms", []), vm_count=len(vmids)),
             ):
                 self.gateway.power_action(vmids, action)
+            # An explicit operator power action after expiry supersedes any
+            # pending retry for the old lease; never stop the newly started run.
+            if stand.get("duration_minutes") is not None and stand.get("expires_at") and stand["expires_at"] <= utc_now():
+                self.store.execute("UPDATE stand_timer_targets SET state='done' WHERE stand_id=? AND state='waiting'", (stand_id,))
             new_status = "stopped" if action == "stop" else "running"
             self.store.execute("UPDATE stands SET status = ?, cpu = ?, updated_at = ? WHERE id = ?", (new_status, 0 if new_status == "stopped" else max(float(stand["cpu"]), 7.2), utc_now(), stand_id))
             self.store.execute("UPDATE stand_vms SET status = ? WHERE stand_id = ?", (new_status, stand_id))

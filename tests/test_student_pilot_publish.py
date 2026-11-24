@@ -23,23 +23,23 @@ class PilotPublishTests(unittest.TestCase):
         self.sql = DashboardStore(self.db, seed_demo=False).execute
         self.sql("INSERT INTO blueprints(id,code,name,template_vmid,updated_at,created_at) VALUES(2,'pr1','pr1',276,'','')")
         self.sql("INSERT INTO stands(id,name,blueprint_id,status,pool_id,created_at,updated_at) VALUES(10,'pilot',2,'running','pilot01','','')")
-        self.sql("INSERT INTO stand_vms(id,stand_id,vmid,name,node,ip,status) VALUES(11,10,701,'clone','node1','10.10.13.40','running')")
+        self.sql("INSERT INTO stand_vms(id,stand_id,vmid,name,node,ip,status) VALUES(11,10,701,'clone','node1','10.39.13.40','running')")
         self.sql("""INSERT INTO ipam_reservations(stand_id,stand_vm_id,address,requested_cidr,prefix_length,vm_index,
-                 status,created_at,updated_at) VALUES(10,11,'10.10.13.40','10.10.13.40/24',24,1,'assigned','','')""")
+                 status,created_at,updated_at) VALUES(10,11,'10.39.13.40','10.39.13.40/16',16,1,'assigned','','')""")
         portal = StudentPortal(directory / "student-demo-state.db", lambda: [{
             "id":"lab-2-276", "title":"t", "description":"d", "template_name":"t", "template_vmid":276, "steps":["s"]}])
         token = portal.login("student01", "DemoLab01!")
         sid = portal.deploy(token, "lab-2-276")["id"]
         self.record = {"student_login":"student01", "stand_id":sid, "assignment_id":"lab-2-276",
-                       "deployer_stand_id":10, "guest_ipv4":"10.10.13.40", "pool_id":"pilot01"}
+                       "deployer_stand_id":10, "guest_ipv4":"10.39.13.40", "pool_id":"pilot01"}
         self.intent.write_text(json.dumps(self.record), encoding="utf-8")
         self.gateway = MagicMock(mode="live")
         self.gateway.pool_members.return_value = [{"vmid":701,"status":"running","node":"node1"}]
         self.iprow = {"ifname":"vmbr0","ifindex":3,"flags":["UP"],"operstate":"UP",
                       "address":"02:03:04:05:06:07",
-                      "addr_info":[{"family":"inet","scope":"global","local":"10.10.13.40"}]}
+                      "addr_info":[{"family":"inet","scope":"global","local":"10.39.13.40","prefixlen":16}]}
         self.digest = hashlib.sha256(b"expected-cert").hexdigest()
-        self.socket_output = "0 0 [::ffff:10.10.13.40]:8006 [::ffff:10.10.0.5]:43123"
+        self.socket_output = "0 0 [::ffff:10.39.13.40]:8006 [::ffff:10.10.0.5]:43123"
         self.gateway._guest_command.side_effect = self.guest
         net = patch.object(pilot.socket, "create_connection")
         self.net = net.start()
@@ -77,9 +77,9 @@ class PilotPublishTests(unittest.TestCase):
         self.assertEqual(json.loads(self.final.read_text()), {**self.record,"vmid":701})
         if os.name == "posix":
             self.assertEqual(self.final.stat().st_mode & 0o077, 0)
-        self.net.assert_called_once_with(("10.10.13.40",8006),timeout=4)
+        self.net.assert_called_once_with(("10.39.13.40",8006),timeout=4)
         request = self.tls.sendall.call_args.args[0]
-        self.assertTrue(request.startswith(b"GET / HTTP/1.1\r\nHost: 10.10.13.40:8006\r\n"))
+        self.assertTrue(request.startswith(b"GET / HTTP/1.1\r\nHost: 10.39.13.40:8006\r\n"))
         self.assertNotIn(b"Authorization:",request)
         self.assertNotIn(b"Cookie:",request)
         self.assertFalse(self.publish())
@@ -122,7 +122,7 @@ class PilotPublishTests(unittest.TestCase):
         self.tls.getpeercert.return_value = b"other-cert"
         self.assertFalse(self.publish())
         self.tls.getpeercert.return_value = b"expected-cert"
-        self.socket_output = "0 0 10.10.13.40:8006 10.10.0.5:43124"
+        self.socket_output = "0 0 10.39.13.40:8006 10.10.0.5:43124"
         self.assertFalse(self.publish())
         self.assertFalse(self.final.exists())
 

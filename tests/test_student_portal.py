@@ -98,6 +98,39 @@ class StudentPortalTests(unittest.TestCase):
         self.assertEqual(reopened.get_dashboard(token)["assignments"][0]["stand"], again)
         self.assertEqual(reopened.get_stand(token, again["id"])["assignment"]["title"], "Задание a")
 
+    def test_timed_demo_starts_at_readiness_and_renews_only_after_expiry(self):
+        token = self.user("1")
+        for bad in (0, True, -1, 10081, "1", 0.5):
+            self.check_status(400, self.portal.deploy, token, "b", bad)
+        first = self.portal.deploy(token, "b", 1)
+        self.assertEqual(first["duration_minutes"], 1)
+        self.clock += self.portal.DEPLOY_SECONDS + 59
+        reopened = self.reopen()
+        self.assertEqual(reopened.deploy(token, "b", 45)["id"], first["id"])
+        self.assertEqual(reopened.get_stand(token, first["id"])["stand"]["status"], "ready")
+        self.clock += 1
+        self.assertEqual(reopened.get_stand(token, first["id"])["stand"]["status"], "expired")
+        new = reopened.deploy(token, "b", 45)
+        self.assertNotEqual(new["id"], first["id"])
+        self.assertEqual(new["duration_minutes"], 45)
+        self.check_status(404, reopened.get_stand, token, first["id"])
+
+    def test_guest_actions_cannot_use_another_students_card_or_simulation(self):
+        token, stand_id, validator, cfg, binding = self.pilot_fixture()
+        grant, setter = Mock(), Mock()
+        self.portal._pilot_grant, self.portal._set_duration = grant, setter
+        with self.assertRaises(StudentError):
+            self.portal.guest_action(self.user("2"), stand_id, "credentials", {"access_code": "test"})
+        grant.for_student.assert_not_called()
+        ordinary = self.portal.deploy(token, "a")
+        self.check_status(404, self.portal.guest_action, token, ordinary["id"], "credentials", {"access_code": "test"})
+        grant.authorize.side_effect = StudentError(403, "Неверный код")
+        self.check_status(403, self.portal.guest_action, token, stand_id, "duration", {"access_code":"wrong", "duration_minutes": 40})
+        setter.assert_not_called()
+        grant.authorize.side_effect = None
+        self.portal.guest_action(token, stand_id, "duration", {"access_code":"test", "duration_minutes":40})
+        setter.assert_called_once_with(binding, 40)
+
     def test_concurrent_deployment_requests_share_one_persisted_stand(self):
         barrier = threading.Barrier(6)
         token = self.user("1")

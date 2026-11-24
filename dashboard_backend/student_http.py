@@ -50,6 +50,7 @@ class _LoginWindow:
 
 
 _logins = _LoginWindow()
+_grants = _LoginWindow(limit=15)
 
 
 def _header_values(headers, name):
@@ -145,7 +146,8 @@ def dispatch_student(handler, method, portal, *, secure_cookie=False) -> bool:
     tail = path[len(PREFIX):]
     deploy = re.fullmatch(r"/assignments/(" + RESOURCE_ID + r")/deploy", tail)
     detail = re.fullmatch(r"/stands/(" + RESOURCE_ID + r")", tail)
-    allowed = "POST" if tail in {"/login", "/logout"} or deploy else "GET" if tail == "/me" or detail else None
+    guest = re.fullmatch(r"/stands/(" + RESOURCE_ID + r")/(credentials|duration)", tail)
+    allowed = "POST" if tail in {"/login", "/logout"} or deploy or guest else "GET" if tail == "/me" or detail else None
     headers = []
     status = 200
     try:
@@ -157,7 +159,13 @@ def dispatch_student(handler, method, portal, *, secure_cookie=False) -> bool:
         if method == "POST":
             _check_origin(handler.headers, secure_cookie)
             data = _body(handler)
-            if tail != "/login" and data:
+            if guest:
+                fields = {"access_code", "duration_minutes"} if guest[2] == "duration" else {"access_code"}
+                if set(data) != fields or not isinstance(data["access_code"], str) or not 1 <= len(data["access_code"]) <= 128:
+                    raise StudentError(400, "Нужен персональный код доступа этой VM и корректные параметры")
+            elif deploy and set(data) <= {"duration_minutes"}:
+                pass
+            elif tail != "/login" and data:
                 raise StudentError(400, "Этой операции не нужны дополнительные параметры.")
         token = _token(handler.headers)
         if tail == "/login":
@@ -188,8 +196,16 @@ def dispatch_student(handler, method, portal, *, secure_cookie=False) -> bool:
             result = portal.get_dashboard(token)
         elif detail:
             result = portal.get_stand(token, detail[1])
+        elif guest:
+            peer = handler.client_address[0]
+            slot = _grants.reserve(peer)
+            if slot is None:
+                headers.append(("Retry-After", str(_grants.seconds)))
+                raise StudentError(429, "Слишком много попыток. Попробуйте через минуту.")
+            result = portal.guest_action(token, guest[1], guest[2], data)
+            _grants.success(peer, slot)
         else:
-            result = {"stand": portal.deploy(token, deploy[1])}
+            result = {"stand": portal.deploy(token, deploy[1], **data)}
     except StudentError as exc:
         status, result = exc.status, {"error": str(exc)}
     except Exception:

@@ -10,6 +10,7 @@ import shlex
 import threading
 import time
 import unicodedata
+import uuid
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
@@ -2361,12 +2362,35 @@ class LiveProxmoxGateway:
     def _locate_vm(self, vmid: int) -> str:
         return str(self._vm_inventory([vmid])[int(vmid)]["node"])
 
+    @staticmethod
+    def _timer_config_uuid(config: dict[str, Any]) -> str:
+        # A VMID and a name can both be reused. Pin the SMBIOS UUID of the
+        # original clone; never use the VMID alone for unattended power actions.
+        for field in str(config.get("smbios1") or "").split(","):
+            if field.startswith("uuid="):
+                identity = uuid.UUID(field[5:])
+                if identity.int:
+                    return str(identity)
+        raise ValueError("Не удалось подтвердить UUID виртуальной машины")
+
+    def timer_vm_uuid(self, vm: dict[str, Any]) -> str:
+        config = self.client.nodes(vm["node"]).qemu(int(vm["vmid"])).config.get()
+        if config.get("name") != vm["name"] or int(config.get("template") or 0):
+            raise ValueError("Изменилась виртуальная машина стенда")
+        return self._timer_config_uuid(config)
+
     def shutdown_idle_vm(self, vm: dict[str, Any]) -> None:
         node, vmid = vm["node"], int(vm["vmid"])
         api = self.client.nodes(node).qemu(vmid)
         config = api.config.get()
         if config.get("name") != vm["name"] or int(config.get("template") or 0) or config.get("lock"):
             raise RuntimeError(f"Нельзя выключить VM {vmid}: имя, тип VM или блокировка изменились")
+        if "timer_uuid" in vm:
+            if self._timer_config_uuid(config) != vm["timer_uuid"]:
+                raise ValueError("UUID изменился; выключение отменено")
+            if not any((m.get("vmid"), m.get("name"), m.get("node")) == (vmid, vm["name"], node)
+                       for m in self.pool_members(vm["timer_pool"])):
+                raise ValueError("VM больше не принадлежит исходному пулу")
         upid = api.status.shutdown.post(timeout=60, forceStop=0)
         if not upid:
             raise RuntimeError(f"Proxmox не подтвердил запуск выключения VM {vmid}")

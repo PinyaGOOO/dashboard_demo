@@ -20,11 +20,11 @@ class PilotIdentityTests(unittest.TestCase):
                     VALUES(42,'pilot',2,'running','pilot','deployed','',''),
                           (99,'other',2,'running','other','deployed','','')""")
         self.sql("""INSERT INTO stand_vms(id,stand_id,vmid,name,ip,status)
-                    VALUES(54,42,331,'mine','10.13.24.87','running')""")
+                    VALUES(54,42,331,'mine','10.39.24.87','running')""")
         self.sql("""INSERT INTO ipam_reservations(stand_id,stand_vm_id,address,requested_cidr,prefix_length,
-                    vm_index,status,created_at,updated_at) VALUES(42,54,'10.13.24.87','10.13.24.87/24',24,1,'assigned','','')""")
+                    vm_index,status,created_at,updated_at) VALUES(42,54,'10.39.24.87','10.39.24.87/16',16,1,'assigned','','')""")
         self.binding = dict(student_login="student01", assignment_id="lab-2-276", stand_id="7a"*12,
-                            deployer_stand_id=42, pool_id="pilot", vmid=331, guest_ipv4="10.13.24.87")
+                            deployer_stand_id=42, pool_id="pilot", vmid=331, guest_ipv4="10.39.24.87")
         self.valid = make_pilot_validator(self.path)
 
     def test_valid_and_never_accesses_secret_columns(self):
@@ -45,8 +45,8 @@ class PilotIdentityTests(unittest.TestCase):
         for field, wrong in (("student_login","student02"), ("assignment_id","lab-3-278"),
                              ("stand_id","bad"), ("vmid", True), ("vmid",276), ("vmid",332),
                              ("deployer_stand_id",99), ("deployer_stand_id",2**64), ("pool_id","pILOT"),
-                             ("guest_ipv4","10.13.24.88"), ("guest_ipv4","127.0.0.1"),
-                             ("guest_ipv4","10.13.24.87:8006"), ("guest_ipv4","::1")):
+                             ("guest_ipv4","10.39.24.88"), ("guest_ipv4","127.0.0.1"),
+                             ("guest_ipv4","10.39.24.87:8006"), ("guest_ipv4","::1")):
             with self.subTest(field=field,value=wrong):
                 self.assertFalse(self.valid({**self.binding, field: wrong}))
 
@@ -61,8 +61,8 @@ class PilotIdentityTests(unittest.TestCase):
             ("UPDATE ipam_reservations SET status='reserved'", "UPDATE ipam_reservations SET status='assigned'"),
             ("UPDATE ipam_reservations SET stand_id=99", "UPDATE ipam_reservations SET stand_id=42"),
             ("UPDATE ipam_reservations SET stand_vm_id=NULL", "UPDATE ipam_reservations SET stand_vm_id=54"),
-            ("UPDATE ipam_reservations SET address='10.13.24.88'", "UPDATE ipam_reservations SET address='10.13.24.87'"),
-            ("UPDATE stand_vms SET ip='10.13.24.88'", "UPDATE stand_vms SET ip='10.13.24.87'"),
+            ("UPDATE ipam_reservations SET address='10.39.24.88'", "UPDATE ipam_reservations SET address='10.39.24.87'"),
+            ("UPDATE stand_vms SET ip='10.39.24.88'", "UPDATE stand_vms SET ip='10.39.24.87'"),
             ("UPDATE stands SET pool_id='pilot' WHERE id=99", "UPDATE stands SET pool_id='other' WHERE id=99"),
         ):
             with self.subTest(sql=sql):
@@ -74,8 +74,8 @@ class PilotIdentityTests(unittest.TestCase):
         self.assertFalse(self.valid(self.binding))
 
     def test_duplicate_id_or_ip_in_inventory_including_cidr_is_ambiguous(self):
-        for stand, vm, ip in ((99,331,"10.13.24.200"), (99,775,"10.13.24.87"),
-                              (99,775,"10.13.24.87/24"), (42,775,"10.13.24.200")):
+        for stand, vm, ip in ((99,331,"10.39.24.200"), (99,775,"10.39.24.87"),
+                              (99,775,"10.39.24.87/24"), (42,775,"10.39.24.200")):
             with self.subTest(stand=stand, vm=vm, ip=ip):
                 row = self.sql("INSERT INTO stand_vms(stand_id,vmid,name,ip) VALUES(?,?,'other',?)", (stand,vm,ip))
                 self.assertFalse(self.valid(self.binding))

@@ -39,16 +39,18 @@ def _reply(h, method, status, body=b"", mime="text/plain", headers=()):
 class _LazyPortal:
     """The static page, unknown routes and unauthenticated reads never open a database."""
 
-    def __init__(self, db_path, catalog_path, example_if_missing, pilot_validator):
+    def __init__(self, db_path, catalog_path, example_if_missing, pilot_validator, pilot_grant, set_duration):
         self.db_path = Path(db_path)
         self.catalog_path = Path(catalog_path)
         self.example_if_missing = example_if_missing
         self.pilot_validator = pilot_validator
+        self.pilot_grant = pilot_grant
+        self.set_duration = set_duration
         self.instance = None
         self.lock = Lock()
 
     def __getattr__(self, name):
-        if name not in {"login", "logout", "get_dashboard", "deploy", "get_stand"}:
+        if name not in {"login", "logout", "get_dashboard", "deploy", "get_stand", "guest_action"}:
             raise AttributeError(name)
         with self.lock:
             if self.instance is None:
@@ -57,7 +59,7 @@ class _LazyPortal:
                         raise ValueError("Demo database and catalog must be different")
                     self.instance = StudentPortal(self.db_path, lambda: load_catalog(
                         self.catalog_path, example_if_missing=self.example_if_missing),
-                        pilot_validator=self.pilot_validator)
+                        pilot_validator=self.pilot_validator, pilot_grant=self.pilot_grant, set_duration=self.set_duration)
                 except (OSError, RuntimeError, SQLiteError, ValueError) as exc:
                     raise StudentError(503, "Хранилище демокабинета недоступно.") from exc
             return getattr(self.instance, name)
@@ -65,8 +67,9 @@ class _LazyPortal:
 
 class StudentMount:
     def __init__(self, db_path: Path, catalog_path: Path, *, secure_cookie: bool,
-                 example_if_missing: bool = True, pilot_validator: Callable[[dict], bool] | None = None):
-        self._portal = _LazyPortal(db_path, catalog_path, example_if_missing, pilot_validator)
+                 example_if_missing: bool = True, pilot_validator: Callable[[dict], bool] | None = None,
+                 pilot_grant=None, set_duration=None):
+        self._portal = _LazyPortal(db_path, catalog_path, example_if_missing, pilot_validator, pilot_grant, set_duration)
         self._secure_cookie = secure_cookie
 
     def handle(self, handler, method) -> bool:

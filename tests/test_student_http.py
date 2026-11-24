@@ -78,6 +78,18 @@ class HTTPTests(unittest.TestCase):
                                               token="t", headers=header)[0], 403)
         self.portal.deploy.assert_not_called()
 
+    def test_guest_code_only_in_scoped_post_no_cache_and_no_caller_selected_vm(self):
+        path = PREFIX + "/stands/abc/credentials"
+        self.portal.guest_action.return_value = {"username":"root@pam", "password":"fixture"}
+        self.assertEqual(self.request(path, "GET", token="s")[0],405)
+        self.assertEqual(self.request(path, "POST", data={"access_code":"X"})[0],401)
+        self.assertEqual(self.request(path, "POST", token="s", data={"access_code":"X","vmid":123})[0],400)
+        self.assertEqual(self.request(path, "POST", token="s", data={"access_code":"X"}, headers={"Origin":"https://wrong.example"})[0],403)
+        self.portal.guest_action.assert_not_called()
+        code, hdr, body = self.request(path,"POST", token="s", data={"access_code":"X"})
+        self.assertEqual((code,hdr["Cache-Control"],json.loads(body)["password"]), (200,"no-store","fixture"))
+        self.portal.guest_action.assert_called_once_with("s","abc","credentials",{"access_code":"X"})
+
     def test_only_scoped_session_cookie_authenticates(self):
         for hdr in [{"Authorization": "Bearer admin"}, {"X-Admin-Token": "admin"},
                     {"Cookie": f"{COOKIE}=a; {COOKIE}=b"}, {"Cookie": f"{COOKIE}=no+good"}]:

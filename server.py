@@ -16,6 +16,8 @@ from dashboard_backend.database import DashboardStore
 from dashboard_backend.proxmox_gateway import create_gateway
 from dashboard_backend.service import ConflictError, DashboardService, NotFoundError, ValidationError
 from dashboard_backend.student_mount import StudentMount
+from dashboard_backend.student_credentials import PilotCredentials
+from dashboard_backend.student_portal import StudentError
 from dashboard_backend.student_pilot_validation import make_pilot_validator
 
 
@@ -30,6 +32,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
     service: DashboardService
     admin_token: str
     student_mount: StudentMount | None = None
+    pilot_grant: PilotCredentials | None = None
 
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, directory=str(WEB_ROOT), **kwargs)
@@ -182,14 +185,24 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             elif len(parts) == 4 and parts[:2] == ["api", "stands"] and parts[3] == "relief-candidates" and method == "GET":
                 self._json(self.service.relief_candidates(int(parts[2])))
             elif len(parts) == 4 and parts[:2] == ["api", "stands"] and parts[3] == "credentials" and method == "GET":
-                self._json(self.service.stand_credentials(int(parts[2])))
+                result = self.service.stand_credentials(int(parts[2]))
+                if self.pilot_grant:
+                    for vm in result["credentials"]:
+                        code = self.pilot_grant.operator_code(int(parts[2]), vm.get("vmid"))
+                        if code:
+                            vm["student_access_code"] = code
+                self._json(result)
             elif len(parts) == 6 and parts[:2] == ["api", "stands"] and parts[3] == "vms" and parts[5] == "actions" and method == "POST":
                 body = self._body()
                 action = str(body.get("action", ""))
                 status = HTTPStatus.ACCEPTED if action in {"run_check", "rollback_start", "snapshot"} else HTTPStatus.OK
                 self._json(self.service.vm_action(int(parts[2]), int(parts[4]), action, body), status)
             elif len(parts) == 6 and parts[:2] == ["api", "stands"] and parts[3] == "vms" and parts[5] == "credentials" and method == "GET":
-                self._json(self.service.vm_credentials(int(parts[2]), int(parts[4])))
+                result = self.service.vm_credentials(int(parts[2]), int(parts[4]))
+                code = self.pilot_grant.operator_code(int(parts[2]), int(parts[4])) if self.pilot_grant else None
+                if code:
+                    result["student_access_code"] = code
+                self._json(result)
             elif parts == ["api", "checks"] and method == "GET":
                 self._json(self.service.list_checks())
             elif parts == ["api", "checks", "run"] and method == "POST":
@@ -232,15 +245,26 @@ def main() -> None:
     student_db = admin_db.with_name("student-demo-state.db")
     if admin_db == student_db.resolve():
         parser.error("Для административной базы и студенческого демо нужны разные файлы")
-    DashboardHandler.student_mount = StudentMount(
-        student_db, admin_db.with_name("student-demo-catalog.json"),
-        secure_cookie=gateway.mode == "live", example_if_missing=gateway.mode == "demo",
-        pilot_validator=make_pilot_validator(admin_db) if gateway.mode == "live" else None,
-    )
     store = DashboardStore(admin_db, seed_demo=gateway.mode == "demo")
     service = DashboardService(store, gateway)
     DashboardHandler.service = service
     DashboardHandler.admin_token = os.environ.get("DASHBOARD_ADMIN_TOKEN", "")
+    grant = PilotCredentials(admin_db, DashboardHandler.admin_token) if gateway.mode == "live" and DashboardHandler.admin_token else None
+    DashboardHandler.pilot_grant = grant
+
+    def set_student_duration(binding, minutes):
+        try:
+            return service.set_stand_duration(binding["deployer_stand_id"], minutes,
+                expected_vmid=binding["vmid"], expected_pool=binding["pool_id"], expected_ip=binding["guest_ipv4"])
+        except (ConflictError, ValidationError, NotFoundError):
+            raise StudentError(409, "Не удалось назначить срок: проверьте состояние стенда и наличие активного таймера") from None
+
+    DashboardHandler.student_mount = StudentMount(
+        student_db, admin_db.with_name("student-demo-catalog.json"),
+        secure_cookie=gateway.mode == "live", example_if_missing=gateway.mode == "demo",
+        pilot_validator=make_pilot_validator(admin_db) if gateway.mode == "live" else None,
+        pilot_grant=grant, set_duration=set_student_duration if grant else None,
+    )
     mimetypes.add_type("application/javascript", ".js")
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
     print(f"DemoExam Control Center: http://{args.host}:{args.port}")

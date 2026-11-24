@@ -13,7 +13,10 @@ import stat
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
+
+from .student_network import STUDENT_NETWORK
 
 
 class StudentError(Exception):
@@ -31,9 +34,10 @@ _ACCOUNTS = {
                   "3c5b33aaa5ff044e6004fa20c00ff66eb6096442543f04898eb4c76004cc789f"),
 }
 _APP_ID = 0x53545544  # STUD: never initialize in someone else's SQLite database.
-_PRIVATE_NETS = tuple(map(ipaddress.IPv4Network, ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")))
 _BINDING_FIELDS = {"student_login", "assignment_id", "stand_id", "guest_ipv4", "vmid",
                    "deployer_stand_id", "pool_id"}
+_STANDS = """SELECT s.*, t.duration_minutes FROM student_stands s
+             LEFT JOIN student_demo_leases t ON t.stand_id=s.id"""
 
 
 def _binding(path: Path, *, pending: bool = False) -> dict | None:
@@ -60,7 +64,7 @@ def _binding(path: Path, *, pending: bool = False) -> dict | None:
             or value["pool_id"] in {".", ".."} or not isinstance(value["guest_ipv4"], str)):
         return None
     ip = ipaddress.IPv4Address(value["guest_ipv4"])
-    if str(ip) != value["guest_ipv4"] or not any(ip in net for net in _PRIVATE_NETS):
+    if str(ip) != value["guest_ipv4"] or ip not in STUDENT_NETWORK or ip in (STUDENT_NETWORK.network_address, STUDENT_NETWORK.broadcast_address):
         return None
     return value
 
@@ -84,12 +88,14 @@ class StudentPortal:
     DEPLOY_SECONDS = 8
 
     def __init__(self, db_path: str | Path, catalog: Callable[[], list[dict]], *, clock=time.time,
-                 pilot_validator: Callable[[dict], bool] | None = None):
+                 pilot_validator: Callable[[dict], bool] | None = None, pilot_grant=None, set_duration=None):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._catalog = catalog
         self._clock = clock
         self._pilot_validator = pilot_validator
+        self._pilot_grant = pilot_grant
+        self._set_duration = set_duration
         try:
             fd = os.open(self.db_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
@@ -108,11 +114,17 @@ class StudentPortal:
             db.execute("""CREATE TABLE IF NOT EXISTS student_stands (
                 id TEXT PRIMARY KEY, login TEXT NOT NULL, assignment_id TEXT NOT NULL,
                 task_json TEXT NOT NULL, started REAL NOT NULL, UNIQUE(login, assignment_id))""")
+            # The previous release inserts all five columns positionally. Keep
+            # that schema intact so an application rollback can still create labs.
+            db.execute("""CREATE TABLE IF NOT EXISTS student_demo_leases (
+                stand_id TEXT PRIMARY KEY REFERENCES student_stands(id) ON DELETE CASCADE,
+                duration_minutes INTEGER NOT NULL CHECK (duration_minutes BETWEEN 1 AND 10080))""")
 
     @contextmanager
     def _db(self) -> Iterator[sqlite3.Connection]:
         db = sqlite3.connect(self.db_path, timeout=10)
         db.row_factory = sqlite3.Row
+        db.execute("PRAGMA foreign_keys=ON")
         try:
             with db:
                 yield db
@@ -177,7 +189,34 @@ class StudentPortal:
             selected = keys[1:3] + keys[4::2]
         return {key: unique[key] for key in selected}
 
-    def _stand(self, row: sqlite3.Row) -> dict:
+    @staticmethod
+    def _duration(value):
+        if value is not None and (type(value) is not int or not 1 <= value <= 10080):
+            raise StudentError(400, "Укажите целое число минут от 1 до 10080 или выберите бессрочный режим")
+        return value
+
+    @staticmethod
+    def _matches(binding, row):
+        return binding and all(binding[k] == row[col] for k, col in (
+            ("student_login", "login"), ("assignment_id", "assignment_id"), ("stand_id", "id")))
+
+    def _owned_binding(self, row):
+        if self._pilot_validator is not None:
+            try:
+                binding = _binding(self.db_path.with_name("student-pilot.json"))
+                if self._matches(binding, row):
+                    return binding
+            except (OSError, ValueError, RecursionError):
+                pass
+        return None
+
+    def _verified(self, binding):
+        try:
+            return self._pilot_validator(binding) is True
+        except Exception:
+            return False
+
+    def _stand(self, row: sqlite3.Row, *, detail=False) -> dict:
         elapsed = max(0.0, self._clock() - row["started"])
         progress = min(100, int(elapsed / self.DEPLOY_SECONDS * 100))
         if progress == 100:
@@ -188,15 +227,37 @@ class StudentPortal:
             phase = "Готовим учебную среду"
         else:
             phase = "Создаём персональный стенд"
-        return {"id": row["id"], "name": f"{row['login']}-{row['id'][:8]}",
-                "status": "ready" if progress == 100 else "provisioning",
-                "progress": progress, "phase": phase}
+        status = "ready" if progress == 100 else "provisioning"
+        minutes = row["duration_minutes"]
+        deadline = row["started"] + self.DEPLOY_SECONDS + minutes*60 if minutes else None
+        stand = {"id": row["id"], "name": f"{row['login']}-{row['id'][:8]}", "status": status,
+                 "progress": progress, "phase": phase, "duration_minutes": minutes,
+                 "expires_at": datetime.fromtimestamp(deadline, timezone.utc).isoformat() if deadline else None}
+        binding = self._owned_binding(row)
+        if binding:
+            lease = self._pilot_grant.lease(binding) if self._pilot_grant is not None else None
+            if lease:
+                stand.update(actual_lease=lease, duration_minutes=lease["duration_minutes"], expires_at=lease["expires_at"])
+                if lease["status"] in ("expired", "stopped"):
+                    stand.update(status=lease["status"], phase="Срок истёк" if lease["status"] == "expired" else "Остановлен")
+                    return stand
+            if detail and status == "ready" and self._verified(binding):
+                stand["access"] = {"kind": "proxmox", "url": f"https://{binding['guest_ipv4']}:8006/",
+                                   "vmid": binding["vmid"], "login": "root@pam"}
+                return stand
+            if lease or not detail:
+                return stand
+        if self._pilot_validator is not None and detail and self._matches(read_pilot_request(self.db_path.with_name("student-pilot-request.json")), row):
+            stand["pilot_pending"] = True
+        elif deadline and self._clock() >= deadline:
+            stand.update(status="expired", phase="Срок истёк")
+        return stand
 
     def get_dashboard(self, token: str | None) -> dict:
         with self._db() as db:
             login = self._student(db, token)
             tasks = {key: dict(task, stand=None) for key, task in self._assigned(login).items()}
-            rows = db.execute("SELECT * FROM student_stands WHERE login=? ORDER BY started, id", (login,))
+            rows = db.execute(_STANDS + " WHERE s.login=? ORDER BY s.started, s.id", (login,))
             for row in rows:
                 # Stands retain the exact assignment and template they started
                 # with, even when a teacher removes/edits the catalogue entry.
@@ -205,45 +266,52 @@ class StudentPortal:
         return {"student": {"login": login, "name": name, "group": group},
                 "assignments": list(tasks.values())}
 
-    def deploy(self, token: str | None, assignment_id: str) -> dict:
+    def deploy(self, token: str | None, assignment_id: str, duration_minutes=None) -> dict:
+        self._duration(duration_minutes)
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             login = self._student(db, token)
-            row = db.execute("SELECT * FROM student_stands WHERE login=? AND assignment_id=?",
+            row = db.execute(_STANDS + " WHERE s.login=? AND s.assignment_id=?",
                              (login, assignment_id)).fetchone()
+            if row is not None and self._stand(row)["status"] == "expired" and not self._owned_binding(row):
+                intent = read_pilot_request(self.db_path.with_name("student-pilot-request.json"))
+                if not self._matches(intent, row):
+                    db.execute("DELETE FROM student_stands WHERE id=? AND login=?", (row["id"], login))
+                    row = None
             if row is None:
                 task = self._assigned(login).get(assignment_id)
                 if task is None:
                     raise StudentError(404, "Задание не найдено")
                 stand_id = secrets.token_hex(12)
-                db.execute("INSERT INTO student_stands VALUES (?,?,?,?,?)",
+                db.execute("INSERT INTO student_stands (id,login,assignment_id,task_json,started) VALUES (?,?,?,?,?)",
                            (stand_id, login, assignment_id, json.dumps(task, ensure_ascii=False), self._clock()))
-                row = db.execute("SELECT * FROM student_stands WHERE id=? AND login=?", (stand_id, login)).fetchone()
+                if duration_minutes is not None:
+                    db.execute("INSERT INTO student_demo_leases VALUES (?,?)", (stand_id,duration_minutes))
+                row = db.execute(_STANDS + " WHERE s.id=? AND s.login=?", (stand_id, login)).fetchone()
             return self._stand(row)
 
-    def get_stand(self, token: str | None, stand_id: str) -> dict:
+    def _own_row(self, token, stand_id):
         with self._db() as db:
             login = self._student(db, token)
-            row = db.execute("SELECT * FROM student_stands WHERE id=? AND login=?", (stand_id, login)).fetchone()
+            row = db.execute(_STANDS + " WHERE s.id=? AND s.login=?", (stand_id, login)).fetchone()
             if row is None:
                 raise StudentError(404, "Стенд не найден")
-        stand = self._stand(row)
-        assignment = dict(json.loads(row["task_json"]), stand=dict(stand))
-        if self._pilot_validator is not None and stand["status"] == "ready":
-            try:
-                binding = _binding(self.db_path.with_name("student-pilot.json"))
-                if (binding and binding["student_login"] == login
-                        and binding["stand_id"] == row["id"] and binding["assignment_id"] == row["assignment_id"]
-                        and self._pilot_validator(dict(binding)) is True):
-                    stand["access"] = {"kind": "proxmox", "url": f"https://{binding['guest_ipv4']}:8006/",
-                                       "vmid": binding["vmid"], "login": "root@pam"}
-            except Exception:
-                # A missing/malformed binding or unavailable validator must never turn a
-                # guessed, stale, or reassigned IP into a clickable sign-in destination.
-                pass
-        if self._pilot_validator is not None and "access" not in stand:
-            intent = read_pilot_request(self.db_path.with_name("student-pilot-request.json"))
-            if (intent and intent["student_login"] == login and intent["stand_id"] == row["id"]
-                    and intent["assignment_id"] == row["assignment_id"]):
-                stand["pilot_pending"] = True
+        return row
+
+    def get_stand(self, token, stand_id):
+        row = self._own_row(token, stand_id)
+        stand = self._stand(row, detail=True)
+        assignment = dict(json.loads(row["task_json"]), stand={k:v for k,v in stand.items() if k not in ("access", "pilot_pending")})
         return {"stand": stand, "assignment": assignment}
+
+    def guest_action(self, token, stand_id, action, data):
+        binding = self._owned_binding(self._own_row(token, stand_id))
+        if not binding or self._pilot_grant is None:
+            raise StudentError(404, "Доступ к реальному стенду не настроен")
+        if action == "credentials":
+            return self._pilot_grant.for_student(binding, data["access_code"])
+        if action != "duration" or self._set_duration is None:
+            raise StudentError(404, "Операция недоступна")
+        minutes = self._duration(data["duration_minutes"])
+        self._pilot_grant.authorize(binding, data["access_code"])
+        return self._set_duration(binding, minutes)

@@ -113,6 +113,7 @@ class DashboardStore:
             check_status TEXT NOT NULL DEFAULT 'idle',
             last_check TEXT,
             expires_at TEXT,
+            duration_minutes INTEGER,
             password_updated_at TEXT,
             origin TEXT NOT NULL DEFAULT 'deployed',
             last_error TEXT NOT NULL DEFAULT '',
@@ -173,6 +174,23 @@ class DashboardStore:
             FOREIGN KEY (stand_id) REFERENCES stands(id) ON DELETE CASCADE,
             FOREIGN KEY (stand_vm_id) REFERENCES stand_vms(id) ON DELETE SET NULL
         );
+        -- Only guests registered by an explicitly timed deployment are eligible.
+        -- Do not rebuild this allowlist from current pool membership on restart.
+        CREATE TABLE IF NOT EXISTS stand_timer_targets (
+            stand_id INTEGER NOT NULL REFERENCES stands(id) ON DELETE CASCADE,
+            vmid INTEGER NOT NULL,
+            vm_row_id INTEGER NOT NULL,
+            pool_id TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            vm_name TEXT NOT NULL,
+            guest_uuid TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'waiting',
+            next_try INTEGER NOT NULL DEFAULT 0,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (stand_id, vmid)
+        );
+        CREATE INDEX IF NOT EXISTS idx_timer_due ON stand_timer_targets(state, next_try);
         CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             stand_id INTEGER NOT NULL,
@@ -230,6 +248,8 @@ class DashboardStore:
                 connection.execute("ALTER TABLE stands ADD COLUMN ip_start TEXT NOT NULL DEFAULT ''")
             if "workspace" not in stand_columns:
                 connection.execute("ALTER TABLE stands ADD COLUMN workspace TEXT NOT NULL DEFAULT 'demoexam'")
+            if "duration_minutes" not in stand_columns:
+                connection.execute("ALTER TABLE stands ADD COLUMN duration_minutes INTEGER")
             vm_columns = {row[1] for row in connection.execute("PRAGMA table_info(stand_vms)")}
             if "credential_username" not in vm_columns:
                 connection.execute("ALTER TABLE stand_vms ADD COLUMN credential_username TEXT NOT NULL DEFAULT 'root'")
@@ -259,7 +279,7 @@ class DashboardStore:
             )
             # Stands are intentionally persistent.  Clear legacy TTL values so
             # upgraded installations do not keep showing or enforcing expiry.
-            connection.execute("UPDATE stands SET expires_at = NULL WHERE expires_at IS NOT NULL")
+            connection.execute("UPDATE stands SET expires_at = NULL WHERE duration_minutes IS NULL AND expires_at IS NOT NULL")
 
     def _backfill_ipam(self) -> None:
         """Adopt addresses from installations created before IPAM existed.

@@ -15,6 +15,7 @@ from contextlib import closing
 from http.client import HTTPResponse
 from pathlib import Path
 
+from .student_network import STUDENT_NETWORK
 from .student_pilot_validation import make_pilot_validator
 from .student_portal import read_pilot_request
 
@@ -50,12 +51,11 @@ def _active_iface(row):
 
 def _guest_mac(get, ip):
     rows = json.loads(get(["ip", "-j", "-4", "addr", "show"]))
-    matches = [r for r in rows if _active_iface(r) and any(
-        a.get("family") == "inet" and a.get("local") == ip and a.get("scope") == "global"
-        for a in r.get("addr_info", []))]
-    if len(matches) != 1:
+    matches = [(r, a) for r in rows if _active_iface(r) for a in r.get("addr_info", [])
+               if a.get("family") == "inet" and a.get("local") == ip and a.get("scope") == "global"]
+    if len(matches) != 1 or matches[0][1].get("prefixlen") != STUDENT_NETWORK.prefixlen:
         return None
-    row = matches[0]
+    row, _ = matches[0]
     mac = row.get("address", "")
     if not mac:  # Some iproute2 builds omit link-layer fields with -4.
         links = json.loads(get(["ip", "-j", "link", "show"]))
