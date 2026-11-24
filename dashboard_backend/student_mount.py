@@ -1,4 +1,5 @@
 """Mount the self-contained student demo in either Deployer or the standalone server."""
+from collections.abc import Callable
 from pathlib import Path
 from sqlite3 import Error as SQLiteError
 from threading import Lock
@@ -38,10 +39,11 @@ def _reply(h, method, status, body=b"", mime="text/plain", headers=()):
 class _LazyPortal:
     """The static page, unknown routes and unauthenticated reads never open a database."""
 
-    def __init__(self, db_path, catalog_path, example_if_missing):
+    def __init__(self, db_path, catalog_path, example_if_missing, pilot_validator):
         self.db_path = Path(db_path)
         self.catalog_path = Path(catalog_path)
         self.example_if_missing = example_if_missing
+        self.pilot_validator = pilot_validator
         self.instance = None
         self.lock = Lock()
 
@@ -54,7 +56,8 @@ class _LazyPortal:
                     if self.db_path.resolve() == self.catalog_path.resolve():
                         raise ValueError("Demo database and catalog must be different")
                     self.instance = StudentPortal(self.db_path, lambda: load_catalog(
-                        self.catalog_path, example_if_missing=self.example_if_missing))
+                        self.catalog_path, example_if_missing=self.example_if_missing),
+                        pilot_validator=self.pilot_validator)
                 except (OSError, RuntimeError, SQLiteError, ValueError) as exc:
                     raise StudentError(503, "Хранилище демокабинета недоступно.") from exc
             return getattr(self.instance, name)
@@ -62,8 +65,8 @@ class _LazyPortal:
 
 class StudentMount:
     def __init__(self, db_path: Path, catalog_path: Path, *, secure_cookie: bool,
-                 example_if_missing: bool = True):
-        self._portal = _LazyPortal(db_path, catalog_path, example_if_missing)
+                 example_if_missing: bool = True, pilot_validator: Callable[[dict], bool] | None = None):
+        self._portal = _LazyPortal(db_path, catalog_path, example_if_missing, pilot_validator)
         self._secure_cookie = secure_cookie
 
     def handle(self, handler, method) -> bool:

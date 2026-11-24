@@ -70,13 +70,13 @@
       <details><summary>Условия задания</summary><ol class="steps">${a.steps.map(step => `<li>${esc(step)}</li>`).join("")}</ol></details>
       <div class="actionbox"><div class="progress-wrap" hidden><span data-phase></span><progress max="100" value="0" aria-label="Подготовка стенда"></progress></div>
       <button type="button" class="button primary" data-deploy>Развернуть стенд</button>
-      <a class="button primary" data-open-stand hidden>Открыть стенд <span aria-hidden="true">→</span></a></div></article>`;
+      <a class="button primary" data-open-stand hidden>Открыть карточку стенда</a></div></article>`;
   }
-  function updateStatus(root, stand) {
+  function updateStatus(root, stand, readyLabel = "Карточка готова") {
     const status = $("[data-status]",root), progress = $("progress",root), wrap = progress.parentElement;
     const ready = stand?.status === "ready", working = stand?.status === "provisioning";
     status.className = `status ${ready ? "ready" : working ? "provisioning" : ""}`;
-    status.textContent = ready ? "● Стенд готов" : working ? "◌ Идёт подготовка" : "Стенд не создан";
+    status.textContent = ready ? readyLabel : working ? "Идёт подготовка карточки" : "Карточка не создана";
     wrap.hidden = !working;
     if (working) {
       const percent = Math.max(0,Math.min(100,Number(stand.progress) || 0));
@@ -89,7 +89,7 @@
       page = "assignments"; current = null; document.title = "Мои задания · Deployer";
       view.innerHTML = `<section class="hero"><p class="eyebrow">Кабинет студента / ${esc(student.group)}</p><h1>Мои <span class="accent">задания.</span></h1>
         <p class="lead">${esc(student.name)}, выберите практическую работу. Стенд будет закреплён за вашим профилем и этим заданием.</p>
-        <div class="hero-stats"><span>Назначено заданий: <strong>${assignments.length}</strong></span><span>Стенды готовы: <strong id="ready-count">0</strong></span></div></section>
+        <div class="hero-stats"><span>Назначено заданий: <strong>${assignments.length}</strong></span><span>Карточки готовы: <strong id="ready-count">0</strong></span></div></section>
         <div class="section-head"><h2>Практические работы</h2></div>
         ${assignments.length ? `<section class="assignment-grid" aria-label="Список заданий">${assignments.map(card).join("")}</section>` : `<div class="empty">Пока у вас нет назначенных работ.</div>`}`;
     }
@@ -104,24 +104,51 @@
       if (!link.hidden) link.href = `#stands/${encodeURIComponent(s.id)}`;
     });
   }
+  function proxmoxAccess(access) {
+    // Links are assigned by the server, never built from the template VMID or the route hash.
+    if (access?.kind !== "proxmox" || access.login !== "root@pam" || !Number.isInteger(access.vmid)
+        || access.vmid < 100 || access.vmid > 999999999 || typeof access.url !== "string") return null;
+    const match = /^https:\/\/(\d{1,3}(?:\.\d{1,3}){3}):8006\/$/.exec(access.url);
+    if (!match) return null;
+    const ip = match[1], parts = ip.split(".").map(Number);
+    if (parts.some(n => n > 255) || parts.join(".") !== ip || !(parts[0] === 10
+        || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) || (parts[0] === 192 && parts[1] === 168))) return null;
+    return {url:`https://${ip}:8006/`, ip, login:access.login, vmid:access.vmid};
+  }
   function standPage(result) {
-    const a = result.assignment, s = result.stand, key = `stand:${s.id}`;
+    const a = result.assignment, s = result.stand, access = proxmoxAccess(s.access);
+    const pendingPilot = !access && s.pilot_pending === true;
+    const key = `stand:${s.id}:${access?.url || (pendingPilot ? "pending" : "demo")}:${access?.vmid || ""}`;
     if (page !== key) {
       page = key; document.title = `${s.name} · Практикум`;
       const marked = marks.get(String(s.id)) || new Set();
       view.innerHTML = `<nav class="crumbs" aria-label="Навигация"><a href="#assignments">← Мои задания</a><span>/</span><span>Стенд</span></nav>
-        <header class="hero"><p class="eyebrow">Практикум / Персональный стенд</p><h1>${esc(s.name)}</h1><p class="lead">${esc(student.name)} · ${esc(student.group)}</p></header>
+        <header class="hero"><p class="eyebrow">Практикум / ${access || pendingPilot ? "Персональный Proxmox" : "Демостенд"}</p><h1>${esc(s.name)}</h1><p class="lead">${esc(student.name)} · ${esc(student.group)}</p>
+        ${access ? `<div class="guest-launch"><a class="button primary" data-open-proxmox href="${esc(access.url)}" target="_blank" rel="noopener noreferrer" aria-describedby="guest-target">Открыть мой Proxmox</a>
+        <span id="guest-target">В новой вкладке · <bdi class="mono">${esc(access.ip)}:8006</bdi></span></div>` : ""}</header>
         <div class="stand-grid"><article class="sheet"><p class="eyebrow">Приложенное задание</p><h2>${esc(a.title)}</h2><p class="brief">${esc(a.description)}</p>
         <h3>Порядок работы</h3><div class="checklist">${a.steps.map((step,i) => `<label><input type="checkbox" data-step="${i}" ${marked.has(i) ? "checked" : ""}><span>${esc(step)}</span></label>`).join("")}</div>
         <p class="check-hint">Это личные заметки: отметки сохраняются в этой вкладке до обновления страницы или выхода.</p>
         <button type="button" id="download-assignment" class="button secondary">Скачать задание (.txt)</button></article>
-        <aside class="stand-panel"><p class="eyebrow">Среда</p><h2>Учебный стенд</h2><dl>
-        <div><dt>Статус</dt><dd data-status></dd></div><div><dt>Шаблон</dt><dd>${esc(a.template_name)}</dd></div>
+        <aside class="stand-panel"><p class="eyebrow">Среда</p><h2>${access || pendingPilot ? "Вход в Proxmox" : "Учебный симулятор"}</h2><dl>
+        <div><dt>Статус</dt><dd data-status></dd></div>
+        ${access ? `<div><dt>IP вашей VM</dt><dd class="mono">${esc(access.ip)}</dd></div><div><dt>Логин Proxmox</dt><dd class="mono">${esc(access.login)}</dd></div>
+        <div><dt>VMID вашей VM</dt><dd>${esc(access.vmid)}</dd></div>` : ""}
+        <div><dt>Шаблон</dt><dd>${esc(a.template_name)}</dd></div>
         <div><dt>VMID шаблона</dt><dd>${esc(a.template_vmid)}</dd></div><div><dt>Владелец</dt><dd>${esc(student.login)}</dd></div></dl>
         <div class="stand-progress" hidden><span data-phase></span><progress max="100" value="0" aria-label="Подготовка стенда"></progress></div>
-        <p class="stand-note">Это симулятор развёртывания. Виртуальная машина в Proxmox не создаётся; консоль и сетевые сервисы здесь не запущены.</p></aside></div>`;
+        <p class="stand-note">${access ? "Пароль от VM выдаёт преподаватель отдельно. Пароль демопрофиля для входа в Proxmox не подходит."
+          : pendingPilot ? "Реальный стенд заказан. Ссылка появится здесь после готовности VM и проверки доступа. Обновлять страницу не нужно."
+          : "Работайте с заданием в этой карточке. Сейчас в ней нет доступа к реальной VM. Если для практики нужен Proxmox, обратитесь к преподавателю."}</p></aside></div>`;
     }
-    current = result; updateStatus($(".stand-panel"),s);
+    current = result;
+    const panel = $(".stand-panel");
+    if (pendingPilot) {
+      const status = $("[data-status]",panel); status.className = "status provisioning"; status.textContent = "Ожидает запуска Proxmox";
+      $(".stand-progress",panel).hidden = true;
+    } else {
+      updateStatus(panel,s,access ? "Реальная VM привязана" : "Демо готово");
+    }
   }
   const routeId = () => {
     const match = /^#stands\/([^/]+)$/.exec(location.hash);
@@ -129,7 +156,10 @@
   };
   function schedule() {
     clearTimeout(timer);
-    if (!document.hidden && student && (page.startsWith("stand:") ? current?.stand.status === "provisioning" : page === "assignments" && assignments.some(a => a.stand?.status === "provisioning"))) {
+    if (document.hidden || !student) return;
+    if (page.startsWith("stand:") && current?.stand.pilot_pending === true && !proxmoxAccess(current.stand.access)) {
+      timer = setTimeout(() => refresh(), 10000);
+    } else if (page.startsWith("stand:") ? current?.stand.status === "provisioning" : page === "assignments" && assignments.some(a => a.stand?.status === "provisioning")) {
       timer = setTimeout(() => refresh(), 1250);
     }
   }
@@ -152,7 +182,7 @@
       } else {
         const structure = list => JSON.stringify(list.map(({stand,...rest}) => rest));
         dashboard(structure(old) !== structure(assignments));
-        if (old.some(a => a.stand?.status === "provisioning" && assignments.some(x => x.id === a.id && x.stand?.status === "ready"))) announce("Ваш стенд готов.");
+        if (old.some(a => a.stand?.status === "provisioning" && assignments.some(x => x.id === a.id && x.stand?.status === "ready"))) announce("Карточка стенда готова.");
       }
       warn(""); schedule();
     } catch (error) {

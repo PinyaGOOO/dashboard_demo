@@ -16,6 +16,7 @@ from dashboard_backend.database import DashboardStore
 from dashboard_backend.proxmox_gateway import create_gateway
 from dashboard_backend.service import ConflictError, DashboardService, NotFoundError, ValidationError
 from dashboard_backend.student_mount import StudentMount
+from dashboard_backend.student_pilot_validation import make_pilot_validator
 
 
 ROOT = Path(__file__).resolve().parent
@@ -234,6 +235,7 @@ def main() -> None:
     DashboardHandler.student_mount = StudentMount(
         student_db, admin_db.with_name("student-demo-catalog.json"),
         secure_cookie=gateway.mode == "live", example_if_missing=gateway.mode == "demo",
+        pilot_validator=make_pilot_validator(admin_db) if gateway.mode == "live" else None,
     )
     store = DashboardStore(admin_db, seed_demo=gateway.mode == "demo")
     service = DashboardService(store, gateway)

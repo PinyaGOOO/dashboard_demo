@@ -1,12 +1,15 @@
-"""Isolated, simulated student labs. This module has no Proxmox or dashboard DB access."""
+"""Student lab state. A verified operator binding may expose a guest URL, never cluster access."""
 from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
+import re
 import secrets
 import sqlite3
+import stat
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -28,17 +31,65 @@ _ACCOUNTS = {
                   "3c5b33aaa5ff044e6004fa20c00ff66eb6096442543f04898eb4c76004cc789f"),
 }
 _APP_ID = 0x53545544  # STUD: never initialize in someone else's SQLite database.
+_PRIVATE_NETS = tuple(map(ipaddress.IPv4Network, ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")))
+_BINDING_FIELDS = {"student_login", "assignment_id", "stand_id", "guest_ipv4", "vmid",
+                   "deployer_stand_id", "pool_id"}
+
+
+def _binding(path: Path, *, pending: bool = False) -> dict | None:
+    """Read one bounded, operator-owned binding. Re-read every time so revocation is immediate."""
+    if path.is_symlink():
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    with os.fdopen(os.open(path, flags), "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_size > 4096 or
+                (os.name == "posix" and (info.st_mode & 0o022 or info.st_uid not in (0, os.geteuid())))):
+            return None
+        raw = stream.read(4097)
+    if len(raw) > 4096:
+        return None
+    value = json.loads(raw.decode("utf-8"))
+    required = _BINDING_FIELDS - {"vmid"} if pending else _BINDING_FIELDS
+    if not isinstance(value, dict) or set(value) != required:
+        return None
+    if not pending and (type(value["vmid"]) is not int or not 100 <= value["vmid"] <= 999999999):
+        return None
+    if (type(value["deployer_stand_id"]) is not int or not 0 < value["deployer_stand_id"] <= 2**63 - 1
+            or not isinstance(value["pool_id"], str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", value["pool_id"])
+            or value["pool_id"] in {".", ".."} or not isinstance(value["guest_ipv4"], str)):
+        return None
+    ip = ipaddress.IPv4Address(value["guest_ipv4"])
+    if str(ip) != value["guest_ipv4"] or not any(ip in net for net in _PRIVATE_NETS):
+        return None
+    return value
+
+
+def read_pilot_request(path: Path) -> dict | None:
+    """Read the ops-only intent, never a source of access URLs or authorization."""
+    try:
+        value = _binding(path, pending=True)
+        if (not value or not isinstance(value["student_login"], str) or value["student_login"] not in _ACCOUNTS
+                or not isinstance(value["stand_id"], str) or not re.fullmatch(r"[a-f0-9]{24}", value["stand_id"])
+                or not isinstance(value["assignment_id"], str)
+                or not re.fullmatch(r"[A-Za-z0-9_:-][A-Za-z0-9._:-]{0,127}", value["assignment_id"])):
+            return None
+        return value
+    except (OSError, ValueError, RecursionError):
+        return None
 
 
 class StudentPortal:
     SESSION_TTL = 8 * 3600
     DEPLOY_SECONDS = 8
 
-    def __init__(self, db_path: str | Path, catalog: Callable[[], list[dict]], *, clock=time.time):
+    def __init__(self, db_path: str | Path, catalog: Callable[[], list[dict]], *, clock=time.time,
+                 pilot_validator: Callable[[dict], bool] | None = None):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._catalog = catalog
         self._clock = clock
+        self._pilot_validator = pilot_validator
         try:
             fd = os.open(self.db_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
@@ -176,5 +227,23 @@ class StudentPortal:
             row = db.execute("SELECT * FROM student_stands WHERE id=? AND login=?", (stand_id, login)).fetchone()
             if row is None:
                 raise StudentError(404, "Стенд не найден")
-            stand = self._stand(row)
-            return {"stand": stand, "assignment": dict(json.loads(row["task_json"]), stand=stand)}
+        stand = self._stand(row)
+        assignment = dict(json.loads(row["task_json"]), stand=dict(stand))
+        if self._pilot_validator is not None and stand["status"] == "ready":
+            try:
+                binding = _binding(self.db_path.with_name("student-pilot.json"))
+                if (binding and binding["student_login"] == login
+                        and binding["stand_id"] == row["id"] and binding["assignment_id"] == row["assignment_id"]
+                        and self._pilot_validator(dict(binding)) is True):
+                    stand["access"] = {"kind": "proxmox", "url": f"https://{binding['guest_ipv4']}:8006/",
+                                       "vmid": binding["vmid"], "login": "root@pam"}
+            except Exception:
+                # A missing/malformed binding or unavailable validator must never turn a
+                # guessed, stale, or reassigned IP into a clickable sign-in destination.
+                pass
+        if self._pilot_validator is not None and "access" not in stand:
+            intent = read_pilot_request(self.db_path.with_name("student-pilot-request.json"))
+            if (intent and intent["student_login"] == login and intent["stand_id"] == row["id"]
+                    and intent["assignment_id"] == row["assignment_id"]):
+                stand["pilot_pending"] = True
+        return {"stand": stand, "assignment": assignment}

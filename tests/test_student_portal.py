@@ -1,12 +1,14 @@
 import concurrent.futures
+import json
 import sqlite3
 import tempfile
 import threading
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import Mock
 
-from dashboard_backend.student_portal import StudentError, StudentPortal
+from dashboard_backend.student_portal import StudentError, StudentPortal, read_pilot_request
 
 
 def task(key, vmid):
@@ -118,3 +120,94 @@ class StudentPortalTests(unittest.TestCase):
         with closing(sqlite3.connect(foreign)) as db:
             self.assertEqual(db.execute("PRAGMA application_id").fetchone()[0], 0)
             self.assertEqual(db.execute("SELECT name FROM sqlite_master").fetchall(), [("blueprints",)])
+
+    def pilot_fixture(self):
+        validator = Mock(return_value=True)
+        self.portal = StudentPortal(self.path, lambda: self.tasks, clock=lambda: self.clock,
+                                    pilot_validator=validator)
+        token = self.user("1")
+        stand_id = self.portal.deploy(token, "b")["id"]
+        binding = dict(student_login="student01", assignment_id="b", stand_id=stand_id,
+                       deployer_stand_id=17, pool_id="pilot-one", guest_ipv4="10.39.11.15", vmid=350)
+        config = self.path.with_name("student-pilot.json")
+        config.write_text(json.dumps(binding), encoding="utf-8")
+        self.clock += self.portal.DEPLOY_SECONDS
+        return token, stand_id, validator, config, binding
+
+    def test_pilot_shows_only_verified_guest_url_to_owner_on_detail(self):
+        token, stand_id, validator, config, binding = self.pilot_fixture()
+        self.assertNotIn("access", self.portal.deploy(token, "b"))
+        self.assertNotIn("access", self.portal.get_dashboard(token)["assignments"][1]["stand"])
+        peer = self.user("2")
+        self.check_status(404, self.portal.get_stand, peer, stand_id)
+        peer_stand = self.portal.deploy(peer, "b")
+        self.clock += self.portal.DEPLOY_SECONDS
+        self.assertNotIn("access", self.portal.get_stand(peer, peer_stand["id"])["stand"])
+        validator.assert_not_called()
+        detail = self.portal.get_stand(token, stand_id)
+        self.assertEqual(detail["stand"]["access"], {
+            "kind": "proxmox", "url": "https://10.39.11.15:8006/", "vmid": 350, "login": "root@pam"})
+        self.assertNotIn("access", detail["assignment"]["stand"])
+        validator.assert_called_once_with(binding)
+        config.unlink()
+        self.assertNotIn("access", self.portal.get_stand(token, stand_id)["stand"])
+        validator.assert_called_once()
+
+    def test_pilot_requires_live_validator_and_exact_binding(self):
+        token, stand_id, validator, config, binding = self.pilot_fixture()
+        for field, invalid in [
+                ("student_login", "student02"), ("assignment_id", "unknown"), ("stand_id", "unrelated"),
+                ("vmid", True), ("vmid", 1), ("vmid", 10**10), ("deployer_stand_id", 0), ("pool_id", "../admin"),
+                ("guest_ipv4", "localhost"), ("guest_ipv4", "127.0.0.1"), ("guest_ipv4", "169.254.169.254"),
+                ("guest_ipv4", "https://10.1.1.1:8006/"), ("guest_ipv4", "8.8.8.8"), ("guest_ipv4", "::1"),
+                ("guest_ipv4", "10.1.1.1@cluster.local"), ("password", "must-not-leak")]:
+            with self.subTest(field=field, invalid=invalid):
+                config.write_text(json.dumps({**binding, field: invalid}), encoding="utf-8")
+                self.assertNotIn("access", self.portal.get_stand(token, stand_id)["stand"])
+        for raw in ("{", "[]", " " * 4100, '{"guest_ipv4":"172.16.0.1"}'):
+            config.write_text(raw, encoding="utf-8")
+            self.assertNotIn("access", self.portal.get_stand(token, stand_id)["stand"])
+        validator.assert_not_called()
+        config.write_text(json.dumps(binding), encoding="utf-8")
+        self.assertNotIn("access", self.reopen().get_stand(token, stand_id)["stand"])
+        validator.return_value = False
+        self.assertNotIn("access", self.portal.get_stand(token, stand_id)["stand"])
+        validator.return_value = 1
+        self.assertNotIn("access", self.portal.get_stand(token, stand_id)["stand"])
+        validator.side_effect = RuntimeError("private internal issue")
+        self.assertNotIn("access", self.portal.get_stand(token, stand_id)["stand"])
+
+    def test_pilot_request_private_pending_then_verified_access(self):
+        token, stand_id, validator, config, binding = self.pilot_fixture()
+        config.unlink()
+        request = {k: v for k, v in binding.items() if k != "vmid"}
+        path = config.with_name("student-pilot-request.json")
+        path.write_text(json.dumps(request), encoding="utf-8")
+        self.assertEqual(read_pilot_request(path), request)
+        before = self.reopen().get_stand(token, stand_id)["stand"]
+        self.assertNotIn("pilot_pending", before)  # standalone never advertises a real pilot
+        self.assertEqual(self.portal.get_stand(token, stand_id)["stand"], dict(before, pilot_pending=True))
+        peer = self.user("2")
+        self.check_status(404, self.portal.get_stand, peer, stand_id)
+        own = self.portal.deploy(peer, "b")
+        self.assertNotIn("pilot_pending", self.portal.get_stand(peer, own["id"])["stand"])
+        self.assertNotIn("pilot_pending", self.portal.get_dashboard(token)["assignments"][1]["stand"])
+        validator.assert_not_called()
+        config.write_text(json.dumps(binding), encoding="utf-8")
+        validator.return_value = False
+        self.assertEqual(self.portal.get_stand(token, stand_id)["stand"], dict(before, pilot_pending=True))
+        validator.return_value = True
+        now = self.portal.get_stand(token, stand_id)["stand"]
+        self.assertNotIn("pilot_pending", now)
+        self.assertEqual(now["access"]["vmid"], binding["vmid"])
+        config.unlink()
+        for key, wrong in [("student_login", "student02"), ("stand_id", "5"*24), ("assignment_id", "other")]:
+            path.write_text(json.dumps({**request, key: wrong}), encoding="utf-8")
+            self.assertEqual(self.portal.get_stand(token, stand_id)["stand"], before)
+        for wrong in [binding, {**request, "student_login": []}, {**request, "guest_ipv4": "8.8.8.8"},
+                      {**request, "stand_id": "bad"}, {**request, "pool_id": ""}, {}]:
+            path.write_text(json.dumps(wrong), encoding="utf-8")
+            self.assertIsNone(read_pilot_request(path))
+            self.assertEqual(self.portal.get_stand(token, stand_id)["stand"], before)
+        path.unlink()
+        self.assertIsNone(read_pilot_request(path))

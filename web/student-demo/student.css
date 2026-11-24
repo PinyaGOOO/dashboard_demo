@@ -24,3 +24,4 @@ h1,h2,h3,p,ol,dl{margin:0}h1,h2,h3{font-weight:750;line-height:1.12;letter-spaci
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important}}
 #main:focus{outline:none}
 .assignment-grid{align-items:stretch}.assignment{display:flex;flex-direction:column}.assignment .actionbox{margin-top:auto}
+.guest-launch{display:flex;flex-wrap:wrap;align-items:center;gap:.6rem 1rem;margin-top:1.35rem}.guest-launch span{font-size:.9rem;color:var(--muted)}

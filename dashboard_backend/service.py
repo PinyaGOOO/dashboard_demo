@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
 from . import deploy_relief
+from .student_pilot_publish import publish_pilot_if_ready
 from .consumer_monitor import ConsumerMonitor
 from .database import DashboardStore, utc_now
 from .operation_queue import DeploymentCapacityBlocked, ProxmoxOperationQueue
@@ -1584,6 +1585,10 @@ class DashboardService:
             self.store.add_activity(
                 "deploy", "Стенд развёрнут", f"{stand['name']} · {vm_count} VM", "success", "Система",
             )
+            # Only an explicit operator enrollment can link a real guest to the
+            # student preview. Publishing never changes this deployment's result.
+            if getattr(self.gateway, "mode", "") == "live":
+                publish_pilot_if_ready(self.store.db_path, self.gateway, stand_id)
         except Exception as exc:
             heartbeat_stop.set()
             if heartbeat_thread and heartbeat_thread.is_alive():
