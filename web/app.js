@@ -4,7 +4,7 @@
   const app = document.querySelector("#app");
   const modalRoot = document.querySelector("#modal-root");
   const toastRoot = document.querySelector("#toast-root");
-  const routes = ["overview", "stands", "blueprints", "checks", "ipam", "infrastructure", "consumers"];
+  const routes = ["overview", "stands", "blueprints", "checks", "ipam", "infrastructure", "consumers", "student-accounts"];
   const workspaces = [
     { id: "demoexam", name: "Демоэкзамен" },
     { id: "mdk02.01", name: "МДК02.01" },
@@ -132,6 +132,7 @@ exit 75`;
     ipam: "IPAM",
     infrastructure: "Инфраструктура",
     consumers: "Потребители ресурсов",
+    "student-accounts": "Учётки студентов",
   };
   const statusLabels = {
     running: "Работает", stopped: "Остановлен", provisioning: "Развёртывается", resetting: "Восстанавливается",
@@ -159,6 +160,7 @@ exit 75`;
   };
   let activeModalToken = 0;
   let disposeModalContent = null;
+  let studentDirectory = null;
   let modalReturnFocus = null;
   let pendingAdminTokenFinish = null;
   let standDetailPollTimer = null;
@@ -1069,8 +1071,8 @@ exit 75`;
   }
 
   function render() {
-    if (!state.data && state.route !== "consumers") {
-      if (app.querySelector("#consumer-page")) app.innerHTML = '<p class="muted-block">Загрузка данных…</p>';
+    if (!state.data && !["consumers","student-accounts"].includes(state.route)) {
+      if (!app.firstElementChild || app.querySelector("#consumer-page")) app.innerHTML = '<p class="muted-block">Загрузка данных…</p>';
       return;
     }
     document.querySelector("#page-title").textContent = routeTitles[state.route];
@@ -1079,7 +1081,7 @@ exit 75`;
       link.classList.toggle("is-active", active);
       if (active) link.setAttribute("aria-current", "page"); else link.removeAttribute("aria-current");
     });
-    const renderers = { overview: renderOverview, stands: renderStands, blueprints: renderBlueprints, checks: renderChecks, ipam: renderIpam, infrastructure: renderInfrastructure, consumers: renderConsumers };
+    const renderers = { overview: renderOverview, stands: renderStands, blueprints: renderBlueprints, checks: renderChecks, ipam: renderIpam, infrastructure: renderInfrastructure, consumers: renderConsumers, "student-accounts": renderStudentAccounts };
     renderers[state.route]();
     updateShell();
     syncQueuePolling();
@@ -1142,7 +1144,7 @@ exit 75`;
         updateShell();
       } else render();
     } catch (error) {
-      if (!state.data && state.route !== "consumers") {
+      if (!state.data && !["consumers","student-accounts"].includes(state.route)) {
         app.innerHTML = `<section class="page"><div class="load-error">${icon("alert")}<h2>Не удалось загрузить дашборд</h2><p>${escapeHtml(error.message)}</p><button class="button button--primary" data-refresh>${icon("refresh")}Повторить</button></div></section>`;
       } else if (!silent) toast(error.message, "error");
     } finally {
@@ -1218,6 +1220,7 @@ exit 75`;
         if (token.length < 12) return;
         localStorage.setItem("demoops.adminToken", token);
         clearConsumerReport();
+        resetStudentDirectory();
         finish(token);
         if (manual) toast("Административный токен сохранён");
       });
@@ -1226,20 +1229,27 @@ exit 75`;
       modalRoot.querySelector("#remove-admin-token")?.addEventListener("click", () => {
         localStorage.removeItem("demoops.adminToken");
         clearConsumerReport();
+        resetStudentDirectory();
         finish(null);
         toast("Локальный административный токен удалён", "warning");
       });
     });
   }
 
-  function openStudentAccounts(sessionToken = "") {
-    closeSidebar();
-    showModal({title:"Учётки студентов", subtitle:"Управление доступом в учебный кабинет", size:"wide",
-      body:'<div class="student-admin" data-student-admin></div>',
-      footer:'<button class="button" type="button" data-close-modal>Закрыть</button>'});
-    const panel = modalRoot.querySelector("[data-student-admin]");
-    let token = sessionToken || localStorage.getItem("demoops.adminToken") || "", search = "", offset = 0, seq = 0, rows = [];
-    sessionToken = "";
+  function clearStudentDirectory() {
+    studentDirectory?.dispose();
+    studentDirectory = null;
+  }
+  function resetStudentDirectory() {
+    clearStudentDirectory();
+    if (state.route === "student-accounts") renderStudentAccounts();
+  }
+  function renderStudentAccounts() {
+    if (studentDirectory) return; // A bootstrap refresh must not erase a form or a one-time password.
+    app.innerHTML = `<section class="page student-directory">${pageHeader("Учётки студентов","Доступ к учебному кабинету: выдача учёток, восстановление пароля и история входов.","","Обучение")}
+      <div class="card"><div class="card__body student-admin" data-student-admin></div></div></section>`;
+    const panel = app.querySelector("[data-student-admin]");
+    let token = localStorage.getItem("demoops.adminToken") || "", search = "", sort = "group", offset = 0, seq = 0, rows = [];
     let closed = false, read = null;
     const limit = 50, $ = selector => panel.querySelector(selector);
     const el = (name, callback) => $(name)?.addEventListener("click", callback);
@@ -1247,36 +1257,43 @@ exit 75`;
       "reset-password": ["Сменить пароль", "Старый пароль перестанет работать, а открытые сессии учебного кабинета завершатся. Новый пароль будет показан один раз."],
       block: ["Заблокировать", "Студент потеряет доступ к кабинету, а открытые сессии кабинета завершатся."],
       unblock: ["Разблокировать", "Студент снова сможет войти в кабинет со своим текущим паролем. Старые сессии не восстановятся."],
-      "revoke-sessions": ["Завершить сессии", "Студенту придётся войти в учебный кабинет заново. Пароль останется прежним."]
+      "revoke-sessions": ["Завершить сессии", "Студенту придётся войти в учебный кабинет заново. Пароль останется прежним."],
+      delete: ["Удалить учётку", "Учётка и её история входов будут удалены без возможности восстановления. Все сеансы кабинета завершатся. Логин не будет выдан другому студенту. Сам стенд останется в Proxmox."]
     };
     const vmNotice = "Эти действия не останавливают VM, не меняют её пароль и не завершают отдельный вход в Proxmox.";
     function wipe() { panel.querySelectorAll("[data-batch-secret]").forEach(field => { field.value = ""; }); }
-    disposeModalContent = () => { closed = true; ++seq; read?.abort(); token = ""; rows = []; wipe(); panel.replaceChildren(); };
-    function template(html) { wipe(); panel.innerHTML = html; }
+    studentDirectory = {
+      dispose() { closed = true; ++seq; read?.abort(); token = ""; rows = []; wipe(); panel.closest(".student-directory")?.remove(); },
+      refresh() { if ($("[data-roster-results]")) list(); else if ($("[data-login-history]")) $("[data-history-refresh]")?.click(); }
+    };
+    function template(html) { ++seq; read?.abort(); read = null; wipe(); panel.innerHTML = html; }
     const banner = msg => msg ? `<p class="alert alert--info" role="status">${escapeHtml(msg)}</p>` : "";
     const batchButton = '<button type="button" class="button button--primary" data-create-student-batch>Создать учётки группы</button>';
     function unlock(message = "") {
       token = ""; rows = [];
       template(`<form class="student-admin-section" data-roster-unlock><label class="field"><span class="field-label">Токен администратора</span><input class="input mono" type="password" name="token" required autocomplete="off" data-batch-secret><small>Введите токен для просмотра списка. Он не сохранится в браузере.</small></label>
         ${banner(message)}<div class="student-admin-tools"><button class="button" type="submit">Открыть список</button>${batchButton}</div></form>`);
-      el("[data-create-student-batch]", () => openStudentBatch($("[data-roster-unlock]").elements.token.value.trim()));
+      el("[data-create-student-batch]", () => { token = $("[data-roster-unlock]").elements.token.value.trim(); openStudentBatch(); });
       $("[data-roster-unlock]").onsubmit = event => { event.preventDefault(); token = event.target.elements.token.value.trim(); if (token) list(); };
     }
     const timestamp = value => value ? new Date(value * 1000).toLocaleString("ru-RU",{dateStyle:"short",timeStyle:"short"}) : "—";
     function list(message = "") {
-      read?.abort(); read = new AbortController();
-      const id = ++seq; rows = [];
-      template(`<div class="student-admin-tools"><form data-roster-search role="search"><label class="field"><span class="field-label">Найти студента</span><input name="search" class="input" type="search" maxlength="80" placeholder="Логин или группа" value="${escapeHtml(search)}"></label><button class="button" type="submit">Найти</button></form>${batchButton}</div>
+      rows = [];
+      template(`<div class="student-admin-tools"><form data-roster-search role="search"><label class="field"><span class="field-label">Найти студента</span><input name="search" class="input" type="search" maxlength="80" placeholder="Логин или группа" value="${escapeHtml(search)}"></label><button class="button" type="submit">Найти</button></form>
+        <label class="field student-directory-sort"><span class="field-label">Сортировка</span><select class="input" data-roster-sort><option value="group">Группа: А–Я</option><option value="group-desc">Группа: Я–А</option><option value="login">Логин: А–Я</option></select></label>${batchButton}</div>
         ${banner(message)}<div data-roster-results aria-live="polite">Загружаем список…</div>`);
-      el("[data-create-student-batch]", () => openStudentBatch(token));
+      const id = seq; read = new AbortController();
+      const order = $("[data-roster-sort]"); order.value = sort;
+      order.onchange = () => { sort = order.value; search = $("[data-roster-search]").elements.search.value.trim(); offset = 0; list(); };
+      el("[data-create-student-batch]", openStudentBatch);
       $("[data-roster-search]").onsubmit = event => { event.preventDefault(); search = event.target.elements.search.value.trim(); offset = 0; list(); };
-      const params = new URLSearchParams({search, offset:String(offset), limit:String(limit)});
+      const params = new URLSearchParams({search, sort, offset:String(offset), limit:String(limit)});
       api("/api/student-accounts?" + params,{promptAdmin:false,headers:{"X-Admin-Token":token},signal:read.signal}).then(data => {
         if (closed || id !== seq) return;
         rows = data.accounts;
         if (!rows.length && offset && offset >= data.total) { offset = Math.max(0, Math.floor((data.total-1)/limit)*limit); return list(message); }
         const result = $("[data-roster-results]");
-        result.innerHTML = `${rows.length ? `<ul class="student-admin-rows">${rows.map((r,i) => `<li><div><strong class="mono">${escapeHtml(r.login)}</strong><small>${escapeHtml(r.group || "Без группы")}</small></div><span class="student-account-status ${r.blocked ? "is-blocked" : ""}">${r.blocked ? "Заблокирована" : "Активна"}</span><button class="button" data-manage-student="${i}" type="button" aria-label="Управлять: ${escapeHtml(r.login)}">Управлять</button></li>`).join("")}</ul>` : '<p>Учётные записи не найдены.</p>'}
+        result.innerHTML = `${rows.length ? `<div class="directory-columns" aria-hidden="true"><span>Логин</span><span>Группа</span><span>Статус</span><span></span></div><ul class="student-admin-rows">${rows.map((r,i) => `<li><strong class="mono">${escapeHtml(r.login)}</strong><span class="directory-group">${escapeHtml(r.group || "Без группы")}</span><span class="student-account-status ${r.blocked ? "is-blocked" : ""}">${r.blocked ? "Заблокирована" : "Активна"}</span><button class="button" data-manage-student="${i}" type="button" aria-label="Управлять: ${escapeHtml(r.login)}">Управлять</button></li>`).join("")}</ul>` : '<p>Учётные записи не найдены.</p>'}
           <div class="student-admin-page"><span>${rows.length ? `${offset+1}–${offset+rows.length} из ` : 'Всего: '}${Number(data.total)}</span>
           <button type="button" class="button" data-roster-prev ${offset ? "" : "disabled"}>Назад</button><button type="button" class="button" data-roster-next ${offset+rows.length < data.total ? "" : "disabled"}>Далее</button></div>`;
         result.querySelectorAll("[data-manage-student]").forEach(btn => btn.onclick = () => details(rows[Number(btn.dataset.manageStudent)]));
@@ -1290,28 +1307,56 @@ exit 75`;
     }
     const back = '<button class="button" type="button" data-roster-back>К списку</button>';
     function details(account) {
-      const actions = ["reset-password", account.blocked ? "unblock" : "block", "revoke-sessions"];
+      const actions = ["reset-password", account.blocked ? "unblock" : "block", "revoke-sessions", "delete"];
       template(`<div>${back}</div><div class="student-admin-section"><h3 class="mono">${escapeHtml(account.login)}</h3>
         <dl class="student-account-info"><dt>Группа</dt><dd>${escapeHtml(account.group || "Без группы")}</dd><dt>Учётная запись</dt><dd>${account.blocked ? "Заблокирована" : "Активна"}</dd>
         <dt>Создана</dt><dd>${timestamp(account.created)}</dd><dt>Последний вход</dt><dd>${timestamp(account.last_login)}</dd></dl>
-        <div class="student-admin-tools">${actions.map(key => `<button type="button" class="button" data-account-action="${key}">${instructions[key][0]}</button>`).join("")}</div><p>${vmNotice}</p></div>`);
+        <div class="student-admin-tools"><button type="button" class="button" data-account-history>История входов</button>${actions.map(key => `<button type="button" class="button ${key === "delete" ? "button--danger" : ""}" data-account-action="${key}">${instructions[key][0]}</button>`).join("")}</div><p>${vmNotice}</p></div>`);
       el("[data-roster-back]", () => list());
+      el("[data-account-history]", () => history(account));
       panel.querySelectorAll("[data-account-action]").forEach(btn => btn.onclick = () => confirmAction(account, btn.dataset.accountAction));
+    }
+    async function history(account) {
+      template(`<div><button type="button" class="button" data-history-back>К учётке</button></div><div class="student-admin-section"><h3>История входов: <span class="mono">${escapeHtml(account.login)}</span></h3><p>До 50 последних успешных входов в учебный кабинет. Для входов до обновления мог сохраниться только последний. Входы в Proxmox здесь не учитываются.</p>
+        <div data-login-history aria-live="polite">Загружаем историю…</div><div><button type="button" class="button" data-history-refresh>Обновить историю</button></div></div>`);
+      el("[data-history-back]", () => details(account)); el("[data-history-refresh]", () => history(account));
+      const id = seq; read = new AbortController();
+      try {
+        const data = await api(`/api/student-accounts/${encodeURIComponent(account.login)}/history`, {promptAdmin:false, headers:{"X-Admin-Token":token},signal:read.signal});
+        if (closed || seq !== id) return;
+        if (data.login !== account.login || !Array.isArray(data.entries)) throw new Error();
+        $("[data-login-history]").innerHTML = data.entries.length
+          ? `<ol class="student-history-list">${data.entries.map(({at}) => `<li><time datetime="${new Date(at*1000).toISOString()}">${timestamp(at)}</time><span>Успешный вход</span></li>`).join("")}</ol>`
+          : "Успешных входов пока не зафиксировано.";
+      } catch (error) {
+        if (closed || seq !== id) return;
+        if ([401,403].includes(error.status)) return unlock("Не удалось подтвердить права администратора.");
+        if (error.status === 404) return list("Учётная запись больше не доступна.");
+        $("[data-login-history]").textContent = "Не удалось загрузить историю. Попробуйте обновить её.";
+      }
     }
     function confirmAction(account, action) {
       const [label, hint] = instructions[action];
+      const deleting = action === "delete";
       template(`<div class="student-admin-section"><h3>${label}: <span class="mono">${escapeHtml(account.login)}</span>?</h3><p>${hint}</p><p>${vmNotice}</p>
-        <div class="student-admin-tools"><button type="button" class="button" data-account-cancel>Отмена</button><button type="button" class="button button--primary" data-account-confirm>${label}</button></div><p role="status" data-action-status></p></div>`);
+        ${deleting ? `<label class="field"><span class="field-label">Для удаления введите логин ${escapeHtml(account.login)}</span><input class="input mono" data-confirm-login autocomplete="off" autocapitalize="none" spellcheck="false"></label>` : ""}
+        <div class="student-admin-tools"><button type="button" class="button" data-account-cancel>Отмена</button><button type="button" class="button ${deleting ? "button--danger" : "button--primary"}" data-account-confirm ${deleting ? "disabled" : ""}>${label}</button></div><p role="status" data-action-status></p></div>`);
       el("[data-account-cancel]", () => details(account));
-      $("[data-account-cancel]").focus();
+      const nameInput = $("[data-confirm-login]");
+      if (nameInput) nameInput.oninput = () => { $("[data-account-confirm]").disabled = nameInput.value !== account.login; };
+      (nameInput || $("[data-account-cancel]")).focus();
       el("[data-account-confirm]", async event => {
-        if (event.currentTarget.disabled) return;
+        if (event.currentTarget.disabled || (deleting && nameInput.value !== account.login)) return;
         event.currentTarget.disabled = true; $("[data-account-cancel]").disabled = true;
+        if (nameInput) nameInput.disabled = true;
+        const id = seq;
         $("[data-action-status]").textContent = "Сохраняем изменение…";
         try {
-          const data = await api(`/api/student-accounts/${encodeURIComponent(account.login)}/${action}`,{method:"POST",promptAdmin:false,headers:{"X-Admin-Token":token},body:{version:account.version}});
-          if (closed) return;
-          if (action !== "reset-password") return list(`Учётка ${account.login}: ${{block:"заблокирована",unblock:"разблокирована","revoke-sessions":"сессии завершены"}[action]}.`);
+          const body = {version:account.version};
+          if (deleting) body.confirm_login = nameInput.value;
+          const data = await api(`/api/student-accounts/${encodeURIComponent(account.login)}/${action}`,{method:"POST",promptAdmin:false,headers:{"X-Admin-Token":token},body});
+          if (closed || seq !== id) return;
+          if (action !== "reset-password") return list(`Учётка ${account.login}: ${{block:"заблокирована",unblock:"разблокирована","revoke-sessions":"сессии завершены",delete:"удалена"}[action]}.`);
           if (!data.password || typeof data.password !== "string") throw new Error("Нет пароля в ответе");
           template(`<div class="student-admin-section"><h3>Новый пароль для <span class="mono">${escapeHtml(account.login)}</span></h3><p>Скопируйте и передайте пароль студенту лично. После ухода с этой страницы посмотреть его ещё раз нельзя.</p>
             <label class="field"><span class="field-label">Новый пароль кабинета</span><input class="input mono" data-reset-secret data-batch-secret readonly autocomplete="off" spellcheck="false"></label>
@@ -1323,7 +1368,7 @@ exit 75`;
           });
           el("[data-roster-back]", () => list());
         } catch (error) {
-          if (closed) return;
+          if (closed || seq !== id) return;
           if ([401,403].includes(error.status)) return unlock("Доступ не подтверждён. Войдите заново и проверьте состояние учётки.");
           const status = error.status === 409 ? "Данные учётки изменились. Вернитесь к списку и проверьте её состояние." :
             (error.status === 404 ? "Учётка больше не доступна." : "Результат операции не подтверждён. Проверьте учётку перед новой попыткой.");
@@ -1331,77 +1376,76 @@ exit 75`;
         }
       });
     }
-    if (token) list(); else unlock();
-  }
 
-  function openStudentBatch(sessionToken = "") {
-    closeSidebar();
-    const saved = Boolean(sessionToken || localStorage.getItem("demoops.adminToken"));
-    showModal({title:"Учётки студентов", subtitle:"Выдача доступов на группу", body:`<form id="student-batch" class="student-batch-form">
-      <p>Каждый студент получит отдельный логин и пароль. Виртуальная машина развернётся только по запросу из личного кабинета.</p>
-      <label class="field"><span class="field-label">Группа</span><input class="input" name="group" required placeholder="Например, ДЭ-24" maxlength="80"></label>
-      <div class="form-grid"><label class="field"><span class="field-label">Количество учёток</span><input class="input" name="count" type="number" min="1" max="100" step="1" value="20" required><small>От 1 до 100 за один раз.</small></label>
-      <label class="field"><span class="field-label">Начало логина</span><input class="input mono" name="prefix" value="student" required maxlength="16" pattern="[a-z]([a-z0-9]|-){0,15}" title="До 16 знаков: строчные латинские буквы, цифры и дефис. Начните с буквы." spellcheck="false" autocapitalize="none"><small>Например, student или mdk. Номер добавится автоматически.</small></label></div>
-      <label class="field" data-batch-token-field ${saved ? "hidden" : ""}><span class="field-label">Токен администратора</span><input class="input mono" name="token" type="password" autocomplete="off" data-batch-secret ${saved ? "" : "required"}><small>Введённый здесь токен не сохраняется.</small></label>
-      <div class="alert alert--info">${icon("info")}Пароли будут показаны один раз. Скопируйте список перед закрытием окна и передайте каждому студенту только его строку.</div>
-      <p data-batch-status role="status" hidden></p></form>`,
-      footer:`<button class="button" type="button" data-batch-back>К списку</button><button class="button button--primary" type="submit" form="student-batch">${icon("users")}Создать учётки</button>`});
-    const form = modalRoot.querySelector("#student-batch"), modalId = activeModalToken;
-    const send = modalRoot.querySelector('[form="student-batch"]'), status = form.querySelector("[data-batch-status]");
-    const previous = modalRoot.querySelector("[data-batch-back]");
-    previous.onclick = () => openStudentAccounts(sessionToken);
-    disposeModalContent = () => { sessionToken = ""; form.elements.token.value = ""; };
-    const setStatus = text => { status.hidden = false; status.textContent = text; };
-    form.addEventListener("submit", async event => {
-      event.preventDefault();
-      if (send.disabled || !form.reportValidity()) return;
-      const fields = form.elements;
-      const token = fields.token.value.trim() || sessionToken || localStorage.getItem("demoops.adminToken");
-      if (!token) {
-        form.querySelector("[data-batch-token-field]").hidden = false;
-        fields.token.required = true; fields.token.focus(); return;
-      }
-      send.disabled = true; previous.disabled = true; fields.token.value = "";
-      setStatus("Готовим личные логины и пароли. Не закрывайте окно…");
-      const wanted = Number(fields.count.value);
-      try {
-        const result = await api("/api/student-accounts/batch", {method:"POST", promptAdmin:false,
-          headers:{"X-Admin-Token":token}, body:{count:wanted, group:fields.group.value.trim(), prefix:fields.prefix.value.trim()}});
-        if (activeModalToken !== modalId || !form.isConnected) return;
-        if (!Array.isArray(result.accounts) || result.accounts.length !== wanted ||
-            !result.accounts.every(row => typeof row?.login === "string" && typeof row.password === "string")) throw new Error("Неполный ответ сервера.");
-        showStudentRoster(result.accounts);
-      } catch (error) {
-        if (activeModalToken !== modalId || !form.isConnected) return;
-        if (error.status === 401 || error.status === 403) {
-          sessionToken = "";
+    function openStudentBatch() {
+      const saved = Boolean(token);
+      template(`<form id="student-batch" class="student-batch-form"><h3>Создать учётки группы</h3>
+        <p>Каждый студент получит отдельный логин и пароль. Виртуальная машина развернётся только по запросу из личного кабинета.</p>
+        <label class="field"><span class="field-label">Группа</span><input class="input" name="group" required placeholder="Например, ДЭ-24" maxlength="80"></label>
+        <div class="form-grid"><label class="field"><span class="field-label">Количество учёток</span><input class="input" name="count" type="number" min="1" max="100" step="1" value="20" required><small>От 1 до 100 за один раз.</small></label>
+        <label class="field"><span class="field-label">Начало логина</span><input class="input mono" name="prefix" value="student" required maxlength="16" pattern="[a-z]([a-z0-9]|-){0,15}" title="До 16 знаков: строчные латинские буквы, цифры и дефис. Начните с буквы." spellcheck="false" autocapitalize="none"><small>Например, student или mdk. Номер добавится автоматически.</small></label></div>
+        <label class="field" data-batch-token-field ${saved ? "hidden" : ""}><span class="field-label">Токен администратора</span><input class="input mono" name="token" type="password" autocomplete="off" data-batch-secret ${saved ? "" : "required"}><small>Введённый здесь токен не сохраняется.</small></label>
+        <div class="alert alert--info">${icon("info")}Пароли будут показаны один раз. Скопируйте список перед уходом со страницы и передайте каждому студенту только его строку.</div>
+        <p data-batch-status role="status" hidden></p></form>
+        <div class="student-admin-tools"><button class="button" type="button" data-batch-back>К списку</button><button class="button button--primary" type="submit" form="student-batch">${icon("users")}Создать учётки</button></div>`);
+      const form = $("#student-batch"), id = seq;
+      const send = $('[form="student-batch"]'), status = form.querySelector("[data-batch-status]");
+      const previous = $("[data-batch-back]");
+      previous.onclick = () => token ? list() : unlock();
+      const setStatus = text => { status.hidden = false; status.textContent = text; };
+      form.addEventListener("submit", async event => {
+        event.preventDefault();
+        if (send.disabled || !form.reportValidity()) return;
+        const fields = form.elements;
+        token = fields.token.value.trim() || token;
+        if (!token) {
           form.querySelector("[data-batch-token-field]").hidden = false;
-          fields.token.required = true; fields.token.focus();
+          fields.token.required = true; fields.token.focus(); return;
         }
-        // Never replay a batch automatically. The server may have committed before a connection loss.
-        const uncertain = !error.status || error.status >= 500;
-        setStatus(uncertain ? "Не удалось получить список. Учётки могли быть созданы: проверьте результат у администратора перед новым выпуском." : error.message);
-        send.disabled = uncertain;
-        previous.disabled = false;
-      }
-    });
-  }
+        send.disabled = true; previous.disabled = true; fields.token.value = "";
+        setStatus("Готовим личные логины и пароли. Не уходите со страницы…");
+        const wanted = Number(fields.count.value);
+        try {
+          const result = await api("/api/student-accounts/batch", {method:"POST", promptAdmin:false,
+            headers:{"X-Admin-Token":token}, body:{count:wanted, group:fields.group.value.trim(), prefix:fields.prefix.value.trim()}});
+          if (closed || seq !== id) return;
+          if (!Array.isArray(result.accounts) || result.accounts.length !== wanted ||
+              !result.accounts.every(row => typeof row?.login === "string" && typeof row.password === "string")) throw new Error("Неполный ответ сервера.");
+          showStudentRoster(result.accounts);
+        } catch (error) {
+          if (closed || seq !== id) return;
+          if (error.status === 401 || error.status === 403) {
+            token = "";
+            form.querySelector("[data-batch-token-field]").hidden = false;
+            fields.token.required = true; fields.token.focus();
+          }
+          // Never replay a batch automatically. The server may have committed before a connection loss.
+          const uncertain = !error.status || error.status >= 500;
+          setStatus(uncertain ? "Не удалось получить список. Учётки могли быть созданы: проверьте результат у администратора перед новым выпуском." : error.message);
+          send.disabled = uncertain;
+          previous.disabled = false;
+        }
+      });
+    }
 
-  function showStudentRoster(rows) {
-    showModal({title:"Учётки готовы", subtitle:`Группа: ${rows[0]?.group || "—"} · Создано: ${rows.length}`,
-      body:`<div class="student-batch-result"><p>Адрес для студентов: <a href="/student-demo/" target="_blank" rel="noopener">учебный кабинет Deployer</a>. При входе студент использует свой логин и пароль из списка.</p>
-      <label class="field"><span class="field-label">Логин и пароль · по одной паре в строке</span><textarea class="input mono" data-batch-secret autocomplete="off" autocapitalize="none" spellcheck="false" wrap="off" readonly></textarea></label>
-      <div class="alert alert--warning">${icon("shield")}Скопируйте список сейчас: после закрытия пароли нельзя посмотреть повторно.</div><p role="status" data-roster-status hidden></p></div>`,
-      footer:`<button class="button" type="button" data-close-modal>Закрыть</button><button class="button button--primary" data-copy-roster type="button">${icon("copy")}Скопировать список</button>`});
-    const roster = modalRoot.querySelector("textarea"), note = modalRoot.querySelector("[data-roster-status]");
-    roster.value = rows.map(row => `${row.login}\t${row.password}`).join("\n");
-    modalRoot.querySelector("[data-copy-roster]").addEventListener("click", async () => {
-      let copied = false;
-      try { await navigator.clipboard.writeText(roster.value); copied = true; } catch {
-        if (roster.isConnected && roster.value) { roster.focus(); roster.select(); try { copied = document.execCommand("copy"); } catch { /* keep the selection for manual copy */ } }
-      }
-      note.hidden = false; note.textContent = copied ? "Логины и пароли скопированы." : "Список выделен. Используйте Ctrl+C или команду «Копировать».";
-    });
+    function showStudentRoster(issued) {
+      template(`<div class="student-batch-result"><h3>Учётки готовы</h3><p>Группа: ${escapeHtml(issued[0]?.group || "—")} · Создано: ${issued.length}</p><p>Адрес для студентов: <a href="/student-demo/" target="_blank" rel="noopener">учебный кабинет Deployer</a>. При входе студент использует свой логин и пароль из списка.</p>
+        <label class="field"><span class="field-label">Логин и пароль · по одной паре в строке</span><textarea class="input mono" data-batch-secret autocomplete="off" autocapitalize="none" spellcheck="false" wrap="off" readonly></textarea></label>
+        <div class="alert alert--warning">${icon("shield")}Скопируйте список сейчас: после ухода со страницы пароли нельзя посмотреть повторно.</div><p role="status" data-roster-status hidden></p></div>
+        <div class="student-admin-tools">${back}<button class="button button--primary" data-copy-roster type="button">${icon("copy")}Скопировать список</button></div>`);
+      const roster = $("textarea"), note = $("[data-roster-status]");
+      roster.value = issued.map(row => `${row.login}\t${row.password}`).join("\n");
+      issued.forEach(row => { delete row.password; });
+      el("[data-roster-back]", () => list());
+      $("[data-copy-roster]").addEventListener("click", async () => {
+        let copied = false;
+        try { await navigator.clipboard.writeText(roster.value); copied = true; } catch {
+          if (roster.isConnected && roster.value) { roster.focus(); roster.select(); try { copied = document.execCommand("copy"); } catch { /* keep the selection for manual copy */ } }
+        }
+        note.hidden = false; note.textContent = copied ? "Логины и пароли скопированы." : "Список выделен. Используйте Ctrl+C или команду «Копировать».";
+      });
+    }
+    if (token) list(); else unlock();
   }
 
   function openImportPoolModal() {
@@ -2626,6 +2670,7 @@ exit 75`;
       webActivityPollTimer = null;
     }
     const leftConsumers = state.route === "consumers";
+    if (state.route === "student-accounts") clearStudentDirectory();
     state.route = route;
     if (leftConsumers) clearConsumerReport();
     if (route === "ipam") state.ipam = null;
@@ -2709,14 +2754,16 @@ exit 75`;
     }
     const target = event.target.closest("button, a, tr");
     if (!target) return;
-    if (target.matches(".nav-link[data-route], .brand[data-route]")) { event.preventDefault(); navigate(target.dataset.route); }
+    if (target.matches(".nav-link[data-route], .brand[data-route]")) {
+      if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      event.preventDefault(); navigate(target.dataset.route);
+    }
     else if (target.dataset.navigate) navigate(target.dataset.navigate);
     else if (target.hasAttribute("data-consumer-refresh")) loadConsumers();
     else if (target.hasAttribute("data-consumer-unlock")) await requestAdminToken();
     else if (target.dataset.consumerSort && Object.hasOwn(consumerMetrics,target.dataset.consumerSort)) { consumerView.metric=target.dataset.consumerSort; consumerView.page=0; paintConsumerRows(); }
     else if (target.hasAttribute("data-consumer-prev") || target.hasAttribute("data-consumer-next")) { consumerView.page+=target.hasAttribute("data-consumer-next") ? 1 : -1; paintConsumerRows(); }
     else if (target.dataset.rollbackAllStands !== undefined) openRollbackAllStandsModal();
-    else if (target.hasAttribute("data-student-batch")) openStudentAccounts();
     else if (target.dataset.importPool !== undefined) openImportPoolModal();
     else if (target.matches("[data-open-deploy]")) openDeployWizard(target.dataset.openDeploy || null);
     else if (target.matches("[data-refresh-ipam]")) { state.ipam = null; renderIpam(); await loadIpam({ force: true }); }
@@ -2817,7 +2864,7 @@ exit 75`;
   }
 
   document.querySelector("#quick-create")?.addEventListener("click", () => openDeployWizard());
-  document.querySelector("#global-refresh")?.addEventListener("click", () => state.route === "consumers" ? loadConsumers() : loadData());
+  document.querySelector("#global-refresh")?.addEventListener("click", () => state.route === "student-accounts" ? studentDirectory?.refresh() : state.route === "consumers" ? loadConsumers() : loadData());
   document.querySelector("#operator-settings")?.addEventListener("click", () => requestAdminToken(true));
   document.querySelector("#workspace-switcher")?.addEventListener("click", event => {
     const menu = document.querySelector("#workspace-menu");
@@ -2869,12 +2916,10 @@ exit 75`;
   window.addEventListener("hashchange", () => { const route = getRoute(); if (route !== state.route) navigate(route); });
   window.addEventListener("beforeunload", event => { if (state.editorDirty) { event.preventDefault(); event.returnValue = ""; } });
 
-  function clearStudentBatch() {
-    if (modalRoot.querySelector("[data-student-admin], #student-batch, .student-batch-result")) closeModal();
-  }
-  window.addEventListener("pagehide", clearStudentBatch);
-  window.addEventListener("storage", event => { if (event.key === "demoops.adminToken" || event.key === null) { clearConsumerReport(); clearStudentBatch(); } });
-  if (state.route === "consumers") render();
+  window.addEventListener("pagehide", clearStudentDirectory);
+  window.addEventListener("pageshow", event => { if (event.persisted && state.route === "student-accounts") renderStudentAccounts(); });
+  window.addEventListener("storage", event => { if (event.key === "demoops.adminToken" || event.key === null) { clearConsumerReport(); resetStudentDirectory(); } });
+  if (["consumers","student-accounts"].includes(state.route)) render();
   loadData();
   window.setInterval(() => { if (!document.hidden) loadData({ silent: true }); }, 30000);
 })();

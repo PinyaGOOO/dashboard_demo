@@ -19,24 +19,25 @@ function teacherFixture() {
   };
   window.addEventListener("load",()=>setTimeout(async () => {
     const $ = s => document.querySelector(s);
-    $("[data-student-batch]").click();
+    $("a[href='#student-accounts']").click();
     $("[data-create-student-batch]").click();
     const form = $("#student-batch");
-    if (form.elements.count.value !== "20" || form.elements.prefix.value !== "student") return;
+    if (!$("#app").contains(form) || $("#modal-root").childElementCount || location.hash !== "#student-accounts" || form.elements.count.value !== "20" || form.elements.prefix.value !== "student") return;
     form.elements.group.value = group; form.elements.prefix.value = "class-gr"; form.elements.token.value = token;
     form.requestSubmit(); form.requestSubmit(); await new Promise(r=>setTimeout(r,100));
     const roster = $(".student-batch-result textarea");
     if (!roster || roster.value.split("\n").length !== 20 || !roster.value.includes("class-gr20\tfake-password-19")) return;
     $("[data-copy-roster]").click(); await new Promise(r=>setTimeout(r,5));
     if (!correct || submissions !== 1 || copied !== roster.value || JSON.stringify(localStorage).includes("fake-") || JSON.stringify(sessionStorage).includes("fake-")) return;
-    $(".modal__close").click();
-    if (roster.value === "") document.body.dataset.qa = "pass";
+    if (!$("#app").contains(roster) || $("#modal-root").childElementCount) return;
+    $("a[data-route=overview]").click(); await new Promise(r=>setTimeout(r,20));
+    if (roster.value === "" && !roster.isConnected && !$(".student-batch-result")) document.body.dataset.qa = "pass";
   },50));
 }
 function accountAdminFixture() {
   const mode = location.search.slice(1), token = "token-test", secret = "temporary-" + crypto.randomUUID();
   const acct = {login:"class09",group:"ДЭ-24 <тест>",version:1,created:1700000000,last_login:null,blocked:false};
-  const writes = [], reads = []; let copied, bad = false;
+  const writes = [], reads = []; let copied, historyReads = 0, deleted = false, bad = false;
   const delay = (ms=20) => new Promise(done => setTimeout(done,ms));
   Object.defineProperty(navigator,"clipboard",{value:{async writeText(text){copied=text;}}});
   window.fetch = async (url,opts) => {
@@ -44,44 +45,92 @@ function accountAdminFixture() {
     bad ||= opts.headers["X-Admin-Token"] !== token;
     if (url.startsWith("/api/student-accounts?")) {
       const q = new URL(url,location).searchParams;
-      bad ||= q.get("limit") !== "50"; reads.push([q.get("search"),Number(q.get("offset"))]);
+      const sort = q.get("sort") || "login";
+      bad ||= q.get("limit") !== "50" || !["login","group","group-desc"].includes(sort);
+      reads.push([q.get("search"),Number(q.get("offset")),sort]);
       const many = !q.get("search");
-      const accounts = many && q.get("offset") === "0" ? Array.from({length:50},(_,i)=>({...acct,login:"class" + i})) : [acct];
-      return new Response(JSON.stringify({accounts,total:many ? 51 : 1,offset:Number(q.get("offset")),limit:50}));
+      const accounts = deleted ? [] : many && q.get("offset") === "0" ? Array.from({length:50},(_,i)=>({...acct,login:"class" + i})) : [acct];
+      return new Response(JSON.stringify({accounts,total:deleted ? 0 : many ? 51 : 1,offset:Number(q.get("offset")),limit:50}));
+    }
+    if (url === "/api/student-accounts/class09/history") {
+      historyReads++; bad ||= (opts.method || "GET") !== "GET";
+      if (mode === "roster-history-late") await delay(80);
+      return new Response(JSON.stringify({login:acct.login,entries:[{at:1700000000},{at:1690000000}],limit:50}));
     }
     const action = url.split("/").pop();
     bad ||= opts.method !== "POST" || url !== "/api/student-accounts/class09/" + action || JSON.parse(opts.body).version !== acct.version;
     writes.push(action); await delay(30);
-    if (mode === "roster-stale") return new Response("{}",{status:409});
+    if (mode === "roster-stale" || (mode === "roster-delete-stale" && action === "delete")) return new Response("{}",{status:409});
     if (mode === "roster-denied") return new Response("{}",{status:401});
+    if (action === "delete") {
+      bad ||= JSON.parse(opts.body).confirm_login !== acct.login; deleted = true;
+      return new Response(JSON.stringify({deleted:true,login:acct.login}));
+    }
     acct.version++; if (action === "block") acct.blocked = true; if (action === "unblock") acct.blocked = false;
     return new Response(JSON.stringify({account:acct,...(action === "reset-password" ? {password:secret} : {})}));
   };
   window.addEventListener("load",()=>setTimeout(async () => {
-    const $ = s => document.querySelector(s), click = sel => $(sel).click();
-    click("[data-student-batch]"); if (reads.length || writes.length) return;
+    const $ = s => document.querySelector(s), click = sel => { document.body.dataset.qaStep = sel; $(sel).click(); };
+    const sidebar = $("a[data-route='student-accounts'][href='#student-accounts']");
+    if (!sidebar) return;
+    if (mode === "roster-history-nav") {
+      // First visit is a direct link, not a click inside an existing admin page.
+      if (location.hash !== "#student-accounts" || !$("#app [data-roster-unlock]") || $("#modal-root").childElementCount) return;
+      if (performance.getEntriesByType("navigation")[0]?.type !== "reload") { location.reload(); return; }
+      click("a[data-route='overview']"); await delay();
+      if ($("#app [data-student-admin]") || location.hash !== "#overview") return;
+      history.back(); await delay(100);
+      if (location.hash === "#student-accounts" && $("#app [data-roster-unlock]") && sidebar.getAttribute("aria-current")==="page" && !$("#modal-root").childElementCount && !reads.length && !writes.length) document.body.dataset.qa = "pass";
+      return;
+    }
+    sidebar.click(); if (reads.length || writes.length || location.hash !== "#student-accounts" || !$("#app [data-roster-unlock]") || $("#modal-root").childElementCount) return;
     const auth = $("[data-roster-unlock]"); auth.elements.token.value = token; auth.requestSubmit(); await delay();
     if (document.querySelectorAll("[data-manage-student]").length !== 50) return;
     click("[data-roster-next]"); await delay(); if (reads.at(-1)[1] !== 50) return;
     click("[data-roster-prev]"); await delay(); if (reads.at(-1)[1] !== 0) return;
+    for (const sort of ["login","group","group-desc"]) {
+      const field = $("[data-roster-sort]"); field.value = sort; field.dispatchEvent(new Event("change",{bubbles:true})); await delay();
+      if (reads.at(-1)[2] !== sort || reads.at(-1)[1] !== 0) return;
+    }
     const filter = $("[data-roster-search]"); filter.elements.search.value="ДЭ-24"; filter.requestSubmit(); await delay();
-    if (reads.at(-1)[0] !== "ДЭ-24" || !$("[data-roster-next]").disabled) return;
-    for (const action of ["reset-password","block","unblock","revoke-sessions"]) {
+    if (reads.at(-1)[0] !== "ДЭ-24" || reads.at(-1)[2] !== "group-desc" || !$("[data-roster-next]").disabled) return;
+    click("[data-manage-student]"); click("[data-account-history]");
+    if (mode === "roster-history-late") {
+      click("a[data-route='overview']"); await delay(120);
+      if (!bad && historyReads === 1 && !writes.length && !$("[data-student-admin]") && !$("[data-history-back]")) document.body.dataset.qa = "pass";
+      return;
+    }
+    await delay();
+    const dates = [...document.querySelectorAll("#app [data-login-history] time")].map(t=>Date.parse(t.dateTime)/1000);
+    if (historyReads !== 1 || !$("#app [data-history-back]") || $("#modal-root").childElementCount || dates.join(",") !== "1700000000,1690000000") return;
+    click("[data-history-back]"); click("[data-roster-back]"); await delay();
+    for (const action of ["reset-password","block","unblock","revoke-sessions","delete"]) {
       click("[data-manage-student]"); click('[data-account-action="' + action + '"]');
-      if (!$("[data-student-admin] h3").textContent.includes(acct.login)) return;
+      if (!$("#app [data-student-admin]").innerText.includes(acct.login) || $("#modal-root").childElementCount) return;
       if (action === "reset-password") {
         click("[data-account-cancel]"); if (writes.length) return;
         click('[data-account-action="reset-password"]');
       }
+      if (action === "delete") {
+        const field = $("[data-confirm-login]"), confirm = $("[data-account-confirm]"), before = writes.length;
+        field.value = "class"; field.dispatchEvent(new Event("input",{bubbles:true})); confirm.click();
+        if (writes.length !== before) return;
+        field.value = acct.login; field.dispatchEvent(new Event("input",{bubbles:true})); if (confirm.disabled) return;
+      }
       click("[data-account-confirm]"); click("[data-account-confirm]");
       if (mode === "roster-late") {
-        window.dispatchEvent(new Event("pagehide")); await delay(60);
-        if (!bad && writes.length === 1 && !$("[data-reset-secret]") && !$("[data-student-admin]").textContent) document.body.dataset.qa = "pass";
+        click("a[data-route='overview']"); await delay(60);
+        if (!bad && writes.length === 1 && !$("[data-reset-secret]") && !$("[data-student-admin]")) document.body.dataset.qa = "pass";
         return;
       }
       await delay(60);
       if (mode === "roster-stale" || mode === "roster-denied") {
         if (!bad && writes.length === 1 && !$("[data-reset-secret]") && (mode === "roster-denied" ? !!$("[data-roster-unlock]") : $("[data-student-admin] [role=alert]")?.textContent.includes("изменились"))) document.body.dataset.qa = "pass";
+        return;
+      }
+      if (mode === "roster-delete-stale" && action === "delete") {
+        const alert = $("#app [role=alert]");
+        if (!bad && !deleted && writes.filter(a => a === "delete").length === 1 && alert?.textContent.includes("изменились") && !$("[data-account-confirm]")) document.body.dataset.qa = "pass";
         return;
       }
       if (action === "reset-password") {
@@ -92,8 +141,9 @@ function accountAdminFixture() {
       }
       if (action === "block" && !$(".student-account-status").textContent.includes("Заблокирована")) return;
     }
+    if (!deleted || $("[data-manage-student]")) return;
     window.dispatchEvent(new StorageEvent("storage",{key:"demoops.adminToken"}));
-    if (!bad && writes.join(",") === "reset-password,block,unblock,revoke-sessions" && !$("[data-student-admin]").textContent) document.body.dataset.qa = "pass";
+    if (!bad && writes.join(",") === "reset-password,block,unblock,revoke-sessions,delete" && !$("[data-reset-secret]") && !$("[data-manage-student]") && !$("[data-roster-search]")) document.body.dataset.qa = "pass";
   },50));
 }
 function managedFixture() {
@@ -224,10 +274,10 @@ function fixture() {
   await new Promise(resolve => server.listen(0,"127.0.0.1",resolve));
   const profile = fs.mkdtempSync(path.join(os.tmpdir(),"deployer-smoke-"));
   try {
-    for (const mode of ["item","text","denied","forbidden","login","teacher","roster","roster-stale","roster-denied","roster-late","managed","assignment"]) {
-      const url = "http://127.0.0.1:" + server.address().port + (mode === "teacher" || mode.startsWith("roster") ? "/?" + mode : "/student-demo/?" + mode + (["managed","assignment"].includes(mode) ? "" : "#stands/fixture"));
+    for (const mode of ["item","text","denied","forbidden","login","teacher","roster","roster-stale","roster-denied","roster-late","roster-history-nav","roster-history-late","roster-delete-stale","managed","assignment"]) {
+      const url = "http://127.0.0.1:" + server.address().port + (mode === "teacher" || mode.startsWith("roster") ? "/?" + mode + (mode === "roster-history-nav" ? "#student-accounts" : "") : "/student-demo/?" + mode + (["managed","assignment"].includes(mode) ? "" : "#stands/fixture"));
       const {stdout} = await run(chrome,["--headless","--disable-gpu","--no-first-run","--disable-background-networking","--user-data-dir=" + profile,"--virtual-time-budget=3000","--dump-dom",url],{timeout:45000,maxBuffer:1_500_000});
-      if (!stdout.includes('data-qa="pass"')) throw Error("Failed case: " + mode);
+      if (!stdout.includes('data-qa="pass"')) throw Error("Failed case: " + mode + (stdout.match(/data-qa-step="([^"]*)"/)?.[1] ? " at " + stdout.match(/data-qa-step="([^"]*)"/)[1] : ""));
       console.log("PASS", mode);
     }
   } finally {

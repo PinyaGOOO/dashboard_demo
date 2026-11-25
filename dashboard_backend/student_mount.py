@@ -90,8 +90,11 @@ class StudentMount:
     def check_operator_origin(self, headers):
         check_same_origin(headers, self._secure_cookie)
 
-    def list_accounts(self, search, offset, limit):
-        return self._portal._initialized().list_accounts(search=search, offset=offset, limit=limit)
+    def list_accounts(self, search, offset, limit, sort="login"):
+        return self._portal._initialized().list_accounts(search=search, offset=offset, limit=limit, sort=sort)
+
+    def account_login_history(self, login):
+        return self._portal._initialized().account_login_history(login)
 
     def manage_account(self, login, action, payload):
         return self._portal._initialized().manage_account(login, action, payload)

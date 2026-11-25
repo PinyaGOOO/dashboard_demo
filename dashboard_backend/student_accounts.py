@@ -18,6 +18,8 @@ _PREFIX = re.compile(r"[a-z][a-z0-9-]{0,15}\Z")
 _FORMAT = "scrypt-v1"
 _BLOCKED_FORMAT = "blocked:scrypt-v1"  # Older portal versions reject unknown formats too.
 _PUBLIC_COLUMNS = "login, group_name, format, version, created, last_login"
+_SORT = {"login": "login", "group": "casefold(group_name), login", "group-desc": "casefold(group_name) DESC, login"}
+HISTORY_LIMIT = 50
 MAX_BATCH = 100
 
 
@@ -32,6 +34,30 @@ def init_schema(db):
         db.execute("ALTER TABLE student_accounts ADD COLUMN last_login REAL")
     db.execute("""CREATE TABLE IF NOT EXISTS student_account_sequences (
         prefix TEXT PRIMARY KEY, last_number INTEGER NOT NULL CHECK(last_number>0))""")
+    # Old lab receipts and guest ownership are keyed by login. Keep only a
+    # reservation, not the account or its secrets, even if prefixes can overlap.
+    db.execute("CREATE TABLE IF NOT EXISTS student_retired_logins (login TEXT PRIMARY KEY NOT NULL)")
+    db.execute("""CREATE TRIGGER IF NOT EXISTS student_prevent_retired_login BEFORE INSERT ON student_accounts
+                  WHEN EXISTS (SELECT 1 FROM student_retired_logins WHERE login=NEW.login)
+                  BEGIN SELECT RAISE(ABORT,'retired student login'); END""")
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='student_login_history'").fetchone() is None:
+        db.execute("""CREATE TABLE student_login_history (id INTEGER PRIMARY KEY,
+                      login TEXT NOT NULL REFERENCES student_accounts(login) ON DELETE CASCADE, at REAL NOT NULL)""")
+        # Previous versions only knew the last successful login (not sessions
+        # closed, failed attempts or read-only requests). Import exactly that.
+        db.execute("""INSERT INTO student_login_history(login,at)
+                      SELECT login,last_login FROM student_accounts WHERE last_login IS NOT NULL""")
+    db.execute("CREATE INDEX IF NOT EXISTS student_recent_logins ON student_login_history(login,at DESC,id DESC)")
+    # last_login is written only when minting a session. This captures the same
+    # atomic event, including when the previous binary is temporarily restored.
+    db.execute(f"""CREATE TRIGGER IF NOT EXISTS student_record_login AFTER UPDATE OF last_login ON student_accounts
+                  WHEN NEW.last_login IS NOT NULL
+                  BEGIN
+                    INSERT INTO student_login_history(login,at) VALUES (NEW.login,NEW.last_login);
+                    DELETE FROM student_login_history WHERE id IN (
+                      SELECT id FROM student_login_history WHERE login=NEW.login
+                      ORDER BY at DESC,id DESC LIMIT -1 OFFSET {HISTORY_LIMIT});
+                  END""")
 
 
 def _hash(password, salt):
@@ -88,33 +114,49 @@ def _public_account(row):
             "version": row["version"], "created": row["created"], "last_login": row["last_login"]}
 
 
-def list_accounts(open_db, reserved, search="", offset=0, limit=50):
+def list_accounts(open_db, reserved, search="", offset=0, limit=50, sort="login"):
     if (not isinstance(search, str) or len(search) > 128 or (search and not search.isprintable())
             or type(offset) is not int or not 0 <= offset <= 2**31 - 1
-            or type(limit) is not int or not 1 <= limit <= 100):
+            or type(limit) is not int or not 1 <= limit <= 100 or not isinstance(sort, str) or sort not in _SORT):
         raise StudentError(400, "Проверьте строку поиска и параметры страницы списка.")
     excluded = ",".join("?" for _ in reserved)
     where = f"WHERE login NOT IN ({excluded})"
     params = list(reserved)
     term = search.strip().casefold()
     with open_db() as db:
-        if term:
+        if term or sort != "login":
             db.create_function("casefold", 1, str.casefold)
+        if term:
             where += " AND (instr(casefold(login), ?) > 0 OR instr(casefold(group_name), ?) > 0)"
             params.extend((term, term))
         db.execute("BEGIN")
         total = db.execute("SELECT count(*) FROM student_accounts " + where, params).fetchone()[0]
-        rows = db.execute(f"SELECT {_PUBLIC_COLUMNS} FROM student_accounts {where} ORDER BY login LIMIT ? OFFSET ?",
+        rows = db.execute(f"SELECT {_PUBLIC_COLUMNS} FROM student_accounts {where} ORDER BY {_SORT[sort]} LIMIT ? OFFSET ?",
                           (*params, limit, offset))
         return {"accounts": [_public_account(row) for row in rows], "total": total, "offset": offset, "limit": limit}
+
+
+def account_login_history(open_db, reserved, login):
+    if not isinstance(login, str) or login in reserved:
+        raise StudentError(404, "Выданная студенту учётная запись не найдена.")
+    with open_db() as db:
+        db.execute("BEGIN")
+        if not db.execute("SELECT 1 FROM student_accounts WHERE login=?", (login,)).fetchone():
+            raise StudentError(404, "Выданная студенту учётная запись не найдена.")
+        rows = db.execute("""SELECT at FROM student_login_history WHERE login=?
+                             ORDER BY at DESC,id DESC LIMIT ?""", (login, HISTORY_LIMIT))
+        return {"login": login, "entries": [{"at": row["at"]} for row in rows], "limit": HISTORY_LIMIT}
 
 
 def manage_account(open_db, reserved, login, action, payload):
     if not isinstance(login, str) or login in reserved:
         raise StudentError(404, "Выданная студенту учётная запись не найдена.")
-    if action not in ("reset-password", "block", "unblock", "revoke-sessions"):
+    if action not in ("reset-password", "block", "unblock", "revoke-sessions", "delete"):
         raise StudentError(400, "Неизвестное действие с учётной записью.")
-    if not isinstance(payload, dict) or set(payload) != {"version"} or type(payload["version"]) is not int or payload["version"] < 1:
+    if action == "delete" and (not isinstance(payload, dict) or payload.get("confirm_login") != login):
+        raise StudentError(400, "Для удаления введите точный логин учётной записи.")
+    expected = {"version", "confirm_login"} if action == "delete" else {"version"}
+    if not isinstance(payload, dict) or set(payload) != expected or type(payload["version"]) is not int or payload["version"] < 1:
         raise StudentError(400, "Для изменения нужна версия учётной записи из списка.")
 
     def current(db):
@@ -141,6 +183,11 @@ def manage_account(open_db, reserved, login, action, payload):
     with open_db() as db:
         db.execute("BEGIN IMMEDIATE")
         row = current(db)
+        if action == "delete":
+            db.execute("INSERT INTO student_retired_logins(login) VALUES (?)", (login,))
+            db.execute("DELETE FROM student_sessions WHERE login=?", (login,))
+            db.execute("DELETE FROM student_accounts WHERE login=?", (login,))  # also erases login history
+            return {"deleted": True, "login": login}
         if action in ("block", "unblock"):
             new_format = _BLOCKED_FORMAT if action == "block" else _FORMAT
             if row["format"] == new_format:
@@ -183,7 +230,8 @@ def create_batch(open_db, payload, reserved, clock):
                     number += 1
                     login = f"{prefix}{number:02d}"
                     if login not in reserved and not db.execute(
-                            "SELECT 1 FROM student_accounts WHERE login=?", (login,)).fetchone():
+                            """SELECT 1 FROM student_accounts WHERE login=?
+                               UNION ALL SELECT 1 FROM student_retired_logins WHERE login=? LIMIT 1""", (login,login)).fetchone():
                         break
                 db.execute("""INSERT INTO student_accounts(login,group_name,salt,verifier,format,created)
                               VALUES (?,?,?,?,?,?)""", (login,group,salt,verifier,_FORMAT,created))

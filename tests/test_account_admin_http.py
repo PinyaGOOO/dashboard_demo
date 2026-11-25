@@ -201,3 +201,56 @@ class AccountAdminHTTP(unittest.TestCase):
                     self.assertIn(status, (400, 403, 404))
                     self.assertNotIn("password", result)
         self.login("student02", "DemoLab02!")
+
+    def test_group_order_is_global_before_pagination_and_search(self):
+        first, = self.issue(group="Язык")
+        middle, = self.issue(group="Алгебра")
+        last, = self.issue(group="алгебра")
+        for order, expected in (("group", [middle, last, first]), ("group-desc", [first, middle, last]),
+                                ("login", [first, middle, last])):
+            pages = [self.listed(search="", limit=1, offset=i, sort=order) for i in range(3)]
+            self.assertEqual([p["accounts"][0]["login"] for p in pages], [r["login"] for r in expected])
+            self.assertTrue(all(p["total"] == 3 for p in pages))
+        self.assertEqual(self.listed(search="АЛГЕБ", sort="group")["total"], 2)
+        for query in ("sort=unknown", "sort=group&sort=login"):
+            self.assertEqual(self.req(ACCOUNTS + "?" + query, headers=[TOKEN])[0], 400)
+
+    def test_history_and_confirmed_delete_are_private_and_scoped(self):
+        person, other = self.issue(2)
+        login = person["login"]
+        prefix = f"{ACCOUNTS}/{login}"
+        history, delete = prefix + "/history", prefix + "/delete"
+        self.assertEqual(self.req(history, headers=[TOKEN])[1]["entries"], [])
+        cookie = self.login(login, person["password"])
+        self.login(login, "not-the-password", expected=401)
+        other_cookie = self.login(other["login"], other["password"])
+        status, data, _ = self.req(history, headers=[TOKEN])
+        self.assertEqual(status, 200)
+        self.assertEqual(set(data), {"login", "entries", "limit"})
+        self.assertEqual((data["login"], data["limit"]), (login, 50))
+        event, = data["entries"]
+        self.assertEqual(set(event), {"at"})
+        self.assertGreater(event["at"], 0)
+        body = {"version": self.version(login), "confirm_login":login}
+        for path, payload in ((history, None), (delete, body)):
+            for headers in ([], [cookie], [TOKEN, TOKEN]):
+                self.assertEqual(self.req(path, payload, headers)[0], 401)
+            self.assertEqual(self.req(path, payload, [TOKEN, ("Origin", "https://foreign.example")])[0], 403)
+            self.assertEqual(self.req("/student-demo" + path, payload, [TOKEN, cookie])[0], 404)
+        self.assertEqual(self.req(delete, headers=[TOKEN])[0], 404)  # Following a link must never delete.
+        self.assertEqual(self.req(delete, {"version":body["version"]}, [TOKEN])[0], 400)
+        self.assertEqual(self.req(delete, dict(body, confirm_login=other["login"]), [TOKEN])[0], 400)
+        self.assertEqual(self.req(delete, dict(body, version=body["version"]+1), [TOKEN])[0], 409)
+        self.assertEqual(self.me(cookie), 200)
+        status, result, _ = self.req(delete, body, [TOKEN])
+        self.assertEqual((status, result), (200, {"login":login, "deleted":True}))
+        self.assertEqual(self.me(cookie), 401)
+        self.login(login, person["password"], expected=401)
+        self.assertEqual(self.req(history, headers=[TOKEN])[0], 404)
+        self.assertEqual(self.req(delete, body, [TOKEN])[0], 404)
+        self.assertEqual(self.listed(search=login)["total"], 0)
+        self.assertEqual(self.me(other_cookie), 200)
+        for reserved in ("student01", "student02"):
+            self.assertEqual(self.req(f"{ACCOUNTS}/{reserved}/history", headers=[TOKEN])[0], 404)
+            self.assertEqual(self.req(f"{ACCOUNTS}/{reserved}/delete",
+                                      {"version":1, "confirm_login":reserved}, [TOKEN])[0], 404)

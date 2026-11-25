@@ -170,20 +170,25 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self.student_mount.check_operator_origin(self.headers)
         if method == "GET" and not parts:
             try:
-                query = parse_qs(query_string, keep_blank_values=True, strict_parsing=True, max_num_fields=3)
-                if set(query) - {"search", "offset", "limit"} or any(len(v) != 1 for v in query.values()):
+                query = parse_qs(query_string, keep_blank_values=True, strict_parsing=True, max_num_fields=4)
+                if set(query) - {"search", "offset", "limit", "sort"} or any(len(v) != 1 for v in query.values()):
                     raise ValueError
                 offset, limit = query.get("offset", ["0"])[0], query.get("limit", ["50"])[0]
                 if not all(re.fullmatch(r"[0-9]{1,10}", n) for n in (offset, limit)):
                     raise ValueError
             except ValueError:
                 raise StudentError(400, "Проверьте параметры поиска.") from None
-            self._json(self.student_mount.list_accounts(query.get("search", [""])[0], int(offset), int(limit)))
+            self._json(self.student_mount.list_accounts(query.get("search", [""])[0], int(offset), int(limit),
+                                                        query.get("sort", ["login"])[0]))
         elif method == "POST" and not query_string and parts == ["batch"]:
             self._json(self.student_mount.create_accounts(read_student_json(self)), HTTPStatus.CREATED)
-        elif (method == "POST" and not query_string and len(parts) == 2 and re.fullmatch(r"[a-z][a-z0-9-]{1,31}", parts[0])
-              and parts[1] in {"reset-password", "block", "unblock", "revoke-sessions"}):
-            self._json(self.student_mount.manage_account(*parts, read_student_json(self)))
+        elif not query_string and len(parts) == 2 and re.fullmatch(r"[a-z][a-z0-9-]{1,31}", parts[0]):
+            if method == "GET" and parts[1] == "history":
+                self._json(self.student_mount.account_login_history(parts[0]))
+            elif method == "POST" and parts[1] in {"reset-password", "block", "unblock", "revoke-sessions", "delete"}:
+                self._json(self.student_mount.manage_account(*parts, read_student_json(self)))
+            else:
+                raise StudentError(404, "Операция с учётной записью не найдена.")
         else:
             raise StudentError(404, "Операция с учётной записью не найдена.")
 
