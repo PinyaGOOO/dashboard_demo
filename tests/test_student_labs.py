@@ -22,6 +22,7 @@ class PersonalLabTests(unittest.TestCase):
         bp = next(b for b in self.svc.list_blueprints() if b["status"] == "active")
         vmid = bp["template_vmid"]
         self.gw.list_templates.return_value = [{"vmid":vmid,"name":"nested"}]
+        self.svc.save_blueprint({"assignment_markdown":"# Conditions","student_visible":True},bp["id"])
         self.task = {"id":f"lab-{bp['id']}-{vmid}","template_vmid":vmid,"template_name":"nested"}
         self.card, self.login = "1"*24, "practicum-03"
         self.adapter = StudentLabs(self.svc,"10.39.170.10","10.39.170.11")
@@ -54,9 +55,11 @@ class PersonalLabTests(unittest.TestCase):
         copied = StudentLabs(self.svc,"10.39.170.10","10.39.170.11")
         self.assertEqual(copied.submit(self.login,self.task,self.card)["status"],"provisioning")
         self.assertEqual(self.receipt()["guest_ip"],"10.39.170.10")
-        self.submit("2"*24)
         with self.assertRaises(StudentError):
-            self.submit("3"*24)
+            self.submit("2"*24)
+        self.adapter.submit("practicum-04",self.task,"2"*24)
+        with self.assertRaises(StudentError):
+            self.adapter.submit("practicum-05",self.task,"3"*24)
         self.assertEqual(self.launch.call_count,2)
         self.assertEqual(self.store.query_one("SELECT count(*) AS n FROM student_lab_receipts")["n"],2)
         self.assertIsNone(self.store.query_one("SELECT id FROM stands WHERE pool_id=?",("lab-"+"3"*24,)))
@@ -107,6 +110,20 @@ class PersonalLabTests(unittest.TestCase):
         self.svc._deploy_job(sid,plan)
         self.gw.deploy.assert_not_called()
         self.assertEqual(self.adapter.inspect(self.login,self.task,self.card)["status"],"error")
+
+    def test_hide_while_queued_and_before_submission(self):
+        self.submit()
+        sid, plan = self.launch.call_args.args
+        self.assertNotIn("assignment_markdown",plan)
+        def unpublish_during_template_check():
+            self.svc.save_blueprint({"student_visible":False},int(self.task["id"].split("-")[1]))
+            return [{"vmid":self.task["template_vmid"],"name":"nested"}]
+        self.gw.list_templates.side_effect = unpublish_during_template_check
+        self.svc._deploy_job(sid,plan)
+        self.gw.deploy.assert_not_called()
+        with self.assertRaises(StudentError):
+            self.adapter.submit("practicum-04",self.task,"2"*24)
+        self.assertEqual(self.store.query_one("SELECT COUNT(*) AS n FROM student_lab_receipts")["n"],1)
 
     def test_twenty_simultaneous_cards_bound_proofs_and_password_joins_inflight(self):
         full, release = threading.Event(), threading.Event()

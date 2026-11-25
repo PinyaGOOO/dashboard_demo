@@ -90,10 +90,11 @@
     }).catch(() => {}); // Personal sign-in still works when public suggestions are unavailable.
   }
   function card(a, index) {
+    const md = !a.withdrawn && a.assignment_markdown;
     return `<article class="assignment" data-assignment-id="${esc(a.id)}"><div class="card-top"><span class="eyebrow">Практика / ${String(index + 1).padStart(2,"0")}</span><span class="status" data-status></span></div>
-      <h3>${esc(a.title)}</h3><p class="brief">${esc(a.description)}</p>
+      <h3>${a.withdrawn ? "Ваш стенд" : esc(a.title)}</h3>${a.withdrawn ? '<p class="brief">Задание больше не опубликовано. Вы можете открыть свой стенд.</p>' : a.description ? `<p class="brief">${esc(a.description)}</p>` : ""}
       <p class="template-line">Шаблон: <b>${esc(a.template_name)}</b> · VMID ${esc(a.template_vmid)}</p>
-      <details><summary>Условия задания</summary><ol class="steps">${a.steps.map(step => `<li>${esc(step)}</li>`).join("")}</ol></details>
+      ${a.withdrawn ? "" : `<details><summary>Условия задания</summary>${md ? `<div class="assignment-md">${AssignmentMarkdown.render(md)}</div>` : `<ol class="steps">${a.steps.map(step => `<li>${esc(step)}</li>`).join("")}</ol>`}</details>`}
       <div class="actionbox"><div class="progress-wrap" hidden><span data-phase></span><progress max="100" value="0" aria-label="Подготовка стенда"></progress></div>
       <p class="stand-note" data-stand-reason hidden></p>
       <label class="field lease-field" data-lease-field>Срок ${student.managed ? "работы VM" : "демостенда"}, минут<input data-duration type="number" inputmode="numeric" min="1" max="10080" step="1" placeholder="Без ограничения"><small>От 1 минуты до 7 дней после готовности. Пустое поле — без ограничения.</small></label>
@@ -135,7 +136,7 @@
       const button = $("[data-deploy]",root), link = $("[data-open-stand]",root), s = a.stand;
       updateStatus(root,s);
       const restart = (s?.status === "expired" && !s.real && !s.actual_lease) || (s?.real && s.status === "removed"), retry = s?.real && s.status === "pending";
-      button.hidden = !!s && !restart && !retry; button.disabled = pending.has(a.id); button.textContent = button.disabled ? "Отправляем запрос…" : retry ? "Повторить заявку" : restart ? "Развернуть заново" : "Развернуть стенд";
+      button.hidden = !!a.withdrawn || (!!s && !restart && !retry); button.disabled = !!a.withdrawn || pending.has(a.id); button.textContent = button.disabled ? "Отправляем запрос…" : retry ? "Повторить заявку" : restart ? "Развернуть заново" : "Развернуть стенд";
       $("[data-lease-field]",root).hidden = button.hidden || retry;
       const lease = $("[data-list-lease]",root);
       lease.hidden = !s?.duration_minutes && !s?.actual_lease?.duration_minutes;
@@ -163,17 +164,19 @@
     const real = !!(s.real || s.actual_lease || access || pendingPilot);
     const timingFixed = Number(s.actual_lease?.duration_minutes) > 0;
     const key = `stand:${s.id}:${access?.url || (pendingPilot ? "pending" : actualExpired ? "expired" : s.real ? s.status : "demo")}:${access?.vmid || ""}:${timingFixed}`;
-    if (page !== key) {
+    const conditionsChanged = ["title","assignment_markdown","withdrawn","description"].some(field => a[field] !== current?.assignment[field]);
+    if (page !== key || conditionsChanged) {
       page = key; document.title = `${s.name} · Практикум`;
       const marked = marks.get(String(s.id)) || new Set();
       view.innerHTML = `<nav class="crumbs" aria-label="Навигация"><a href="#assignments">← Мои задания</a><span>/</span><span>Стенд</span></nav>
         <header class="hero"><p class="eyebrow">Практикум / ${real ? "Персональный Proxmox" : "Демостенд"}</p><h1>${esc(s.name)}</h1><p class="lead">${esc(student.name)} · ${esc(student.group)}</p>
         ${access ? `<div class="guest-launch"><a class="button primary" data-open-proxmox href="${esc(access.url)}" target="_blank" rel="noopener noreferrer" aria-describedby="guest-target">Открыть мой Proxmox</a>
         <span id="guest-target">В новой вкладке · <bdi class="mono">${esc(access.ip)}:8006</bdi></span></div>` : ""}</header>
-        <div class="stand-grid"><article class="sheet"><p class="eyebrow">Приложенное задание</p><h2>${esc(a.title)}</h2><p class="brief">${esc(a.description)}</p>
+        <div class="stand-grid"><article class="sheet"><p class="eyebrow">Приложенное задание</p>${a.withdrawn ? '<h2>Задание больше не опубликовано</h2><p class="brief">Преподаватель снял задание с публикации. Доступ к вашему стенду не изменился.</p>' : `<h2>${esc(a.title)}</h2>
+        ${a.assignment_markdown ? `<div class="assignment-md">${AssignmentMarkdown.render(a.assignment_markdown)}</div>` : `<p class="brief">${esc(a.description)}</p>
         <h3>Порядок работы</h3><div class="checklist">${a.steps.map((step,i) => `<label><input type="checkbox" data-step="${i}" ${marked.has(i) ? "checked" : ""}><span>${esc(step)}</span></label>`).join("")}</div>
-        <p class="check-hint">Это личные заметки: отметки сохраняются в этой вкладке до обновления страницы или выхода.</p>
-        <button type="button" id="download-assignment" class="button secondary">Скачать задание (.txt)</button></article>
+        <p class="check-hint">Это личные заметки: отметки сохраняются в этой вкладке до обновления страницы или выхода.</p>`}
+        <button type="button" id="download-assignment" class="button secondary">Скачать задание (.${a.assignment_markdown ? "md" : "txt"})</button>`}</article>
         <aside class="stand-panel"><p class="eyebrow">Среда</p><h2>${real ? "Персональная VM" : "Учебный симулятор"}</h2><dl>
         <div><dt>Статус</dt><dd data-status></dd></div>
         <div><dt>${real ? "Срок работы VM" : "Срок демостенда"}</dt><dd data-lease></dd></div>
@@ -221,7 +224,8 @@
     clearTimeout(timer);
     if (document.hidden || !student) return;
     const stands = page.startsWith("stand:") ? [current?.stand] : assignments.map(a => a.stand);
-    let delay = Infinity;
+    // The teacher may publish/unpublish work while a student has an idle tab open.
+    let delay = 30000;
     if (page.startsWith("stand:") && current?.stand.pilot_pending === true && !proxmoxAccess(current.stand.access)) {
       delay = 10000;
     }
@@ -374,7 +378,9 @@
     if (deploy && student) {
       const root = deploy.closest("[data-assignment-id]"), id = root.dataset.assignmentId;
       let minutes;
-      const prior = assignments.find(a => a.id === id)?.stand;
+      const task = assignments.find(a => a.id === id);
+      if (!task || task.withdrawn) return;
+      const prior = task.stand;
       try { minutes = prior?.real && prior.status === "pending" ? prior.duration_minutes : checkedMinutes($("[data-duration]",root)); } catch (error) { warn(error.message); return; }
       if (pending.has(id)) return;
       const generation = epoch; pending.add(id); deploy.disabled = true; deploy.textContent = "Отправляем запрос…"; warn("");
@@ -389,9 +395,11 @@
     }
     if (event.target.closest("#download-assignment") && current) {
       const a = current.assignment;
-      const lines = [a.title,`Шаблон: ${a.template_name} · VMID ${a.template_vmid}`,"",a.description,"","Порядок работы:",...a.steps.map((step,i) => `${i+1}. ${step}`)];
-      const url = URL.createObjectURL(new Blob(["\uFEFF"+lines.join("\r\n")],{type:"text/plain;charset=utf-8"}));
-      const link = document.createElement("a"); link.href = url; link.download = `Задание-${String(a.id).replace(/[^a-zA-Z0-9_-]/g,"_")}.txt`;
+      if (a.withdrawn) return;
+      const md = a.assignment_markdown;
+      const source = md || "\uFEFF" + [a.title,`Шаблон: ${a.template_name} · VMID ${a.template_vmid}`,"",a.description,"","Порядок работы:",...a.steps.map((step,i) => `${i+1}. ${step}`)].join("\r\n");
+      const url = URL.createObjectURL(new Blob([source],{type:(md ? "text/markdown" : "text/plain")+";charset=utf-8"}));
+      const link = document.createElement("a"); link.href = url; link.download = `Задание-${String(a.id).replace(/[^a-zA-Z0-9_-]/g,"_")}.${md ? "md" : "txt"}`;
       document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url),1000);
     }
   });

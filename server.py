@@ -16,6 +16,7 @@ from dashboard_backend.database import DashboardStore
 from dashboard_backend.proxmox_gateway import create_gateway
 from dashboard_backend.service import ConflictError, DashboardService, NotFoundError, ValidationError
 from dashboard_backend.student_mount import StudentMount
+from dashboard_backend.student_catalog import published_assignments
 from dashboard_backend.student_credentials import PilotCredentials
 from dashboard_backend.student_labs import StudentLabs
 from dashboard_backend.student_portal import StudentError
@@ -126,10 +127,15 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         query = parse_qs(parsed.query)
         sensitive = method == "GET" and (
             (bool(parts) and parts[-1] in {"credentials", "relief-candidates"})
+            or (len(parts) == 4 and parts[:2] == ["api", "blueprints"] and parts[3] == "assignment")
             or parts in (["api", "web-activity"], ["api", "resource-consumers"])
         )
         if not self._authorized(method, sensitive=sensitive):
             self._json({"error": "Неверный административный токен", "code": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
+            return
+        if (parts[:2] == ["api", "blueprints"] and (method != "GET" or parts[-1] == "assignment")
+                and not self.admin_token and self.service.gateway.mode == "live"):
+            self._json({"error": "Для редактирования заданий настройте административный токен."}, HTTPStatus.FORBIDDEN)
             return
         try:
             if parts == ["api", "student-accounts", "batch"] and method == "POST":
@@ -151,7 +157,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             elif parts == ["api", "health"] and method == "GET":
                 self._json({"status": "ok", "integration": self.service.integration()})
             elif parts == ["api", "bootstrap"] and method == "GET":
-                self._json(self.service.bootstrap())
+                boot = self.service.bootstrap()
+                self._json(dict(boot, blueprints=[self._blueprint_summary(bp) for bp in boot["blueprints"]]))
             elif parts == ["api", "overview"] and method == "GET":
                 self._json(self.service.overview())
             elif parts == ["api", "metrics"] and method == "GET":
@@ -166,11 +173,14 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             elif parts == ["api", "activity"] and method == "GET":
                 self._json(self.service.activity(int(query.get("limit", [30])[0])))
             elif parts == ["api", "blueprints"] and method == "GET":
-                self._json(self.service.list_blueprints())
+                self._json([self._blueprint_summary(bp) for bp in self.service.list_blueprints()])
             elif parts == ["api", "blueprints"] and method == "POST":
                 self._json(self.service.save_blueprint(self._body()), HTTPStatus.CREATED)
             elif len(parts) == 3 and parts[:2] == ["api", "blueprints"] and method == "GET":
-                self._json(self.service.get_blueprint(int(parts[2])))
+                self._json(self._blueprint_summary(self.service.get_blueprint(int(parts[2]))))
+            elif len(parts) == 4 and parts[:2] == ["api", "blueprints"] and parts[3] == "assignment" and method == "GET":
+                bp = self.service.get_blueprint(int(parts[2]))
+                self._json({"assignment_markdown": bp["assignment_markdown"], "student_visible": bool(bp["student_visible"])})
             elif len(parts) == 3 and parts[:2] == ["api", "blueprints"] and method == "PATCH":
                 self._json(self.service.save_blueprint(self._body(), int(parts[2])))
             elif len(parts) == 3 and parts[:2] == ["api", "blueprints"] and method == "DELETE":
@@ -244,6 +254,13 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self._json({"error": f"Внутренняя ошибка: {exc}", "code": "server_error"}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
 
+    @staticmethod
+    def _blueprint_summary(bp):
+        # Draft text belongs only in the protected teacher editor. Public admin
+        # bootstrap is also fetched by browsers that have not supplied a token.
+        return {k: v for k, v in bp.items() if k not in ("assignment_markdown", "assignment_template_name")}
+
+
 def secrets_compare(left: str, right: str) -> bool:
     import hmac
     return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
@@ -284,6 +301,7 @@ def main() -> None:
 
     DashboardHandler.student_mount = StudentMount(
         student_db, admin_db.with_name("student-demo-catalog.json"),
+        published_catalog=lambda: published_assignments(admin_db),
         secure_cookie=gateway.mode == "live", example_if_missing=gateway.mode == "demo",
         pilot_validator=make_pilot_validator(admin_db) if gateway.mode == "live" else None,
         pilot_grant=grant, set_duration=set_student_duration if grant else None,

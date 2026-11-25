@@ -585,6 +585,25 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
   .consumer-cap-row { padding: 12px; gap: 8px; }
 }
 
+.assignment-author { display: grid; gap: .75rem; min-width: 0; }
+.assignment-author > :is(h3,p) { margin: 0; }
+.assignment-author .assignment-source { display: block; min-height: 9rem; padding: .75rem; font-size: .95rem; line-height: 1.55; resize: vertical; }
+.assignment-preview { overflow-wrap: anywhere; border: 1px solid var(--line); border-radius: 8px; }
+.assignment-preview summary { cursor: pointer; padding: .7rem .9rem; font-weight: 650; }
+.assignment-md { padding: .8rem 1rem; border-top: 1px solid var(--line); font-size: 1rem; line-height: 1.55; min-width: 0; overflow-x: auto; }
+.assignment-md > :first-child { margin-top: 0; }
+.assignment-md > :last-child { margin-bottom: 0; }
+.assignment-md :is(h1,h2,h3,h4,h5,h6) { margin: .8em 0 .4em; color: var(--ink); line-height: 1.25; }
+.assignment-md h1 { font-size: 1.4em; }
+.assignment-md h2 { font-size: 1.25em; }
+.assignment-md p { margin: .5em 0; font-size: inherit; color: inherit; }
+.assignment-md :is(ul,ol) { margin: .5em 0; padding-inline-start: 1.6em; }
+.assignment-md pre { overflow: auto; padding: .7em; border-radius: 6px; background: var(--surface-muted); }
+.assignment-md blockquote { margin-inline: 0; padding-inline-start: .8em; border-inline-start: 3px solid var(--line-strong); }
+.assignment-md :is(th,td) { padding: .3em .5em; border: 1px solid var(--line); }
+.assignment-publish { display: flex; align-items: center; gap: .55rem; font-size: .95rem; font-weight: 650; cursor: pointer; }
+.assignment-publish input { width: 1.1rem; height: 1.1rem; accent-color: var(--accent); }
+.assignment-publish:has(:disabled) { color: var(--ink-muted); cursor: default; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }

@@ -58,6 +58,32 @@ function managedFixture() {
     if (mode === "managed" && $("[data-status]").textContent === "Ожидает решения преподавателя" && $("[data-stand-reason]").textContent === "Узел занят" && !$("[data-copy-password]") && !document.body.innerText.includes("Учебный симулятор")) document.body.dataset.qa = "pass";
   },50));
 }
+function assignmentFixture() {
+  const md = '## Шаги\n\n- **Соберите** схему\n- `ip -br a`\n\n![diagram](https://invalid.example/image.png)\n\n<img src="/never" onerror="window.injection=true">';
+  const a = {id:"task",title:"Паспорт сети",description:"",template_name:"PR1",template_vmid:276,steps:[],assignment_markdown:md};
+  const student = {login:"class01",name:"Test",group:"ДЭ-24",managed:true};
+  const stand = {id:"fixture",name:"Личная VM",real:true,status:"ready",access:{kind:"proxmox",login:"root@pam",vmid:321,url:"https://10.39.0.9:8006/"}};
+  let hidden = false, blob, filename;
+  const task = () => ({...a,withdrawn:hidden,stand}); // Leave stale text intentionally: the client must not show it.
+  window.fetch = async url => new Response(JSON.stringify(url.endsWith("/me") ? {student,assignments:[task()]} : {assignment:task(),stand}));
+  URL.createObjectURL = b => {blob=b; return "blob:test";};
+  const click = HTMLAnchorElement.prototype.click;
+  HTMLAnchorElement.prototype.click = function() { if (this.download) filename=this.download; else click.call(this); };
+  window.addEventListener("load",()=>setTimeout(async () => {
+    const $ = sel => document.querySelector(sel), delay = () => new Promise(resolve=>setTimeout(resolve,80));
+    $(".assignment details summary").click();
+    if ($(".assignment-md strong")?.textContent !== "Соберите" || $(".assignment-md img")) return;
+    $("[data-open-stand]").click(); await delay();
+    if ($(".sheet .assignment-md h2")?.textContent !== "Шаги" || !$("[data-open-proxmox]")) return;
+    $("#download-assignment").click();
+    if (!filename?.endsWith(".md") || blob.type !== "text/markdown;charset=utf-8" || await blob.text() !== md || window.injection) return;
+    hidden = true; window.dispatchEvent(new Event("online")); await delay();
+    if ($("#download-assignment") || $(".assignment-md") || document.body.innerText.includes("Паспорт сети") || !$("[data-open-proxmox]")) return;
+    location.hash = "assignments"; await delay();
+    if ($("details summary") || !$("[data-deploy]").hidden || $("[data-open-stand]").hidden || document.body.textContent.includes(md)) return;
+    document.body.dataset.qa = "pass";
+  },50));
+}
 function fixture() {
   const mode = location.search.slice(1), secret = "fake-" + crypto.randomUUID();
   let reads = 0, writes = 0, actual = "", dialogs = 0, bad = false;
@@ -110,13 +136,13 @@ function fixture() {
   const html = (dir, script) => fs.readFileSync(path.join(dir,"index.html"),"utf8").replace("<head>","<head><script>(" + script.toString() + ")()</script>");
   const server = http.createServer((req,res) => {
     if (req.url === "/?teacher") { res.setHeader("Content-Type","text/html; charset=utf-8"); res.end(html(path.dirname(web),teacherFixture)); return; }
-    if (req.url.startsWith("/student-demo/?")) { res.setHeader("Content-Type","text/html; charset=utf-8"); res.end(html(web,req.url.includes("?managed") ? managedFixture : fixture)); return; }
+    if (req.url.startsWith("/student-demo/?")) { res.setHeader("Content-Type","text/html; charset=utf-8"); res.end(html(web,req.url.includes("?assignment") ? assignmentFixture : req.url.includes("?managed") ? managedFixture : fixture)); return; }
     const asset = req.url.split("?")[0];
     if (["/styles.css","/app.js"].includes(asset)) {
       res.setHeader("Content-Type",asset.endsWith(".js") ? "text/javascript" : "text/css"); res.end(fs.readFileSync(path.join(web,"..",asset.slice(1)))); return;
     }
     const name = req.url.slice("/student-demo/".length);
-    if (["student.css","student.js"].includes(name)) {
+    if (["student.css","student.js","assignment-markdown.js"].includes(name)) {
       res.setHeader("Content-Type",name.endsWith(".js") ? "text/javascript" : "text/css"); res.end(fs.readFileSync(path.join(web,name))); return;
     }
     res.writeHead(404).end();
@@ -124,8 +150,8 @@ function fixture() {
   await new Promise(resolve => server.listen(0,"127.0.0.1",resolve));
   const profile = fs.mkdtempSync(path.join(os.tmpdir(),"deployer-smoke-"));
   try {
-    for (const mode of ["item","text","denied","forbidden","login","teacher","managed"]) {
-      const url = "http://127.0.0.1:" + server.address().port + (mode === "teacher" ? "/?teacher" : "/student-demo/?" + mode + (mode === "managed" ? "" : "#stands/fixture"));
+    for (const mode of ["item","text","denied","forbidden","login","teacher","managed","assignment"]) {
+      const url = "http://127.0.0.1:" + server.address().port + (mode === "teacher" ? "/?teacher" : "/student-demo/?" + mode + (["managed","assignment"].includes(mode) ? "" : "#stands/fixture"));
       const {stdout} = await run(chrome,["--headless","--disable-gpu","--no-first-run","--disable-background-networking","--user-data-dir=" + profile,"--virtual-time-budget=3000","--dump-dom",url],{timeout:45000,maxBuffer:1_500_000});
       if (!stdout.includes('data-qa="pass"')) throw Error("Failed case: " + mode);
       console.log("PASS", mode);

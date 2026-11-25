@@ -85,10 +85,12 @@ class StudentPortal:
     DEPLOY_SECONDS = 8
 
     def __init__(self, db_path: str | Path, catalog: Callable[[], list[dict]], *, clock=time.time,
-                 pilot_validator: Callable[[dict], bool] | None = None, pilot_grant=None, set_duration=None, labs=None):
+                 pilot_validator: Callable[[dict], bool] | None = None, pilot_grant=None, set_duration=None,
+                 labs=None, published_catalog=None):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._catalog = catalog
+        self._published_catalog = published_catalog
         self._clock = clock
         self._pilot_validator = pilot_validator
         self._pilot_grant = pilot_grant
@@ -233,15 +235,18 @@ class StudentPortal:
         # The catalogue provider supplies public teaching material only. Do not
         # let additional fields such as scripts/credentials into the student API.
         unique = {}
-        for source in self._catalog():
+        classroom = self._published_catalog is not None and (self._managed(login) or self._private_login(login))
+        for source in (self._published_catalog() if classroom else self._catalog()):
             key = source["id"]
             if not isinstance(key, str) or not key or key in unique:
                 continue
             task = {k: source[k] for k in ("id", "title", "description", "template_name", "template_vmid")}
             task["steps"] = list(source["steps"])
+            if isinstance(source.get("assignment_markdown"), str):
+                task["assignment_markdown"] = source["assignment_markdown"]
             unique[key] = task
         keys = list(unique)
-        if len(keys) < 2 or self._managed(login):
+        if classroom or len(keys) < 2 or self._managed(login):
             selected = keys
         elif login == "student01":
             selected = keys[:2] + keys[3::2]
@@ -329,9 +334,16 @@ class StudentPortal:
             tasks = {key: dict(task, stand=None) for key, task in self._assigned(login).items()}
             rows = db.execute(_STANDS + " WHERE s.login=? ORDER BY s.started, s.id", (login,))
             for row in rows:
-                # Stands retain the exact assignment and template they started
-                # with, even when a teacher removes/edits the catalogue entry.
-                tasks[row["assignment_id"]] = dict(json.loads(row["task_json"]), stand=self._stand(row))
+                key = row["assignment_id"]
+                if self._published_catalog is None:
+                    task = json.loads(row["task_json"])  # standalone demo snapshot
+                elif key in tasks:
+                    task = tasks[key]
+                else:
+                    task = self._withdrawn_task(row)
+                    if task is None:
+                        continue
+                tasks[key] = dict(task, stand=self._stand(row))
             if login in _ACCOUNTS:
                 name, group = _ACCOUNTS[login][:2]
                 managed = self._private_login(login)
@@ -356,7 +368,19 @@ class StudentPortal:
             result["access"] = state["access"]
         return result
 
-    def _prepare_real(self, db, login, assignment_id, row, minutes):
+    def _withdrawn_task(self, row):
+        # Keep the owner's existing VM usable without revealing a withdrawn
+        # assignment or the stale Markdown pinned in its original request.
+        if row["real_request"]:
+            if self._real_state(row)["status"] in {"pending", "removed"}:
+                return None
+        elif not self._owned_binding(row) and not self._matches(
+                read_pilot_request(self.db_path.with_name("student-pilot-request.json")), row):
+            return None
+        return {"id": row["assignment_id"], "title": "Мой стенд", "withdrawn": True,
+                "description": "", "steps": [], "template_name": "—", "template_vmid": None}
+
+    def _prepare_real(self, db, login, assignment_id, row, minutes, assigned):
         if self._labs is None:
             raise StudentError(503, "Сервис реальных стендов не настроен. Обратитесь к преподавателю.")
         # One retained personal VM per student. Concurrent tabs share this SQLite
@@ -365,7 +389,9 @@ class StudentPortal:
             if other["assignment_id"] == assignment_id:
                 continue
             if other["real_request"]:
-                if self._real_state(other)["status"] == "removed":
+                status = self._real_state(other)["status"]
+                if status == "removed" or (status == "pending" and self._published_catalog is not None
+                                           and other["assignment_id"] not in assigned):
                     continue
             elif not self._owned_binding(other) and not self._matches(
                     read_pilot_request(self.db_path.with_name("student-pilot-request.json")), other):
@@ -373,7 +399,7 @@ class StudentPortal:
             raise StudentError(409, "У вас уже есть личный стенд или заявка. Для смены задания обратитесь к преподавателю.")
         if row and row["real_request"] and self._real_state(row)["status"] != "removed":
             return row  # reuse the exact saved task, duration and request ID
-        task = self._assigned(login).get(assignment_id)
+        task = assigned.get(assignment_id)
         if not task:
             raise StudentError(404, "Задание не найдено среди опубликованных")
         if row:
@@ -391,6 +417,9 @@ class StudentPortal:
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             login, _ = self._session(db, token)
+            assigned = self._assigned(login)
+            if self._published_catalog is not None and assignment_id not in assigned:
+                raise StudentError(404, "Задание не опубликовано или недоступно")
             row = db.execute(_STANDS + " WHERE s.login=? AND s.assignment_id=?",
                              (login, assignment_id)).fetchone()
             personal = self._managed(login, db) or (self._labs is not None and self._private_login(login))
@@ -398,14 +427,14 @@ class StudentPortal:
                 if row and not row["real_request"] and (self._owned_binding(row) or self._matches(
                         read_pilot_request(self.db_path.with_name("student-pilot-request.json")), row)):
                     return self._stand(row)
-                row = self._prepare_real(db, login, assignment_id, row, duration_minutes)
+                row = self._prepare_real(db, login, assignment_id, row, duration_minutes, assigned)
             elif row is not None and self._stand(row)["status"] == "expired" and not self._owned_binding(row):
                 intent = read_pilot_request(self.db_path.with_name("student-pilot-request.json"))
                 if not self._matches(intent, row):
                     db.execute("DELETE FROM student_stands WHERE id=? AND login=?", (row["id"], login))
                     row = None
             if row is None:
-                task = self._assigned(login).get(assignment_id)
+                task = assigned.get(assignment_id)
                 if task is None:
                     raise StudentError(404, "Задание не найдено")
                 stand_id = secrets.token_hex(12)
@@ -429,8 +458,14 @@ class StudentPortal:
 
     def get_stand(self, token, stand_id):
         row, _ = self._own_row_and_stamp(token, stand_id)
+        if self._published_catalog is None:
+            task = json.loads(row["task_json"])
+        else:
+            task = self._assigned(row["login"]).get(row["assignment_id"]) or self._withdrawn_task(row)
+            if task is None:
+                raise StudentError(404, "Задание не опубликовано или недоступно")
         stand = self._stand(row, detail=True)
-        assignment = dict(json.loads(row["task_json"]), stand={k:v for k,v in stand.items() if k not in ("access", "pilot_pending")})
+        assignment = dict(task, stand={k:v for k,v in stand.items() if k not in ("access", "pilot_pending")})
         return {"stand": stand, "assignment": assignment}
 
     def guest_action(self, token, stand_id, action, data):

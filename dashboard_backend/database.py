@@ -248,6 +248,15 @@ class DashboardStore:
         """
         with self.connect() as connection:
             connection.executescript(schema)
+            # New and upgraded databases both require an explicit teacher publication.
+            bp_columns = {row[1] for row in connection.execute("PRAGMA table_info(blueprints)")}
+            for column, definition in (
+                ("assignment_markdown", "TEXT NOT NULL DEFAULT '' CHECK(length(assignment_markdown)<=32000)"),
+                ("student_visible", "INTEGER NOT NULL DEFAULT 0 CHECK(student_visible IN (0,1))"),
+                ("assignment_template_name", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if column not in bp_columns:
+                    connection.execute(f"ALTER TABLE blueprints ADD COLUMN {column} {definition}")
             stand_columns = {row[1] for row in connection.execute("PRAGMA table_info(stands)")}
             if "origin" not in stand_columns:
                 connection.execute("ALTER TABLE stands ADD COLUMN origin TEXT NOT NULL DEFAULT 'deployed'")
@@ -486,6 +495,8 @@ printf '%s\\n' \"${results[@]}\"""",
         if row is None:
             return None
         item = dict(row)
+        if "student_visible" in item:
+            item["student_visible"] = bool(item["student_visible"])
         for key in ("tags", "details"):
             if key in item and isinstance(item[key], str):
                 try:

@@ -584,7 +584,7 @@ exit 75`;
     return `<article class="blueprint-card blueprint-card--${tones[blueprint.category] || "slate"}">
       <div class="blueprint-card__top"><span class="blueprint-card__mark">${icon(blueprint.category === "Безопасность" ? "shield" : blueprint.category === "Сети" ? "activity" : "server")}</span><span>${statusChip(blueprint.status)}</span></div>
       <div class="blueprint-card__body"><div class="blueprint-code">${escapeHtml(blueprint.code)} · v${escapeHtml(blueprint.version)}</div><h3>${escapeHtml(blueprint.name)}</h3><p>${escapeHtml(blueprint.description)}</p>
-        <div class="tag-list">${(blueprint.tags || []).map(tag => `<span class="tag">${escapeHtml(tag)}</span>`).join("")}</div></div>
+        <div class="tag-list">${blueprint.student_visible && blueprint.status === "active" ? '<span class="tag">В кабинете студентов</span>' : ""}${(blueprint.tags || []).map(tag => `<span class="tag">${escapeHtml(tag)}</span>`).join("")}</div></div>
       <div class="blueprint-specs"><span><small>Шаблон VMID</small><strong class="mono">${blueprint.template_vmid}</strong></span><span><small>Версия</small><strong>${escapeHtml(blueprint.version)}</strong></span><span><small>Проверки</small><strong>${blueprint.checks_count || "—"}</strong></span></div>
       <div class="blueprint-card__footer"><button class="button button--primary button--small" data-open-deploy="${blueprint.id}" ${blueprint.status !== "active" ? "disabled title=\"Сначала опубликуйте сценарий\"" : ""}>${icon("power")}Развернуть</button>
         <div><button class="icon-button" data-blueprint-duplicate="${blueprint.id}" title="Дублировать">${icon("copy")}</button><button class="icon-button" data-blueprint-edit="${blueprint.id}" title="Редактировать">${icon("edit")}</button><button class="icon-button" data-blueprint-delete="${blueprint.id}" title="Удалить">${icon("trash")}</button></div></div>
@@ -1472,8 +1472,30 @@ exit 75`;
     return true;
   }
 
-  function openBlueprintEditor(id = null) {
+  async function openBlueprintEditor(id = null, mayUnlock = true) {
     const original = id ? state.data.blueprints.find(item => item.id === Number(id)) : null;
+    if (id && !original) { toast("Этот сценарий уже недоступен", "error"); return; }
+    let assignment = {assignment_markdown:"", student_visible:false};
+    if (original) {
+      const route = state.route;
+      showModal({title:"Редактировать сценарий", subtitle:original.name, body:'<p role="status">Загружаем задание…</p>'});
+      const loading = activeModalToken;
+      try {
+        const result = await api(`/api/blueprints/${original.id}/assignment`, {promptAdmin:false});
+        if (activeModalToken !== loading || state.route !== route) return;
+        if (typeof result.assignment_markdown !== "string" || ![true,false,0,1].includes(result.student_visible))
+          throw new Error("Не удалось загрузить сохранённое задание.");
+        assignment = result;
+      } catch (error) {
+        if (activeModalToken !== loading || state.route !== route) return;
+        if (error.status === 401 && mayUnlock) {
+          const prompt = requestAdminToken(), unlock = activeModalToken;
+          if (await prompt && activeModalToken === unlock + 1 && state.route === route) return openBlueprintEditor(id,false);
+          return;
+        }
+        closeModal(); toast(error.message, "error"); return;
+      }
+    }
     const blueprint = original || {
       code: "NEW-01", name: "", description: "", category: "Общий", version: "1.0", status: "draft",
       template_vmid: 0, tags: [], deploy_script: VKLVIKL_BOOTSTRAP_SCRIPT,
@@ -1487,10 +1509,42 @@ exit 75`;
       <label class="field"><span class="field-label">Категория</span><select class="input" name="category">${["Сети", "Системы", "Безопасность", "Базы данных", "Общий"].map(value => `<option ${blueprint.category === value ? "selected" : ""}>${value}</option>`).join("")}</select></label><label class="field"><span class="field-label">Статус</span><select class="input" name="status"><option value="draft" ${blueprint.status === "draft" ? "selected" : ""}>Черновик</option><option value="active" ${blueprint.status === "active" ? "selected" : ""}>Опубликован</option><option value="archived" ${blueprint.status === "archived" ? "selected" : ""}>Архив</option></select></label>
       <label class="field"><span class="field-label">Версия</span><input class="input" name="version" value="${escapeHtml(blueprint.version)}"></label><label class="field"><span class="field-label">Теги через запятую</span><input class="input" name="tags" value="${escapeHtml((blueprint.tags || []).join(", "))}"></label></div></div>
       <div class="form-section"><h3>Шаблон Proxmox</h3><p>Количество VM, подсеть и bridge оператор укажет при развёртывании стенда. Используются только связанные клоны.</p><div class="form-grid"><label class="field field--full"><span class="field-label">QEMU-шаблон</span><select class="input mono" name="template_vmid" required>${templateOptions}</select><small class="field-hint">Показываются VM, отмеченные в Proxmox как Template</small></label></div></div>
+      <section class="form-section assignment-author" aria-labelledby="assignment-heading"><h3 id="assignment-heading">Задание для студентов</h3>
+        <p>Название сценария станет названием задания. Опишите, что студент должен сделать на своём стенде и как сдавать работу.</p>
+        <label class="field"><span class="field-label">Условие в Markdown</span><textarea class="input textarea mono assignment-source" name="assignment_markdown" rows="7" maxlength="32000" placeholder="## Цель работы&#10;&#10;1. Подготовьте стенд.&#10;2. Проверьте результат."></textarea></label>
+        <details class="assignment-preview"><summary>Предпросмотр задания</summary><article class="assignment-md" data-assignment-preview></article></details>
+        <label class="assignment-publish"><input type="checkbox" name="student_visible" ${assignment.student_visible ? "checked" : ""}><span>Показывать задание студентам</span></label>
+        <small class="field-hint" data-assignment-visibility></small>
+      </section>
       <div class="form-section"><h3>Bootstrap-скрипт</h3><p>Скрипт запускается через QEMU Guest Agent внутри каждой созданной VM.</p><div class="editor-shell editor-shell--compact"><div class="editor-toolbar"><div class="editor-file">${icon("terminal")}deploy.sh</div><div class="editor-actions"><button class="editor-template-button" type="button" data-use-vklvikl-bootstrap>Вставить из vklvikl</button><span class="editor-safety">guest only</span></div></div><textarea class="code-editor" name="deploy_script" spellcheck="false">${escapeHtml(blueprint.deploy_script)}</textarea></div><small class="field-hint">Исходный скрипт рассчитан на Linux с интерфейсом vmbr0 и gateway 10.39.1.1; значения можно изменить через GUEST_INTERFACE и VM_GATEWAY.</small></div></form>`;
     const footer = `<button class="button" data-close-modal type="button">Отмена</button><button class="button button--primary" type="submit" form="blueprint-form">${icon("check")}${original ? "Сохранить изменения" : "Создать сценарий"}</button>`;
     showModal({ title: original ? "Редактировать сценарий" : "Новый сценарий", subtitle: original ? `${original.code} · версия ${original.version}` : "Новый сценарий создаётся как черновик", body, footer, size: "large" });
     const form = modalRoot.querySelector("#blueprint-form");
+    const editing = activeModalToken;
+    const markdown = form.elements.assignment_markdown, visible = form.elements.student_visible;
+    const preview = form.querySelector(".assignment-preview"), content = form.querySelector("[data-assignment-preview]");
+    markdown.value = assignment.assignment_markdown;
+    function updateAssignment() {
+      const text = markdown.value.trim();
+      const active = form.elements.status.value === "active";
+      form.elements.template_vmid.required = active;
+      const hasTemplate = Number(form.elements.template_vmid.value) > 0;
+      // Changing a scenario to a draft/archive also withdraws its publication.
+      visible.disabled = !active || !hasTemplate;
+      if (visible.disabled) visible.checked = false;
+      markdown.required = visible.checked;
+      markdown.setCustomValidity(visible.checked && !text ? "Для публикации введите условие задания." : "");
+      form.querySelector("[data-assignment-visibility]").textContent = !active || !hasTemplate
+        ? "Чтобы показать задание, выберите статус «Опубликован» и шаблон Proxmox. До этого его можно сохранить как черновик."
+        : visible.checked ? "После сохранения задание появится в учебном кабинете."
+          : "После сохранения условие будет скрыто. Выданные стенды не выключатся.";
+      if (!preview.open) return;
+      if (text && window.AssignmentMarkdown) content.innerHTML = window.AssignmentMarkdown.render(markdown.value);
+      else content.textContent = text || "Здесь появится оформленное условие задания.";
+    }
+    [markdown, visible, form.elements.status, form.elements.template_vmid].forEach(field => field.addEventListener("input", updateAssignment));
+    preview.addEventListener("toggle",updateAssignment);
+    updateAssignment();
     modalRoot.querySelector("[data-use-vklvikl-bootstrap]").addEventListener("click", () => {
       const editor = form.elements.deploy_script;
       const placeholder = "#!/usr/bin/env bash\nset -euo pipefail\n\n# Подготовка гостевой VM";
@@ -1502,13 +1556,33 @@ exit 75`;
     });
     form.addEventListener("submit", async event => {
       event.preventDefault();
-      const submit = modalRoot.querySelector("button[type=submit]"); submit.disabled = true;
+      const submit = modalRoot.querySelector('[form="blueprint-form"]');
+      if (submit.disabled) return;
+      updateAssignment();
+      if (!form.reportValidity()) return;
+      submit.disabled = true;
       const values = Object.fromEntries(new FormData(form).entries());
+      values.template_vmid = Number(values.template_vmid) || 0;
+      values.student_visible = visible.checked;
       values.tags = values.tags.split(",").map(item => item.trim()).filter(Boolean);
       try {
-        await api(original ? `/api/blueprints/${original.id}` : "/api/blueprints", { method: original ? "PATCH" : "POST", body: values });
-        closeModal(); toast(original ? "Сценарий сохранён" : "Сценарий создан"); await loadData();
-      } catch (error) { submit.disabled = false; toast(error.message, "error"); }
+        const tokenField = form.querySelector("[data-blueprint-token]");
+        await api(original ? `/api/blueprints/${original.id}` : "/api/blueprints", { method: original ? "PATCH" : "POST", body: values,
+          promptAdmin:false, headers:tokenField?.value ? {"X-Admin-Token":tokenField.value.trim()} : {} });
+        if (editing === activeModalToken) closeModal();
+        toast(original ? "Сценарий сохранён" : "Сценарий создан"); await loadData();
+      } catch (error) {
+        if (editing !== activeModalToken) return;
+        submit.disabled = false;
+        if (error.status === 401) {
+          let tokenField = form.querySelector("[data-blueprint-token]");
+          if (!tokenField) {
+            form.insertAdjacentHTML("beforeend", '<label class="field"><span class="field-label">Административный токен для сохранения</span><input class="input" type="password" data-blueprint-token autocomplete="off" required><small class="field-hint">Черновик остался в форме. Введите токен и нажмите «Сохранить» ещё раз.</small></label>');
+            tokenField = form.querySelector("[data-blueprint-token]");
+          }
+          tokenField.focus();
+        } else toast(error.message, "error");
+      }
     });
   }
 

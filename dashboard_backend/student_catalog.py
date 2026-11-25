@@ -9,13 +9,29 @@ from contextlib import closing
 from pathlib import Path
 
 
-def public_templates(db_path: Path, templates: list[dict]) -> list[dict]:
-    """Join published scenario metadata to *currently verified* QEMU templates."""
-    names = {int(t["vmid"]): str(t["name"]) for t in templates if t.get("vmid") and t.get("name")}
+def _published_rows(db_path: Path):
     with closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
-        rows = db.execute("SELECT id, name, template_vmid FROM blueprints WHERE status='active' ORDER BY id")
-        return [{"blueprint_id": bp, "scenario": title.strip(), "vmid": vmid, "template": names[vmid]}
-                for bp, title, vmid in rows if vmid in names]
+        # Allow an operator to export an old, not-yet-migrated database, but
+        # do not infer consent to publish from a deployment scenario being active.
+        columns = {r[1] for r in db.execute("PRAGMA table_info(blueprints)")}
+        if not {"assignment_markdown", "student_visible", "assignment_template_name"} <= columns:
+            return []
+        rows = db.execute("""SELECT id,name,template_vmid,assignment_template_name,assignment_markdown
+            FROM blueprints WHERE status='active' AND student_visible=1 AND template_vmid>0
+            AND assignment_template_name!='' ORDER BY id""")
+        return [{"blueprint_id":bp,"scenario":name,"vmid":vmid,"template":template,"assignment_markdown":md}
+                for bp,name,vmid,template,md in rows if md.strip()]
+
+
+def published_assignments(db_path: Path) -> list[dict]:
+    """Read the current teacher-authored catalogue, without reading any scripts or contacting PVE."""
+    return make_assignments(_published_rows(db_path))
+
+
+def public_templates(db_path: Path, templates: list[dict]) -> list[dict]:
+    """Export explicitly published material only if its pinned template still matches."""
+    verified = {(t["vmid"], t["name"]) for t in templates if t.get("vmid") and t.get("name")}
+    return [r for r in _published_rows(db_path) if (r["vmid"], r["template"]) in verified]
 
 
 def _exercise(name: str) -> tuple:
@@ -78,6 +94,13 @@ def make_assignments(rows: list[dict]) -> list[dict]:
     result = []
     for row in rows:
         template, scenario = row["template"], row["scenario"]
+        if "assignment_markdown" in row:
+            result.append((0, int(row["blueprint_id"]), {
+                "id": f"lab-{int(row['blueprint_id'])}-{int(row['vmid'])}",
+                "title": scenario, "description": "", "steps": [], "assignment_markdown":row["assignment_markdown"],
+                "template_name": template, "template_vmid": int(row["vmid"]),
+            }))
+            continue
         rank, title, description, steps = _exercise((template + " " + scenario).casefold())
         result.append((rank, int(row["blueprint_id"]), {
             "id": f"lab-{int(row['blueprint_id'])}-{int(row['vmid'])}",
@@ -87,19 +110,22 @@ def make_assignments(rows: list[dict]) -> list[dict]:
     return [task for _, _, task in sorted(result, key=lambda t: (t[0], t[1]))]
 
 
+def demo_assignments() -> list[dict]:
+    """Standalone demonstration; never mix the classroom's real published work with public personas."""
+    return make_assignments([
+        {"blueprint_id": 1, "scenario": "Сетевое администрирование", "vmid": 9001, "template": "debian-12-network"},
+        {"blueprint_id": 2, "scenario": "Системное администрирование", "vmid": 9002, "template": "windows-server-2022"},
+        {"blueprint_id": 3, "scenario": "Информационная безопасность", "vmid": 9003, "template": "debian-12-security"},
+    ])
+
+
 def load_catalog(path: Path, *, example_if_missing: bool = True) -> list[dict]:
     # The standalone example uses the same demo templates as the operator UI.
     # An existing (even empty) snapshot always wins over the offline examples.
     try:
         rows = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        if not example_if_missing:
-            return []
-        rows = [
-            {"blueprint_id": 1, "scenario": "Сетевое администрирование", "vmid": 9001, "template": "debian-12-network"},
-            {"blueprint_id": 2, "scenario": "Системное администрирование", "vmid": 9002, "template": "windows-server-2022"},
-            {"blueprint_id": 3, "scenario": "Информационная безопасность", "vmid": 9003, "template": "debian-12-security"},
-        ]
+        return demo_assignments() if example_if_missing else []
     return make_assignments(rows)
 
 

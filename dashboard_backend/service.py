@@ -696,9 +696,18 @@ class DashboardService:
     def save_blueprint(self, payload: dict[str, Any], blueprint_id: int | None = None) -> dict[str, Any]:
         fields = {
             "code", "name", "description", "category", "version", "status", "template_vmid",
-            "tags", "deploy_script", "autocheck_script", "checks_count",
+            "tags", "deploy_script", "autocheck_script", "checks_count", "assignment_markdown", "student_visible",
         }
         data = {key: payload[key] for key in fields if key in payload}
+        original = self.get_blueprint(blueprint_id) if blueprint_id is not None else {}
+        if blueprint_id is not None and not data:
+            return original
+        if "student_visible" in data and type(data["student_visible"]) is not bool:
+            raise ValidationError("Поле «Показывать задание студентам» должно быть логическим")
+        if "assignment_markdown" in data:
+            md = data["assignment_markdown"]
+            if not isinstance(md, str) or len(md) > 32000 or "\x00" in md:
+                raise ValidationError("Текст задания должен содержать не более 32 000 символов и не содержать NUL")
         if blueprint_id is None and (not str(data.get("name", "")).strip() or not str(data.get("code", "")).strip()):
             raise ValidationError("Укажите название и код сценария")
         if "name" in data and not str(data["name"]).strip():
@@ -717,6 +726,32 @@ class DashboardService:
             raise ValidationError("Количество проверок должно быть от 0 до 1000")
         if "status" in data and data["status"] not in {"active", "draft", "archived"}:
             raise ValidationError("Неизвестный статус сценария")
+        status = data.get("status", original.get("status", "draft"))
+        visible = data.get("student_visible", original.get("student_visible", False))
+        if status != "active":
+            if data.get("student_visible") is True:
+                raise ValidationError("Публиковать задания можно только у активных сценариев")
+            visible = False
+        if visible:
+            if not data.get("assignment_markdown", original.get("assignment_markdown", "")).strip():
+                raise ValidationError("Перед публикацией заполните текст задания")
+            vmid = data.get("template_vmid", original.get("template_vmid", 0))
+            if not 1 <= vmid <= 999999999:
+                raise ValidationError("Перед публикацией выберите шаблон VM")
+            if (not original.get("student_visible") or vmid != original.get("template_vmid")
+                    or not original.get("assignment_template_name")):
+                # Only the operator checks Proxmox. Student catalogue reads never contact it.
+                try:
+                    name = next((t["name"] for t in self.list_templates() if t.get("vmid")==vmid
+                                 and isinstance(t.get("name"), str) and t["name"].strip()), None)
+                except Exception as exc:
+                    raise ConflictError("Не удалось проверить шаблон в Proxmox. Задание не опубликовано") from exc
+                if name is None:
+                    raise ValidationError("Выбранный шаблон не найден в Proxmox")
+                data["assignment_template_name"] = name
+        else:
+            data["assignment_template_name"] = ""
+        data["student_visible"] = visible
         if "tags" in data:
             if not isinstance(data["tags"], list):
                 data["tags"] = [part.strip() for part in str(data["tags"]).split(",") if part.strip()]
@@ -739,12 +774,17 @@ class DashboardService:
             )
             self.store.add_activity("script", "Создан сценарий", str(defaults["name"]), "success")
             return self.get_blueprint(new_id)
-        self.get_blueprint(blueprint_id)
-        if not data:
-            return self.get_blueprint(blueprint_id)
         data["updated_at"] = now
         assignments = ", ".join(f"{column} = ?" for column in data)
-        self.store.execute(f"UPDATE blueprints SET {assignments} WHERE id = ?", tuple(data.values()) + (blueprint_id,))
+        # Do not race a hide, a teacher's article edit or template replacement
+        # while waiting for the Proxmox check above.
+        guarded = ("student_visible", "assignment_markdown", "assignment_template_name", "template_vmid", "status")
+        predicates = " AND ".join(f"{column}=?" for column in guarded)
+        with self.store.transaction() as conn:
+            cursor = conn.execute(f"UPDATE blueprints SET {assignments} WHERE id=? AND {predicates}",
+                                  (*data.values(), blueprint_id, *(original[k] for k in guarded)))
+            if not cursor.rowcount:
+                raise ConflictError("Сценарий изменился. Обновите карточку и повторите сохранение")
         updated = self.get_blueprint(blueprint_id)
         self.store.add_activity("script", "Сценарий обновлён", updated["name"], "success")
         return updated
@@ -756,6 +796,7 @@ class DashboardService:
         payload["code"] = f"{source['code']}-COPY"
         payload["version"] = "1.0"
         payload["status"] = "draft"
+        payload["student_visible"] = False
         return self.save_blueprint(payload)
 
     def delete_blueprint(self, blueprint_id: int) -> None:
@@ -1069,12 +1110,16 @@ class DashboardService:
             if student_receipt is not None:
                 if (vm_count != 1 or use_existing_pool or self.gateway.mode != "live" or
                         blueprint["template_vmid"] != student_receipt["template_vmid"] or
-                        not connection.execute("SELECT 1 FROM blueprints WHERE id=? AND template_vmid=? AND status='active'",
-                                               (blueprint_id, student_receipt["template_vmid"])).fetchone()):
+                        not connection.execute("""SELECT 1 FROM blueprints WHERE id=? AND template_vmid=? AND status='active'
+                                               AND student_visible=1 AND assignment_template_name=?""",
+                                               (blueprint_id, student_receipt["template_vmid"], student_receipt["template_name"])).fetchone()):
                     raise ConflictError("Учебный шаблон изменился; обратитесь к преподавателю")
                 if connection.execute("SELECT 1 FROM student_lab_receipts WHERE card_id=?",
                                       (student_receipt["card_id"],)).fetchone():
                     raise ConflictError("Эта учебная карточка уже зарегистрирована")
+                if connection.execute("""SELECT 1 FROM student_lab_receipts r JOIN stands s ON s.id=r.stand_id
+                                         WHERE r.login=? LIMIT 1""", (owner,)).fetchone():
+                    raise ConflictError("У студента уже есть личный стенд")
             tracked_pool_rows = connection.execute(
                 "SELECT id, origin FROM stands WHERE pool_id = ?", (pool_id,),
             ).fetchall()
@@ -1136,6 +1181,8 @@ class DashboardService:
             deployment = dict(blueprint, vm_count=vm_count, subnet=subnet, start_ip=canonical_start,
                               allocated_ips=allocated_ips, bridge=bridge, clone_type="linked",
                               storage="", use_existing_pool=use_existing_pool)
+            for field in ("assignment_markdown", "student_visible", "assignment_template_name"):
+                deployment.pop(field, None)
             if student_receipt is not None:
                 deployment["_student_template_name"] = student_receipt["template_name"]
             connection.execute(
@@ -1461,17 +1508,20 @@ class DashboardService:
                         try:
                             # Waits and operator-approved retries can outlive a published
                             # assignment. Never clone a VM that has since reused its ID.
-                            if "_student_template_name" in blueprint:
-                                if (not self.store.query_one("""SELECT id FROM blueprints
-                                        WHERE id=? AND template_vmid=? AND status='active'""",
-                                        (stand["blueprint_id"], blueprint["template_vmid"])) or
-                                        not any(t.get("vmid")==blueprint["template_vmid"] and
-                                                t.get("name")==blueprint["_student_template_name"]
-                                                for t in self.gateway.list_templates())):
-                                    raise ConflictError("Учебный шаблон изменился до запуска клонирования")
+                            pinned_name = blueprint.get("_student_template_name")
+                            if pinned_name and not any(t.get("vmid")==blueprint["template_vmid"] and
+                                    t.get("name")==pinned_name for t in self.gateway.list_templates()):
+                                raise ConflictError("Учебный шаблон изменился до запуска клонирования")
                             # From this point a Proxmox task may exist even if
-                            # the process dies before it records the VMID.
-                            self.store.execute("DELETE FROM pending_deployments WHERE stand_id = ?", (stand_id,))
+                            # the process dies before it records the VMID. Check after
+                            # the network lookup and commit admission atomically with publication.
+                            with self.store.transaction() as conn:
+                                if pinned_name and not conn.execute("""SELECT 1 FROM blueprints WHERE id=?
+                                        AND template_vmid=? AND status='active' AND student_visible=1
+                                        AND assignment_template_name=?""",
+                                        (stand["blueprint_id"], blueprint["template_vmid"], pinned_name)).fetchone():
+                                    raise ConflictError("Задание или шаблон изменились до запуска клонирования")
+                                conn.execute("DELETE FROM pending_deployments WHERE stand_id = ?", (stand_id,))
                             vms = self.gateway.deploy(stand, blueprint, progress)
                         finally:
                             heartbeat_stop.set()

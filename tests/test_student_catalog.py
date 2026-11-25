@@ -22,12 +22,14 @@ class StudentCatalogTests(unittest.TestCase):
 
     def seed(self):
         with closing(sqlite3.connect(self.db)) as db:
-            db.execute("CREATE TABLE blueprints (id INTEGER, name TEXT, template_vmid INTEGER, status TEXT, bootstrap TEXT)")
-            db.executemany("INSERT INTO blueprints VALUES (?,?,?,?,?)", [
-                (1, "1 module", 283, "active", "private-provision-script"),
-                (2, "old draft", 10, "draft", "private-key"),
-                (3, "removed template", 11, "active", "private-script"),
-                (6, "1 module 2027", 144, "active", "private-autocheck"),
+            db.execute("""CREATE TABLE blueprints (id INTEGER, name TEXT, template_vmid INTEGER, status TEXT,
+                bootstrap TEXT, assignment_template_name TEXT, assignment_markdown TEXT, student_visible INTEGER)""")
+            db.executemany("INSERT INTO blueprints VALUES (?,?,?,?,?,?,?,?)", [
+                (1, "1 module", 283, "active", "private-provision-script", "de2026module-1-ach", "## 2026", 1),
+                (2, "old draft", 10, "draft", "private-key", "unused draft", "private-markdown", 1),
+                (3, "removed template", 11, "active", "private-script", "old template", "removed", 1),
+                (6, "1 module 2027", 144, "active", "private-autocheck", "DEMOFULL2027", "## 2027", 1),
+                (7, "not shared", 144, "active", "private-script", "DEMOFULL2027", "private-markdown", 0),
             ])
             db.commit()
         return [
@@ -47,15 +49,15 @@ class StudentCatalogTests(unittest.TestCase):
         self.assertEqual(self.db.read_bytes(), before)
         rows = json.loads(self.dest.read_text(encoding="utf-8"))
         self.assertEqual([r["vmid"] for r in rows], [283, 144])
-        self.assertTrue(all(set(r) == {"blueprint_id", "scenario", "vmid", "template"} for r in rows))
+        self.assertTrue(all(set(r) == {"blueprint_id", "scenario", "vmid", "template", "assignment_markdown"} for r in rows))
         self.assertNotIn("private", str(rows))
         with patch(GATEWAY, side_effect=AssertionError("student reads must be offline")):
             tasks = load_catalog(self.dest)
         self.assertEqual([t["template_name"] for t in tasks], ["de2026module-1-ach", "DEMOFULL2027"])
-        self.assertIn("2026", tasks[0]["title"])
+        self.assertEqual(tasks[0]["assignment_markdown"], "## 2026")
         self.assertIn("2027", tasks[1]["title"])
-        self.assertNotEqual(tasks[0]["steps"], tasks[1]["steps"])
-        self.assertEqual(set(tasks[0]), {"id", "title", "description", "steps", "template_name", "template_vmid"})
+        self.assertEqual(tasks[1]["steps"], [])
+        self.assertEqual(set(tasks[0]), {"id", "title", "description", "steps", "template_name", "template_vmid", "assignment_markdown"})
 
     def test_task_ids_stable_when_titles_or_catalog_order_change(self):
         rows = [
