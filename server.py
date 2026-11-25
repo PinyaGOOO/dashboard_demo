@@ -110,6 +110,15 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def _attach_operator_student_access(self, stand_id: int, vm: dict) -> None:
+        if self.pilot_grant:
+            code = self.pilot_grant.operator_code(stand_id, vm.get("vmid"))
+            if code:
+                vm["student_access_code"] = code
+            password = code or self.pilot_grant.operator_login_password(stand_id, vm.get("vmid"))
+            if password:
+                vm["student_login_password"] = password
+
     def _handle_api(self, method: str) -> None:
         parsed = urlparse(self.path)
         parts = [part for part in parsed.path.strip("/").split("/") if part]
@@ -186,11 +195,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self._json(self.service.relief_candidates(int(parts[2])))
             elif len(parts) == 4 and parts[:2] == ["api", "stands"] and parts[3] == "credentials" and method == "GET":
                 result = self.service.stand_credentials(int(parts[2]))
-                if self.pilot_grant:
-                    for vm in result["credentials"]:
-                        code = self.pilot_grant.operator_code(int(parts[2]), vm.get("vmid"))
-                        if code:
-                            vm["student_access_code"] = code
+                for vm in result["credentials"]:
+                    self._attach_operator_student_access(int(parts[2]), vm)
                 self._json(result)
             elif len(parts) == 6 and parts[:2] == ["api", "stands"] and parts[3] == "vms" and parts[5] == "actions" and method == "POST":
                 body = self._body()
@@ -199,9 +205,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self._json(self.service.vm_action(int(parts[2]), int(parts[4]), action, body), status)
             elif len(parts) == 6 and parts[:2] == ["api", "stands"] and parts[3] == "vms" and parts[5] == "credentials" and method == "GET":
                 result = self.service.vm_credentials(int(parts[2]), int(parts[4]))
-                code = self.pilot_grant.operator_code(int(parts[2]), int(parts[4])) if self.pilot_grant else None
-                if code:
-                    result["student_access_code"] = code
+                self._attach_operator_student_access(int(parts[2]), result)
                 self._json(result)
             elif parts == ["api", "checks"] and method == "GET":
                 self._json(self.service.list_checks())

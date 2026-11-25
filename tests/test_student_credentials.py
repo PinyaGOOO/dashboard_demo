@@ -41,6 +41,60 @@ class PilotCredentialsTests(unittest.TestCase):
         self.assertEqual(caught.exception.status, status)
         self.assertNotIn("fixture-only", str(caught.exception))
 
+    def session_fails(self, stamp, status, binding=None):
+        with self.assertRaises(StudentError) as caught:
+            self.issuer.for_session(self.binding if binding is None else binding, stamp)
+        self.assertEqual(caught.exception.status, status)
+        self.assertNotIn("fixture-only", str(caught.exception))
+
+    def test_personal_login_and_session_proof_are_not_interchangeable(self):
+        password = self.issuer.operator_login_password(42,331)
+        self.assertEqual(password, self.issuer.operator_code(42,331))
+        self.assertIsNone(self.issuer.operator_login_password(42,332))
+        self.assertIsNone(self.issuer.operator_login_password(43,331))
+        stamp = self.issuer.authenticate_login("student01",password)
+        self.assertIsInstance(stamp,str)
+        self.assertTrue(stamp)
+        self.assertEqual(stamp,self.issuer.session_stamp("student01"))
+        self.assertNotEqual(stamp,password)
+        self.assertEqual(self.issuer.for_session(self.binding, stamp),
+                         {"username":"root@pam","password":"fixture-only"})
+        for bad in (stamp, "DemoLab01!", "пароль", "", None):
+            self.assertIsNone(self.issuer.authenticate_login("student01",bad))
+        for bad in (password, "DemoLab01!", "пароль", "", None):
+            self.session_fails(bad,403)
+        self.assertFalse(self.issuer.private_login_required("student02"))
+        self.assertIsNone(self.issuer.authenticate_login("student02",password))
+        self.assertIsNone(self.issuer.session_stamp("student02"))
+        self.session_fails(stamp,404,{**self.binding,"student_login":"student02"})
+        self.session_fails(stamp,404,{**self.binding,"vmid":332})
+
+    def test_private_account_never_downgrades_after_binding_or_signer_change(self):
+        password = self.issuer.operator_login_password(42,331)
+        stamp = self.issuer.authenticate_login("student01",password)
+        rotated = PilotCredentials(self.db,"second-test-operator-key")
+        self.assertNotEqual(rotated.session_stamp("student01"),stamp)
+        self.assertIsNone(rotated.authenticate_login("student01",password))
+        with self.assertRaises(StudentError) as caught:
+            rotated.for_session(self.binding,stamp)
+        self.assertEqual(caught.exception.status,403)
+        moved = {**self.binding,"stand_id":"ab"*12}
+        self.publish(moved)
+        self.session_fails(stamp,404)
+        self.session_fails(stamp,403,moved)
+        self.assertNotEqual(self.issuer.session_stamp("student01"),stamp)
+        self.assertIsNone(self.issuer.authenticate_login("student01",password))
+        self.publish({})
+        for issuer in (self.issuer,PilotCredentials(self.db," ")):
+            self.assertTrue(issuer.private_login_required("student01"))
+            self.assertIsNone(issuer.session_stamp("student01"))
+            self.assertIsNone(issuer.authenticate_login("student01","DemoLab01!"))
+        self.file.unlink()
+        self.assertTrue(self.issuer.private_login_required("student01"))
+        self.assertIsNone(self.issuer.authenticate_login("student01",password))
+        self.assertIsNone(self.issuer.session_stamp("student01"))
+        self.session_fails(stamp,404)
+
     def test_code_scoped_stable_and_reads_exact_guest(self):
         code = self.issuer.operator_code(42,331)
         self.assertRegex(code, r"^LAB-[A-Z2-7]{32}$")
@@ -79,6 +133,10 @@ class PilotCredentialsTests(unittest.TestCase):
             self.assertIsNone(self.issuer.authorize(self.binding, self.issuer.operator_code(42,331)))
             self.assertEqual(self.issuer.lease(self.binding)["status"], "active")
             self.fails("",403)
+            account_password = self.issuer.operator_login_password(42,331)
+            self.assertIsNotNone(self.issuer.authenticate_login("student01",account_password))
+            self.assertIsNone(self.issuer.authenticate_login("student01","DemoLab01!"))
+            self.session_fails(account_password,403)
 
     def test_lease_status_and_actual_owner(self):
         code = self.issuer.operator_code(42,331)
@@ -103,15 +161,32 @@ class PilotCredentialsTests(unittest.TestCase):
 
     def test_stopped_lease_never_reenables_password_or_reshaped_network(self):
         code=self.issuer.operator_code(42,331)
+        stamp=self.issuer.authenticate_login("student01",code)
         self.sql("UPDATE stands SET status='stopped' WHERE id=42")
         self.sql("UPDATE stand_vms SET status='stopped' WHERE id=54")
         self.assertEqual(self.issuer.lease(self.binding)["status"],"stopped")
+        self.assertEqual(self.issuer.operator_login_password(42,331),code)
+        self.assertEqual(self.issuer.authenticate_login("student01",code),stamp)
+        self.session_fails(stamp,404)
         self.fails(code,404)
         self.sql("UPDATE stands SET duration_minutes=20,expires_at=datetime('now','-1 hour') WHERE id=42")
         self.assertEqual(self.issuer.lease(self.binding)["status"],"expired")
         self.assertIsNone(self.issuer.lease({**self.binding,"stand_id":"00"*12}))
         self.sql("UPDATE ipam_reservations SET prefix_length=24 WHERE stand_id=42")
         self.assertIsNone(self.issuer.lease(self.binding))
+        self.assertIsNone(self.issuer.operator_login_password(42,331))
+
+    def test_expired_lease_disables_guest_access_not_account_signin(self):
+        password = self.issuer.operator_login_password(42,331)
+        stamp = self.issuer.authenticate_login("student01",password)
+        self.sql("UPDATE stands SET duration_minutes=20,expires_at=datetime('now','-1 hour') WHERE id=42")
+        self.assertIsNone(self.issuer.operator_code(42,331))
+        self.assertEqual(self.issuer.operator_login_password(42,331),password)
+        self.assertEqual(self.issuer.authenticate_login("student01",password),stamp)
+        self.session_fails(stamp,404)
+        self.sql("UPDATE stands SET duration_minutes=NULL,owner='other' WHERE id=42")
+        self.assertIsNone(self.issuer.operator_login_password(42,331))
+        self.session_fails(stamp,404)
 
     def test_revocation_rechecked_by_secret_select(self):
         code = self.issuer.operator_code(42,331)
@@ -120,6 +195,8 @@ class PilotCredentialsTests(unittest.TestCase):
             return True
         with patch.object(self.issuer,"_valid",side_effect=invalidate_lease_after_identity_check):
             self.fails(code,404)
+            self.sql("UPDATE ipam_reservations SET prefix_length=16 WHERE stand_id=42")
+            self.session_fails(self.issuer.authenticate_login("student01",code),404)
 
     def test_fails_closed_no_key_missing_or_replaced_binding(self):
         self.assertIsNone(PilotCredentials(self.db," ").operator_code(42,331))

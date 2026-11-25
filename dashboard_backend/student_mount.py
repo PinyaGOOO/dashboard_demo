@@ -37,7 +37,7 @@ def _reply(h, method, status, body=b"", mime="text/plain", headers=()):
 
 
 class _LazyPortal:
-    """The static page, unknown routes and unauthenticated reads never open a database."""
+    """Initialize the portal only for recognized requests that need it."""
 
     def __init__(self, db_path, catalog_path, example_if_missing, pilot_validator, pilot_grant, set_duration):
         self.db_path = Path(db_path)
@@ -50,7 +50,7 @@ class _LazyPortal:
         self.lock = Lock()
 
     def __getattr__(self, name):
-        if name not in {"login", "logout", "get_dashboard", "deploy", "get_stand", "guest_action"}:
+        if name not in {"login", "logout", "get_dashboard", "deploy", "get_stand", "guest_action", "demo_profiles"}:
             raise AttributeError(name)
         with self.lock:
             if self.instance is None:

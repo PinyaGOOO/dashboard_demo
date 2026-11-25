@@ -1,8 +1,4 @@
-"""Read credentials for one operator-enrolled, authenticated student pilot.
-
-The caller authenticates the student and resolves their own card. Neither the
-student session, the public demo password, nor a card ID is an access code.
-"""
+"""Authenticate a personal pilot account and release credentials only for its own live guest."""
 from __future__ import annotations
 
 import base64
@@ -21,6 +17,7 @@ from .student_portal import StudentError, _binding
 
 
 _DOMAIN = b"deployer/student-guest-credentials/v1\0"
+_SESSION_DOMAIN = b"deployer/student-personal-session/v1\0"
 _NOT_FOUND = "Доступы этого стенда сейчас недоступны."
 _BAD_CODE = "Неверный код доступа к этой VM."
 # _MATCH contains the entire live enrollment/IPAM predicate. The conditional
@@ -79,10 +76,37 @@ class PilotCredentials:
         except (OSError, ValueError, RecursionError):
             return None
 
-    def _code(self, binding: dict) -> str:
+    def _digest(self, binding: dict, domain: bytes) -> bytes:
         encoded = json.dumps(binding, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
-        digest = hmac.digest(self._key, _DOMAIN + encoded, hashlib.sha256)
-        return "LAB-" + base64.b32encode(digest[:20]).decode("ascii")
+        return hmac.digest(self._key, domain + encoded, hashlib.sha256)
+
+    def _code(self, binding: dict) -> str:
+        # Keep the already-issued personal code valid as the account sign-in password.
+        return "LAB-" + base64.b32encode(self._digest(binding, _DOMAIN)[:20]).decode("ascii")
+
+    def _stamp(self, binding: dict) -> str:
+        # Server-side scope marker, never the sign-in password, never a browser credential.
+        return self._digest(binding, _SESSION_DOMAIN).hex()
+
+    def private_login_required(self, login: str) -> bool:
+        # Live-mode selection happens at construction/wiring. A malformed/absent
+        # binding must *not* revert this personal account to its published demo password.
+        return login == "student01"
+
+    def authenticate_login(self, login: str, password: str) -> str | None:
+        if (not self.private_login_required(login) or not isinstance(password, str) or
+                len(password) != 36 or not password.isascii()):
+            return None
+        b = self._live_binding()
+        if not b or b["student_login"] != login or not hmac.compare_digest(password, self._code(b)):
+            return None
+        return self._stamp(b) if self._live_binding() == b else None
+
+    def session_stamp(self, login: str) -> str | None:
+        if not self.private_login_required(login):
+            return None
+        b = self._live_binding()
+        return self._stamp(b) if b and b["student_login"] == login else None
 
     def _row(self, b: dict, *, with_password: bool):
         # Only fixed projections can reach SQL. The common/operator path does
@@ -108,6 +132,17 @@ class PilotCredentials:
             return None
         return self._code(b)
 
+    def operator_login_password(self, stand_id: int, vmid: int) -> str | None:
+        """Admin-only delivery of the account password also for a stopped or expired enrolled lab."""
+        if type(stand_id) is not int or type(vmid) is not int:
+            return None
+        b = self._live_binding()
+        if not b or (stand_id, vmid) != (b["deployer_stand_id"], b["vmid"]):
+            return None
+        if self.lease(b) is None or self._live_binding() != b:
+            return None
+        return self._code(b)
+
     def authorize(self, binding: dict, access_code: str) -> None:
         """Verify the second factor without selecting the VM password."""
         b = self._live_binding()
@@ -121,9 +156,24 @@ class PilotCredentials:
     def for_student(self, binding: dict, access_code: str) -> dict[str, str]:
         """Use a server-resolved binding for the owner of the authenticated card."""
         self.authorize(binding, access_code)
-        row = self._row(binding, with_password=True)
+        return self._guest_credentials(binding)
+
+    def for_session(self, binding: dict, stamp: str) -> dict[str, str]:
+        """Caller resolves both parameters from the authenticated session and owned assignment."""
+        b = self._live_binding()
+        if not b or b != binding:
+            raise StudentError(404, _NOT_FOUND)
+        if not isinstance(stamp, str) or not stamp.isascii() or not hmac.compare_digest(stamp, self._stamp(b)):
+            raise StudentError(403, "Войдите в личную учётную запись")
+        if not self._valid(b):
+            raise StudentError(404, _NOT_FOUND)
+        return self._guest_credentials(b)
+
+    def _guest_credentials(self, b: dict) -> dict[str, str]:
+        # _row verifies ownership, VM state, IPAM and expiry in the same read as the password.
+        row = self._row(b, with_password=True)
         if (not row or row[0] != "root@pam" or not isinstance(row[1], str) or not row[1]
-                or self._live_binding() != binding):
+                or self._live_binding() != b):
             raise StudentError(404, _NOT_FOUND)
         return {"username": row[0], "password": row[1]}
 

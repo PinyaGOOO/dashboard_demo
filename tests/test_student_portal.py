@@ -115,21 +115,96 @@ class StudentPortalTests(unittest.TestCase):
         self.assertEqual(new["duration_minutes"], 45)
         self.check_status(404, reopened.get_stand, token, first["id"])
 
-    def test_guest_actions_cannot_use_another_students_card_or_simulation(self):
-        token, stand_id, validator, cfg, binding = self.pilot_fixture()
+    def private_portal(self, validator):
         grant, setter = Mock(), Mock()
-        self.portal._pilot_grant, self.portal._set_duration = grant, setter
-        with self.assertRaises(StudentError):
-            self.portal.guest_action(self.user("2"), stand_id, "credentials", {"access_code": "test"})
-        grant.for_student.assert_not_called()
+        grant.private_login_required.side_effect = lambda login: login == "student01"
+        grant.session_stamp.return_value = "opaque-binding-key-stamp"
+        grant.authenticate_login.side_effect = lambda login, password: (
+            grant.session_stamp(login) if password == "test-personal-pass" else None)
+        grant.lease.return_value = None
+        self.portal = StudentPortal(self.path, lambda: self.tasks, clock=lambda: self.clock,
+                                    pilot_validator=validator, pilot_grant=grant, set_duration=setter)
+        return grant, setter
+
+    def test_private_login_revokes_legacy_public_session_without_changing_peer(self):
+        legacy, stand_id, validator, _, _ = self.pilot_fixture()
+        peer = self.user("2")
+        self.assertEqual(self.portal.demo_profiles(), ["student01", "student02"])
+        with closing(sqlite3.connect(self.path)) as db:
+            db.execute("DROP TABLE student_private_sessions")  # previous release's schema
+        grant, setter = self.private_portal(validator)
+        self.assertEqual(self.portal.demo_profiles(), ["student02"])
+        self.check_status(401, self.portal.login, "student01", "DemoLab01!")
+        self.assertEqual(self.portal.get_dashboard(peer)["student"]["login"], "student02")
+        self.assertEqual(self.portal.get_dashboard(self.user("2"))["student"]["login"], "student02")
+        self.check_status(401, self.portal.get_dashboard, legacy)
+        self.check_status(401, self.portal.deploy, legacy, "b")
+        self.check_status(401, self.portal.get_stand, legacy, stand_id)
+        self.check_status(401, self.portal.guest_action, legacy, stand_id, "credentials", {})
+        self.check_status(401, self.portal.guest_action, legacy, stand_id, "duration",
+                          {"duration_minutes": 45, "access_code": "test-personal-pass"})
+        grant.for_session.assert_not_called()
+        grant.authorize.assert_not_called()
+        setter.assert_not_called()
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM student_sessions WHERE login='student01'").fetchone()[0], 0)
+        # An older worker could still insert an unstamped row after migration.
+        late_public = self.reopen().login("student01", "DemoLab01!")
+        self.check_status(401, self.portal.get_dashboard, late_public)
+        self.check_status(401, self.portal.guest_action, late_public, stand_id, "credentials", {})
+        grant.for_session.assert_not_called()
+
+    def test_guest_actions_accept_only_private_owner_of_current_real_stand(self):
+        _, stand_id, validator, _, binding = self.pilot_fixture()
+        grant, setter = self.private_portal(validator)
+        token = self.portal.login("student01", "test-personal-pass")
+        self.check_status(404, self.portal.guest_action, self.user("2"), stand_id, "credentials", {})
         ordinary = self.portal.deploy(token, "a")
-        self.check_status(404, self.portal.guest_action, token, ordinary["id"], "credentials", {"access_code": "test"})
+        self.check_status(404, self.portal.guest_action, token, ordinary["id"], "credentials", {})
+        self.check_status(400, self.portal.guest_action, token, stand_id, "credentials", {"vmid": 101})
+        grant.for_session.assert_not_called()
+        self.assertIs(self.portal.guest_action(token, stand_id, "credentials", {}), grant.for_session.return_value)
+        grant.for_session.assert_called_once_with(binding, "opaque-binding-key-stamp")
+        grant.authorize.assert_not_called()
         grant.authorize.side_effect = StudentError(403, "Неверный код")
         self.check_status(403, self.portal.guest_action, token, stand_id, "duration", {"access_code":"wrong", "duration_minutes": 40})
         setter.assert_not_called()
         grant.authorize.side_effect = None
         self.portal.guest_action(token, stand_id, "duration", {"access_code":"test", "duration_minutes":40})
         setter.assert_called_once_with(binding, 40)
+
+    def test_private_session_stamp_is_revocable_and_never_stores_the_password(self):
+        _, stand_id, validator, _, _ = self.pilot_fixture()
+        grant, setter = self.private_portal(validator)
+        token = self.portal.login("student01", "test-personal-pass")
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(db.execute("SELECT * FROM student_private_sessions").fetchall(),
+                             [(self.portal._token_hash(token), "opaque-binding-key-stamp")])
+            self.assertNotIn("test-personal-pass", "".join(db.iterdump()))
+        self.assertEqual(self.portal.get_dashboard(token)["student"]["login"], "student01")
+        for current in (None, "rotated-or-rebound-stamp"):
+            grant.session_stamp.return_value = current
+            self.check_status(401, self.portal.get_dashboard, token)
+            self.check_status(401, self.portal.get_stand, token, stand_id)
+            self.check_status(401, self.portal.guest_action, token, stand_id, "credentials", {})
+            self.check_status(401, self.portal.guest_action, token, stand_id, "duration",
+                              {"duration_minutes": 45, "access_code": "test-personal-pass"})
+        grant.for_session.assert_not_called()
+        grant.authorize.assert_not_called()
+        setter.assert_not_called()
+        # Neither standalone mode nor disabling the grant converts an old private session to demo.
+        self.check_status(401, self.reopen().get_dashboard, token)
+        fresh = self.portal.login("student01", "test-personal-pass")
+        self.assertEqual(self.portal.get_stand(fresh, stand_id)["stand"]["id"], stand_id)
+        self.portal.logout(fresh)
+        self.check_status(401, self.portal.guest_action, fresh, stand_id, "credentials", {})
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM student_private_sessions WHERE token_hash=?",
+                                        (self.portal._token_hash(fresh),)).fetchone()[0], 0)
+        fresh = self.portal.login("student01", "test-personal-pass")
+        self.clock += self.portal.SESSION_TTL
+        self.check_status(401, self.portal.guest_action, fresh, stand_id, "credentials", {})
+        grant.for_session.assert_not_called()
 
     def test_concurrent_deployment_requests_share_one_persisted_stand(self):
         barrier = threading.Barrier(6)

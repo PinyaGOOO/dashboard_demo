@@ -111,6 +111,16 @@ class StudentPortal:
                 raise ValueError("Для студенческого демо требуется отдельный файл SQLite")
             db.execute("""CREATE TABLE IF NOT EXISTS student_sessions (
                 token_hash BLOB PRIMARY KEY, login TEXT NOT NULL, expires REAL NOT NULL)""")
+            # Old releases insert positional session rows. No existing/public
+            # session acquires personal-account privileges during this upgrade.
+            db.execute("""CREATE TABLE IF NOT EXISTS student_private_sessions (
+                token_hash BLOB PRIMARY KEY REFERENCES student_sessions(token_hash) ON DELETE CASCADE,
+                binding_stamp TEXT NOT NULL)""")
+            for login in _ACCOUNTS:
+                if self._private_login(login):
+                    db.execute("""DELETE FROM student_sessions WHERE login=? AND NOT EXISTS (
+                        SELECT 1 FROM student_private_sessions p WHERE p.token_hash=student_sessions.token_hash
+                    )""", (login,))
             db.execute("""CREATE TABLE IF NOT EXISTS student_stands (
                 id TEXT PRIMARY KEY, login TEXT NOT NULL, assignment_id TEXT NOT NULL,
                 task_json TEXT NOT NULL, started REAL NOT NULL, UNIQUE(login, assignment_id))""")
@@ -137,28 +147,53 @@ class StudentPortal:
             raise StudentError(401, "Войдите в учебный кабинет")
         return hashlib.sha256(token.encode("ascii")).digest()
 
-    def _student(self, db: sqlite3.Connection, token: str | None) -> str:
-        row = db.execute("SELECT login FROM student_sessions WHERE token_hash=? AND expires>?",
+    def _private_login(self, login: str) -> bool:
+        return self._pilot_grant is not None and self._pilot_grant.private_login_required(login)
+
+    def demo_profiles(self) -> list[str]:
+        return [login for login in _ACCOUNTS if not self._private_login(login)]
+
+    def _session(self, db: sqlite3.Connection, token: str | None) -> tuple[str, str | None]:
+        row = db.execute("""SELECT s.login, p.binding_stamp FROM student_sessions s
+                         LEFT JOIN student_private_sessions p ON p.token_hash=s.token_hash
+                         WHERE s.token_hash=? AND s.expires>?""",
                          (self._token_hash(token), self._clock())).fetchone()
         if row is None:
             raise StudentError(401, "Сессия завершена. Войдите снова")
-        return row["login"]
+        login, stamp = row
+        if self._private_login(login):
+            current = self._pilot_grant.session_stamp(login) if stamp else None
+            if not current or not hmac.compare_digest(stamp, current):
+                raise StudentError(401, "Сессия завершена. Войдите снова")
+        elif stamp is not None:
+            raise StudentError(401, "Сессия завершена. Войдите снова")
+        return login, stamp
 
     def login(self, login: str, password: str) -> str:
         if not isinstance(login, str) or not isinstance(password, str) or len(password) > 256:
             raise StudentError(401, "Неверный логин или пароль")
         login = login.strip().lower()
         entry = _ACCOUNTS.get(login)
-        salt, verifier = (entry or _ACCOUNTS["student01"])[2:]
-        candidate = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), 180_000)
-        if not hmac.compare_digest(candidate, bytes.fromhex(verifier)) or entry is None:
-            raise StudentError(401, "Неверный логин или пароль")
+        stamp = None
+        if entry is not None and self._private_login(login):
+            stamp = self._pilot_grant.authenticate_login(login, password)
+            if not stamp:
+                raise StudentError(401, "Неверный логин или пароль")
+        else:
+            salt, verifier = (entry or _ACCOUNTS["student01"])[2:]
+            candidate = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), 180_000)
+            if not hmac.compare_digest(candidate, bytes.fromhex(verifier)) or entry is None:
+                raise StudentError(401, "Неверный логин или пароль")
         token = secrets.token_urlsafe(32)
+        digest = self._token_hash(token)
         now = self._clock()
         with self._db() as db:
             db.execute("DELETE FROM student_sessions WHERE expires<=?", (now,))
             db.execute("INSERT INTO student_sessions VALUES (?,?,?)",
-                       (self._token_hash(token), login, now + self.SESSION_TTL))
+                       (digest, login, now + self.SESSION_TTL))
+            if stamp is not None:
+                db.execute("INSERT INTO student_private_sessions (token_hash,binding_stamp) VALUES (?,?)",
+                           (digest, stamp))
         return token
 
     def logout(self, token: str | None) -> None:
@@ -255,7 +290,7 @@ class StudentPortal:
 
     def get_dashboard(self, token: str | None) -> dict:
         with self._db() as db:
-            login = self._student(db, token)
+            login, _ = self._session(db, token)
             tasks = {key: dict(task, stand=None) for key, task in self._assigned(login).items()}
             rows = db.execute(_STANDS + " WHERE s.login=? ORDER BY s.started, s.id", (login,))
             for row in rows:
@@ -270,7 +305,7 @@ class StudentPortal:
         self._duration(duration_minutes)
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            login = self._student(db, token)
+            login, _ = self._session(db, token)
             row = db.execute(_STANDS + " WHERE s.login=? AND s.assignment_id=?",
                              (login, assignment_id)).fetchone()
             if row is not None and self._stand(row)["status"] == "expired" and not self._owned_binding(row):
@@ -290,26 +325,29 @@ class StudentPortal:
                 row = db.execute(_STANDS + " WHERE s.id=? AND s.login=?", (stand_id, login)).fetchone()
             return self._stand(row)
 
-    def _own_row(self, token, stand_id):
+    def _own_row_and_stamp(self, token, stand_id):
         with self._db() as db:
-            login = self._student(db, token)
+            login, stamp = self._session(db, token)
             row = db.execute(_STANDS + " WHERE s.id=? AND s.login=?", (stand_id, login)).fetchone()
             if row is None:
                 raise StudentError(404, "Стенд не найден")
-        return row
+        return row, stamp
 
     def get_stand(self, token, stand_id):
-        row = self._own_row(token, stand_id)
+        row, _ = self._own_row_and_stamp(token, stand_id)
         stand = self._stand(row, detail=True)
         assignment = dict(json.loads(row["task_json"]), stand={k:v for k,v in stand.items() if k not in ("access", "pilot_pending")})
         return {"stand": stand, "assignment": assignment}
 
     def guest_action(self, token, stand_id, action, data):
-        binding = self._owned_binding(self._own_row(token, stand_id))
-        if not binding or self._pilot_grant is None:
+        row, stamp = self._own_row_and_stamp(token, stand_id)
+        binding = self._owned_binding(row)
+        if not binding or not stamp or self._pilot_grant is None:
             raise StudentError(404, "Доступ к реальному стенду не настроен")
         if action == "credentials":
-            return self._pilot_grant.for_student(binding, data["access_code"])
+            if data != {}:
+                raise StudentError(400, "Для копирования пароля дополнительные параметры не нужны")
+            return self._pilot_grant.for_session(binding, stamp)
         if action != "duration" or self._set_duration is None:
             raise StudentError(404, "Операция недоступна")
         minutes = self._duration(data["duration_minutes"])

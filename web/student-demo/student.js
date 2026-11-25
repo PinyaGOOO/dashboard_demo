@@ -2,12 +2,10 @@
 (function studentPortal() {
   const $ = (selector, root = document) => root.querySelector(selector);
   const view = $("#view"), notice = $("#notice");
-  const demoProfiles = {student01: "DemoLab01!", student02: "DemoLab02!"};
+  let demoProfiles = [];
   const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
   let student = null, assignments = [], current = null, page = "", timer = 0, epoch = 0, activeRequest = 0;
   const pending = new Set(), marks = new Map();
-  // Short-lived assignment grant only; passwords are never written to page state.
-  let grant = null;
   function leaseText(stand) {
     const lease = stand?.actual_lease || stand;
     if (!lease) return "";
@@ -52,7 +50,7 @@
   }
   function forget() {
     ++epoch; ++activeRequest; clearTimeout(timer); student = null; assignments = []; current = null;
-    page = ""; pending.clear(); marks.clear(); grant = null; identity();
+    page = ""; pending.clear(); marks.clear(); identity();
   }
   function heroArt() {
     return `<svg class="lab-art" viewBox="0 0 440 132" aria-hidden="true" fill="none">
@@ -67,12 +65,23 @@
     view.innerHTML = `<div class="login-layout"><section class="login-intro"><p class="eyebrow">Deployer / Учебная лаборатория</p>
       <h1>Личный<br><span class="accent">практикум.</span></h1>
       <p class="lead">Получайте задания и разворачивайте собственные стенды по учебным шаблонам.</p>${heroArt()}</section>
-      <section class="login-card"><h2>Вход студента</h2><p class="muted">Используйте один из двух учебных профилей.</p>
+      <section class="login-card"><h2>Вход студента</h2><p class="muted">Введите логин и пароль учебного кабинета, которые выдал преподаватель.</p>
       <form id="login-form"><label class="field">Логин<input name="login" id="login" autocomplete="username" autocapitalize="none" spellcheck="false" required></label>
       <label class="field">Пароль<input name="password" id="password" type="password" autocomplete="current-password" required></label>
       <button type="submit" class="button primary">Войти в кабинет</button></form>
-      <div class="demo-accounts"><strong>Попробовать демо</strong><p>Нажмите на логин, чтобы подставить учебные данные. У каждого профиля свои задания и стенды.</p>
-      <div class="demo-fill">${Object.keys(demoProfiles).map(id => `<button type="button" data-demo-login="${id}">${id}</button>`).join("")}</div></div></section></div>`;
+      <div class="demo-accounts" hidden><strong>Попробовать демо</strong><p>Выберите демонстрационный профиль, чтобы подставить его данные для входа.</p>
+      <div class="demo-fill"></div></div></section></div>`;
+    const accounts = $(".demo-accounts",view);
+    demoProfiles = [];
+    api("login-options").then(options => {
+      if (!accounts.isConnected || !Array.isArray(options.demo_profiles)) return;
+      demoProfiles = options.demo_profiles.filter(id => id === "student01" || id === "student02");
+      for (const id of demoProfiles) {
+        const button = document.createElement("button");
+        button.type = "button"; button.dataset.demoLogin = id; button.textContent = id; $(".demo-fill",accounts).append(button);
+      }
+      accounts.hidden = !demoProfiles.length;
+    }).catch(() => {}); // Personal sign-in still works when public suggestions are unavailable.
   }
   function card(a, index) {
     return `<article class="assignment" data-assignment-id="${esc(a.id)}"><div class="card-top"><span class="eyebrow">Практика / ${String(index + 1).padStart(2,"0")}</span><span class="status" data-status></span></div>
@@ -165,9 +174,9 @@
           <label class="field">Время с момента подтверждения, минут<input name="duration_minutes" type="number" min="1" max="10080" step="1" inputmode="numeric" required placeholder="Например, 90"></label>
           <p>Без таймера стенд работает бессрочно. Срок назначается один раз: по его окончании VM получит команду мягкого выключения. Диски и задание сохранятся.</p>
           <button class="button secondary small" type="submit">Назначить срок</button></form></details>`}
-        <form class="grant-form" data-grant-form hidden><label class="field">Личный код задания<input type="password" name="access_code" autocomplete="off" spellcheck="false" required></label><button class="button primary small" type="submit" data-confirm-grant>Подтвердить</button></form>
+        <form class="grant-form" data-grant-form hidden><label class="field">Пароль учебного кабинета<input type="password" name="access_code" autocomplete="off" spellcheck="false" required></label><button class="button primary small" type="submit">Подтвердить время работы</button></form>
         <p data-copy-status role="status" aria-live="polite"></p>` : ""}
-        <p class="stand-note">${access ? "Для копирования пароля VM нужен личный код задания от преподавателя. Пароль учебного профиля для входа в Proxmox не подходит."
+        <p class="stand-note">${access ? "Скопируйте логин и пароль по отдельности и вставьте их на странице входа в Proxmox."
           : actualExpired ? "Срок работы этой VM закончился. Задание сохранено. Для продления обратитесь к преподавателю."
           : pendingPilot ? "Реальный стенд заказан. Ссылка появится здесь после готовности VM и проверки доступа. Обновлять страницу не нужно."
           : "Работайте с заданием в этой карточке. Сейчас в ней нет доступа к реальной VM. Если для практики нужен Proxmox, обратитесь к преподавателю."}</p></aside></div>`;
@@ -238,53 +247,63 @@
     return input.value === "" ? null : input.valueAsNumber;
   }
   const message = text => { const output = $("[data-copy-status]"); if (output) output.textContent = text; };
-  function beginGrant(action, minutes) {
+  async function copyVmPassword(button) {
+    if (button.disabled || !student || !current || !proxmoxAccess(current.stand.access)) return;
+    const stand = current.stand.id, login = student.login, generation = epoch;
+    const relevant = () => generation === epoch && student?.login === login && routeId() === String(stand) && button.isConnected;
+    const denied = () => Object.assign(new Error(),{clipboard:true});
+    button.disabled = true; message("Копируем пароль…");
+    try {
+      const clipboard = navigator.clipboard;
+      const canWriteItem = clipboard?.write && typeof ClipboardItem === "function";
+      if (!window.isSecureContext || (!canWriteItem && !clipboard?.writeText)) throw denied();
+      const password = api(`stands/${encodeURIComponent(stand)}/credentials`,{}).then(result => {
+        if (!relevant() || typeof result.password !== "string" || !result.password) throw new Error();
+        return result.password;
+      });
+      if (canWriteItem) {
+        // Begin the write during the original click; Safari cannot regain activation after fetch.
+        const blob = password.then(value => new Blob([value],{type:"text/plain"}));
+        blob.catch(() => {}); // Some browsers reject write() before reading the item.
+        try { await clipboard.write([new ClipboardItem({"text/plain":blob})]); }
+        catch { await password; throw denied(); }
+      } else {
+        const value = await password;
+        try { await clipboard.writeText(value); } catch { throw denied(); }
+      }
+      if (relevant()) message("Пароль скопирован.");
+    } catch (err) {
+      if (!relevant()) return;
+      if (err.status === 401) { await refresh(true); return; }
+      message(err.clipboard ? "Браузер не разрешил копирование. Проверьте разрешение для буфера обмена и откройте кабинет по HTTPS."
+        : err.status === 429 ? "Слишком много запросов. Попробуйте позже." : "Не удалось получить пароль вашей VM. Проверьте доступность стенда.");
+    } finally { button.disabled = false; }
+  }
+  function beginDurationGrant(minutes) {
     const form = $("[data-grant-form]");
     if (!form || !student || !current || !proxmoxAccess(current.stand.access)) return;
-    const stand = current.stand.id;
-    if (grant?.login === student.login && grant.stand === stand) { protectedAction(action, minutes, grant.code); return; }
-    form.dataset.action = action;
     form.dataset.minutes = minutes ?? "";
-    $("[data-confirm-grant]",form).textContent = action === "password" ? "Подтвердить и скопировать" : "Подтвердить время работы";
-    form.hidden = false; form.elements.access_code.focus(); message("Введите код, который выдал преподаватель для этого стенда.");
+    form.hidden = false; form.elements.access_code.focus(); message("Для изменения срока введите пароль учебного кабинета.");
   }
-  async function protectedAction(action, minutes, code) {
+  async function setDuration(minutes, code) {
     if (!student || !current || !proxmoxAccess(current.stand.access)) return;
     const stand = current.stand.id, login = student.login, generation = epoch, form = $("[data-grant-form]");
     if (!form || form.dataset.busy === "yes") return;
     const relevant = () => generation === epoch && student?.login === login && routeId() === stand && current?.stand.id === stand && form.isConnected;
     form.dataset.busy = "yes";
-    const buttons = [...view.querySelectorAll("[data-copy-password], [data-grant-form] button, [data-real-duration-form] button")];
+    const buttons = [...view.querySelectorAll("[data-grant-form] button, [data-real-duration-form] button")];
     buttons.forEach(button => {button.disabled = true;});
     try {
-      if (action === "password") {
-        if (!window.isSecureContext || !navigator.clipboard?.writeText) throw Object.assign(new Error(),{clipboard:true});
-        const request = api(`stands/${encodeURIComponent(stand)}/credentials`,{access_code:code}).then(result => {
-          if (!relevant() || !result.password || typeof result.password !== "string") throw new Error();
-          return result.password;
-        });
-        // Safari requires creating the clipboard write within the click gesture.
-        if (window.ClipboardItem && navigator.clipboard.write) {
-          const blob = request.then(value => new Blob([value],{type:"text/plain"})); blob.catch(() => {});
-          try { await navigator.clipboard.write([new ClipboardItem({"text/plain":blob})]); }
-          catch { await request; throw Object.assign(new Error(),{clipboard:true}); }
-        } else {
-          const value = await request;
-          try { await navigator.clipboard.writeText(value); }
-          catch { throw Object.assign(new Error(),{clipboard:true}); }
-        }
-      } else if (action === "duration") {
-        await api(`stands/${encodeURIComponent(stand)}/duration`,{access_code:code,duration_minutes:minutes});
-      } else { return; }
+      await api(`stands/${encodeURIComponent(stand)}/duration`,{access_code:code,duration_minutes:minutes});
       if (!relevant()) return;
-      grant = {login,stand,code}; form.hidden = true;
-      message(action === "password" ? "Пароль скопирован." : `Таймер установлен: ${minutes} мин.`);
-      if (action === "duration") await refresh(true);
+      form.hidden = true;
+      message(`Таймер установлен: ${minutes} мин.`);
+      await refresh(true);
     } catch (err) {
       if (!relevant()) return;
-      if (err.status === 403) { grant = null; form.hidden = false; form.dataset.action = action; form.dataset.minutes = minutes ?? ""; form.elements.access_code.focus(); }
+      if (err.status === 403) { form.hidden = false; form.dataset.minutes = minutes ?? ""; form.elements.access_code.focus(); }
       if (err.status === 401) { await refresh(true); return; }
-      message(err.clipboard ? "Не удалось записать в буфер обмена. Разрешите копирование в браузере и нажмите ещё раз." : err.status === 403 ? "Код не принят. Проверьте личный код задания." : err.status === 429 ? "Слишком много попыток. Попробуйте позже." : "Операция не выполнена. Проверьте доступ к стенду и повторите.");
+      message(err.status === 403 ? "Пароль учебного кабинета не принят." : err.status === 429 ? "Слишком много попыток. Попробуйте позже." : "Операция не выполнена. Проверьте доступ к стенду и повторите.");
     } finally {
       if (form.isConnected) { delete form.dataset.busy; buttons.forEach(button => {button.disabled = false;}); }
     }
@@ -292,13 +311,13 @@
   view.addEventListener("submit", async event => {
     if (event.target.matches("[data-grant-form]")) {
       event.preventDefault(); const form = event.target, input = form.elements.access_code, code = input.value.trim(); input.value = "";
-      if (code) await protectedAction(form.dataset.action, form.dataset.minutes ? Number(form.dataset.minutes) : null, code);
+      if (code) await setDuration(form.dataset.minutes ? Number(form.dataset.minutes) : null, code);
       return;
     }
     if (event.target.matches("[data-real-duration-form]")) {
       event.preventDefault(); let minutes;
       try { minutes = checkedMinutes(event.target.elements.duration_minutes); } catch { return; }
-      if (minutes && window.confirm(`Назначить срок ${minutes} мин с этого момента? По окончании VM получит команду мягкого выключения. Изменить срок из кабинета нельзя.`)) beginGrant("duration",minutes);
+      if (minutes && window.confirm(`Назначить срок ${minutes} мин с этого момента? По окончании VM получит команду мягкого выключения. Изменить срок из кабинета нельзя.`)) beginDurationGrant(minutes);
       return;
     }
     if (event.target.id !== "login-form") return;
@@ -311,13 +330,15 @@
       form.elements.password.value = ""; await refresh(true);
       if (student) { focusPage(); announce("Вы вошли в кабинет."); }
     } catch (error) {
-      if (generation === epoch) warn(error.status === 401 ? "Неверный логин или пароль. Выберите учебный профиль или проверьте данные." : error.message);
+      if (generation === epoch) warn(error.status === 401 ? "Неверный логин или пароль учебного кабинета." : error.message);
     } finally { submit.disabled = false; }
   });
   view.addEventListener("click",async event => {
     const fill = event.target.closest("[data-demo-login]");
     if (fill) {
-      const id = fill.dataset.demoLogin; $("#login").value = id; $("#password").value = demoProfiles[id];
+      const id = fill.dataset.demoLogin;
+      if (!demoProfiles.includes(id)) return;
+      $("#login").value = id; $("#password").value = `DemoLab${id.slice(-2)}!`;
       $("#login-form button[type=submit]").focus(); announce(`Учебный профиль ${id} выбран.`); return;
     }
     const deploy = event.target.closest("[data-deploy]");
@@ -326,7 +347,8 @@
       catch { message("Не удалось скопировать: выделите логин в карточке и скопируйте вручную."); }
       return;
     }
-    if (event.target.closest("[data-copy-password]")) { beginGrant("password",null); return; }
+    const copyPassword = event.target.closest("[data-copy-password]");
+    if (copyPassword) { await copyVmPassword(copyPassword); return; }
     if (deploy && student) {
       const root = deploy.closest("[data-assignment-id]"), id = root.dataset.assignmentId;
       let minutes;
@@ -357,7 +379,7 @@
     marks.set(key,checked);
   });
   $("#logout").addEventListener("click",async event => {
-    grant = null; ++epoch;
+    ++epoch;
     const button = event.currentTarget; button.disabled = true; clearTimeout(timer); ++activeRequest;
     try {
       await api("logout",{}); forget(); history.replaceState(null,"",location.pathname+location.search); loginPage(); warn("");
@@ -365,9 +387,9 @@
     } catch (error) { if (error.status === 401) await refresh(true); else { warn(error.message); schedule(); } }
     finally { button.disabled = false; }
   });
-  window.addEventListener("hashchange",async () => { grant = null; if (student) { await refresh(true); if (student) focusPage(); } });
+  window.addEventListener("hashchange",async () => { if (student) { await refresh(true); if (student) focusPage(); } });
   window.addEventListener("online",() => refresh(true));
   window.addEventListener("offline",() => { clearTimeout(timer); warn("Нет подключения. Состояние стендов обновится после восстановления связи.",true); });
-  document.addEventListener("visibilitychange",() => { if (document.hidden) { grant = null; clearTimeout(timer); } else if (student) refresh(); });
+  document.addEventListener("visibilitychange",() => { if (document.hidden) clearTimeout(timer); else if (student) refresh(); });
   refresh();
 })();

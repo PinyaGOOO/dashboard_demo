@@ -147,7 +147,7 @@ def dispatch_student(handler, method, portal, *, secure_cookie=False) -> bool:
     deploy = re.fullmatch(r"/assignments/(" + RESOURCE_ID + r")/deploy", tail)
     detail = re.fullmatch(r"/stands/(" + RESOURCE_ID + r")", tail)
     guest = re.fullmatch(r"/stands/(" + RESOURCE_ID + r")/(credentials|duration)", tail)
-    allowed = "POST" if tail in {"/login", "/logout"} or deploy or guest else "GET" if tail == "/me" or detail else None
+    allowed = "POST" if tail in {"/login", "/logout"} or deploy or guest else "GET" if tail in {"/me", "/login-options"} or detail else None
     headers = []
     status = 200
     try:
@@ -159,19 +159,20 @@ def dispatch_student(handler, method, portal, *, secure_cookie=False) -> bool:
         if method == "POST":
             _check_origin(handler.headers, secure_cookie)
             data = _body(handler)
-            if guest:
-                fields = {"access_code", "duration_minutes"} if guest[2] == "duration" else {"access_code"}
-                if set(data) != fields or not isinstance(data["access_code"], str) or not 1 <= len(data["access_code"]) <= 128:
+            if guest and guest[2] == "duration":
+                if set(data) != {"access_code", "duration_minutes"} or not isinstance(data["access_code"], str) or not 1 <= len(data["access_code"]) <= 128:
                     raise StudentError(400, "Нужен персональный код доступа этой VM и корректные параметры")
             elif deploy and set(data) <= {"duration_minutes"}:
                 pass
             elif tail != "/login" and data:
                 raise StudentError(400, "Этой операции не нужны дополнительные параметры.")
         token = _token(handler.headers)
-        if tail == "/login":
+        if tail == "/login-options":
+            result = {"demo_profiles": portal.demo_profiles()}
+        elif tail == "/login":
             if (set(data) != {"login", "password"} or not isinstance(data["login"], str)
                     or not isinstance(data["password"], str) or len(data["login"]) > 80 or len(data["password"]) > 256):
-                raise StudentError(400, "Введите демологин и пароль.")
+                raise StudentError(400, "Введите логин и пароль.")
             peer = handler.client_address[0]
             slot = _logins.reserve(peer)
             if slot is None:
@@ -191,7 +192,7 @@ def dispatch_student(handler, method, portal, *, secure_cookie=False) -> bool:
             headers.append(("Set-Cookie", _cookie("", secure_cookie)))
             result = {"ok": True}
         elif not token:
-            raise StudentError(401, "Войдите в демоучётную запись.")
+            raise StudentError(401, "Войдите в учебный кабинет.")
         elif tail == "/me":
             result = portal.get_dashboard(token)
         elif detail:
