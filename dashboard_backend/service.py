@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
-from . import deploy_relief
+from . import assignment_images, deploy_relief
 from .stand_timer import StandTimer, deadline as stand_deadline, duration as parse_duration
 from .student_pilot_publish import publish_pilot_if_ready
 from .student_network import student_deployment_network
@@ -693,6 +693,37 @@ class DashboardService:
             raise NotFoundError("Сценарий не найден")
         return blueprint
 
+    def upload_assignment_image(self, raw: bytes) -> dict[str, str]:
+        """Teacher-only backend entry point; bytes never enter general blueprint APIs."""
+        try:
+            png = assignment_images.canonical_png(raw)
+            with self.store.transaction() as conn:
+                return assignment_images.stage(conn, png)
+        except assignment_images.ImageInputError as exc:
+            raise ValidationError(str(exc)) from None
+        except assignment_images.ImageLimitError as exc:
+            raise ConflictError(str(exc)) from None
+
+    def assignment_image(self, image_id: str) -> bytes:
+        """Read an existing or staged image for the authenticated editor."""
+        row = self.store.query_one("SELECT png FROM assignment_images WHERE id=?", (image_id,)) if assignment_images.valid_id(image_id) else None
+        if not row:
+            raise NotFoundError("Изображение задания не найдено")
+        return row["png"]
+
+    def published_assignment_image(self, assignment_id: str, image_id: str) -> bytes:
+        png = assignment_images.published(self.store, assignment_id, image_id)
+        if png is None:
+            raise NotFoundError("Изображение задания не найдено")
+        return png
+
+    @staticmethod
+    def _link_assignment_images(conn, blueprint_id, markdown):
+        try:
+            assignment_images.link(conn, blueprint_id, markdown)
+        except assignment_images.ImageInputError as exc:
+            raise ValidationError(str(exc)) from None
+
     def save_blueprint(self, payload: dict[str, Any], blueprint_id: int | None = None) -> dict[str, Any]:
         fields = {
             "code", "name", "description", "category", "version", "status", "template_vmid",
@@ -769,9 +800,11 @@ class DashboardService:
             columns = list(defaults) + ["updated_at", "created_at"]
             values = [defaults[column] for column in defaults] + [now, now]
             placeholders = ", ".join("?" for _ in values)
-            new_id = self.store.execute(
-                f"INSERT INTO blueprints ({', '.join(columns)}) VALUES ({placeholders})", tuple(values),
-            )
+            with self.store.transaction() as conn:
+                new_id = int(conn.execute(
+                    f"INSERT INTO blueprints ({', '.join(columns)}) VALUES ({placeholders})", tuple(values),
+                ).lastrowid)
+                self._link_assignment_images(conn, new_id, defaults.get("assignment_markdown", ""))
             self.store.add_activity("script", "Создан сценарий", str(defaults["name"]), "success")
             return self.get_blueprint(new_id)
         data["updated_at"] = now
@@ -785,6 +818,8 @@ class DashboardService:
                                   (*data.values(), blueprint_id, *(original[k] for k in guarded)))
             if not cursor.rowcount:
                 raise ConflictError("Сценарий изменился. Обновите карточку и повторите сохранение")
+            if "assignment_markdown" in data:
+                self._link_assignment_images(conn, blueprint_id, data["assignment_markdown"])
         updated = self.get_blueprint(blueprint_id)
         self.store.add_activity("script", "Сценарий обновлён", updated["name"], "success")
         return updated

@@ -590,6 +590,9 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .assignment-author .assignment-source { display: block; min-height: 9rem; padding: .75rem; font-size: .95rem; line-height: 1.55; resize: vertical; }
 .assignment-preview { overflow-wrap: anywhere; border: 1px solid var(--line); border-radius: 8px; }
 .assignment-preview summary { cursor: pointer; padding: .7rem .9rem; font-weight: 650; }
+.assignment-image-toolbar { display: flex; align-items: center; gap: .6rem 1rem; flex-wrap: wrap; }
+.assignment-author [data-image-status]:empty { display: none; }
+.assignment-md img { display: block; max-width: 100%; height: auto; margin: .45em 0; border-radius: 6px; }
 .assignment-md { padding: .8rem 1rem; border-top: 1px solid var(--line); font-size: 1rem; line-height: 1.55; min-width: 0; overflow-x: auto; }
 .assignment-md > :first-child { margin-top: 0; }
 .assignment-md > :last-child { margin-bottom: 0; }

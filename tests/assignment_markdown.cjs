@@ -20,4 +20,22 @@ assert.doesNotMatch(html,/<(?:script|svg|img)\b/i);
 assert.doesNotMatch(html,/external\.test/);
 assert.match(html,/&lt;img/);
 assert.ok(render("[".repeat(32000)).endsWith("</p>"));
-console.log("PASS assignment-markdown: blocks, inline, literal HTML, restricted links, no image requests");
+const id = "abcdef0123456789".repeat(2), local = "/student-demo/api/assignments/lab-2-276/images/" + id;
+const attachment = '![Схема "VM"](attachment:' + id + ')';
+const imageURL = key => (assert.equal(key,id),local);
+assert.match(render(attachment,{imageURL}), new RegExp('<img class="assignment-image" src="' + local + '" alt="Схема &quot;VM&quot;"'));
+assert.match(render("![](attachment:" + id + ")",{imageURL}), /<img\b[^>]* alt=""/);
+assert.equal(render(attachment),"<p>Схема &quot;VM&quot;</p>"); // offline export without asset service
+assert.doesNotMatch(render("`" + attachment + "`",{imageURL}),/<img\b/);
+assert.doesNotMatch(render(attachment.replace(id,id.toUpperCase()),{imageURL}),/<img\b/);
+assert.doesNotMatch(render("![x]("+local+")",{imageURL}),/<img\b/);
+for (const src of ["//outside.invalid/x", "data:image/png;base64,x", "blob:https://outside.invalid/" + id,
+    "/api/assignment-images/" + id, local+"?token=demo",local+"#fragment",local.slice(0,-1)+"f",local+"\n"]) {
+  assert.doesNotMatch(render(attachment,{imageURL:()=>src}),/<img\b/);
+}
+const viaBlob = "blob:https://class.test/86ea87f9-99ca-4d4f-89bd-32ffc257892b";
+globalThis.location = {origin:"https://class.test"};
+assert.match(render(attachment,{imageURL:()=>viaBlob}),/<img\b/);
+assert.doesNotMatch(render(attachment,{imageURL:()=>viaBlob.replace("class.test","class.test.elsewhere.test")}),/<img\b/);
+delete globalThis.location;
+console.log("PASS assignment-markdown: scoped attachments, escaped alt, protected preview, external images never requested");

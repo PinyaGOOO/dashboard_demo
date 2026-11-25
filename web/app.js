@@ -158,6 +158,7 @@ exit 75`;
     lastUpdated: null,
   };
   let activeModalToken = 0;
+  let disposeModalContent = null;
   let modalReturnFocus = null;
   let pendingAdminTokenFinish = null;
   let standDetailPollTimer = null;
@@ -1161,6 +1162,7 @@ exit 75`;
   }
 
   function showModal({ title, subtitle = "", body, footer = "", size = "", className = "" }) {
+    disposeModalContent?.(); disposeModalContent = null;
     if (activeStandDetailId !== null && !className.includes("stand-detail-modal")) stopStandDetailPolling();
     activeModalToken += 1;
     if (!modalRoot.innerHTML || modalRoot.querySelector(".modal-backdrop.is-closing")) modalReturnFocus = document.activeElement;
@@ -1178,6 +1180,7 @@ exit 75`;
       return;
     }
     // Do not leave a one-time roster or an unsaved token visible during the close animation.
+    disposeModalContent?.(); disposeModalContent = null;
     modalRoot.querySelectorAll("[data-batch-secret]").forEach(field => { field.value = ""; });
     stopStandDetailPolling();
     activeModalToken += 1;
@@ -1512,6 +1515,10 @@ exit 75`;
       <section class="form-section assignment-author" aria-labelledby="assignment-heading"><h3 id="assignment-heading">Задание для студентов</h3>
         <p>Название сценария станет названием задания. Опишите, что студент должен сделать на своём стенде и как сдавать работу.</p>
         <label class="field"><span class="field-label">Условие в Markdown</span><textarea class="input textarea mono assignment-source" name="assignment_markdown" rows="7" maxlength="32000" placeholder="## Цель работы&#10;&#10;1. Подготовьте стенд.&#10;2. Проверьте результат."></textarea></label>
+        <div class="assignment-image-toolbar"><button class="button button--small" type="button" data-upload-image>Загрузить изображение</button>
+          <input type="file" hidden multiple accept="image/png,image/jpeg,image/webp" data-image-input aria-label="Выбрать изображения для задания">
+          <small class="field-hint">Или вставьте скриншот в текст через Ctrl+V. PNG, JPEG и WebP, до 12 МиБ на файл.</small></div>
+        <small class="field-hint" role="status" aria-live="polite" data-image-status></small>
         <details class="assignment-preview"><summary>Предпросмотр задания</summary><article class="assignment-md" data-assignment-preview></article></details>
         <label class="assignment-publish"><input type="checkbox" name="student_visible" ${assignment.student_visible ? "checked" : ""}><span>Показывать задание студентам</span></label>
         <small class="field-hint" data-assignment-visibility></small>
@@ -1524,6 +1531,19 @@ exit 75`;
     const markdown = form.elements.assignment_markdown, visible = form.elements.student_visible;
     const preview = form.querySelector(".assignment-preview"), content = form.querySelector("[data-assignment-preview]");
     markdown.value = assignment.assignment_markdown;
+    function unlockEditor() {
+      let field = form.querySelector("[data-blueprint-token]");
+      if (!field) {
+        form.insertAdjacentHTML("beforeend", '<label class="field"><span class="field-label">Административный токен</span><input class="input" type="password" data-blueprint-token autocomplete="off" required><small class="field-hint">Черновик остался в форме. Введите токен и повторите действие. Для повторной загрузки предпросмотра закройте и откройте его.</small></label>');
+        field = form.querySelector("[data-blueprint-token]");
+      }
+      field.focus();
+    }
+    const images = window.AssignmentImageEditor.install({form,markdown,preview,content,
+      submit:modalRoot.querySelector('[form="blueprint-form"]'),alive:()=>activeModalToken===editing && form.isConnected,
+      token:()=>form.querySelector("[data-blueprint-token]")?.value.trim() || localStorage.getItem("demoops.adminToken"),
+      unlock:unlockEditor});
+    disposeModalContent = images.dispose;
     function updateAssignment() {
       const text = markdown.value.trim();
       const active = form.elements.status.value === "active";
@@ -1539,8 +1559,7 @@ exit 75`;
         : visible.checked ? "После сохранения задание появится в учебном кабинете."
           : "После сохранения условие будет скрыто. Выданные стенды не выключатся.";
       if (!preview.open) return;
-      if (text && window.AssignmentMarkdown) content.innerHTML = window.AssignmentMarkdown.render(markdown.value);
-      else content.textContent = text || "Здесь появится оформленное условие задания.";
+      images.paint();
     }
     [markdown, visible, form.elements.status, form.elements.template_vmid].forEach(field => field.addEventListener("input", updateAssignment));
     preview.addEventListener("toggle",updateAssignment);
@@ -1575,12 +1594,7 @@ exit 75`;
         if (editing !== activeModalToken) return;
         submit.disabled = false;
         if (error.status === 401) {
-          let tokenField = form.querySelector("[data-blueprint-token]");
-          if (!tokenField) {
-            form.insertAdjacentHTML("beforeend", '<label class="field"><span class="field-label">Административный токен для сохранения</span><input class="input" type="password" data-blueprint-token autocomplete="off" required><small class="field-hint">Черновик остался в форме. Введите токен и нажмите «Сохранить» ещё раз.</small></label>');
-            tokenField = form.querySelector("[data-blueprint-token]");
-          }
-          tokenField.focus();
+          unlockEditor();
         } else toast(error.message, "error");
       }
     });

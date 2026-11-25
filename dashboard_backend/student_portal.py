@@ -86,11 +86,12 @@ class StudentPortal:
 
     def __init__(self, db_path: str | Path, catalog: Callable[[], list[dict]], *, clock=time.time,
                  pilot_validator: Callable[[dict], bool] | None = None, pilot_grant=None, set_duration=None,
-                 labs=None, published_catalog=None):
+                 labs=None, published_catalog=None, image_reader=None):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._catalog = catalog
         self._published_catalog = published_catalog
+        self._image_reader = image_reader
         self._clock = clock
         self._pilot_validator = pilot_validator
         self._pilot_grant = pilot_grant
@@ -244,6 +245,8 @@ class StudentPortal:
             task["steps"] = list(source["steps"])
             if isinstance(source.get("assignment_markdown"), str):
                 task["assignment_markdown"] = source["assignment_markdown"]
+                if classroom and self._image_reader is not None:
+                    task["images_available"] = True
             unique[key] = task
         keys = list(unique)
         if classroom or len(keys) < 2 or self._managed(login):
@@ -253,6 +256,18 @@ class StudentPortal:
         else:
             selected = keys[1:3] + keys[4::2]
         return {key: unique[key] for key in selected}
+
+    def assignment_image(self, token, assignment_id, image_id):
+        with self._db() as db:
+            login, stamp = self._session(db, token)
+            if not (stamp and self._image_reader and self._published_catalog and
+                    (self._managed(login, db) or self._private_login(login))):
+                raise StudentError(404, "Изображение недоступно")
+        if assignment_id not in self._assigned(login):
+            raise StudentError(404, "Изображение недоступно")
+        # Reader verifies the active publication AND membership of this exact
+        # attachment in the same SQL statement that returns its bytes.
+        return self._image_reader(assignment_id, image_id)
 
     @staticmethod
     def _duration(value):

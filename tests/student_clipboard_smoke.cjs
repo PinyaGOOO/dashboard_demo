@@ -59,8 +59,9 @@ function managedFixture() {
   },50));
 }
 function assignmentFixture() {
-  const md = '## Шаги\n\n- **Соберите** схему\n- `ip -br a`\n\n![diagram](https://invalid.example/image.png)\n\n<img src="/never" onerror="window.injection=true">';
-  const a = {id:"task",title:"Паспорт сети",description:"",template_name:"PR1",template_vmid:276,steps:[],assignment_markdown:md};
+  const imageId = "13579bdf".repeat(4), imagePath = "/student-demo/api/assignments/lab-2-276/images/" + imageId;
+  const md = '## Шаги\n\n- **Соберите** схему\n- `ip -br a`\n\n![Топология](attachment:' + imageId + ')\n\n![diagram](https://invalid.example/image.png)\n\n<img src="/never" onerror="window.injection=true">';
+  const a = {id:"lab-2-276",title:"Паспорт сети",description:"",template_name:"PR1",template_vmid:276,steps:[],assignment_markdown:md,images_available:true};
   const student = {login:"class01",name:"Test",group:"ДЭ-24",managed:true};
   const stand = {id:"fixture",name:"Личная VM",real:true,status:"ready",access:{kind:"proxmox",login:"root@pam",vmid:321,url:"https://10.39.0.9:8006/"}};
   let hidden = false, blob, filename;
@@ -72,9 +73,13 @@ function assignmentFixture() {
   window.addEventListener("load",()=>setTimeout(async () => {
     const $ = sel => document.querySelector(sel), delay = () => new Promise(resolve=>setTimeout(resolve,80));
     $(".assignment details summary").click();
-    if ($(".assignment-md strong")?.textContent !== "Соберите" || $(".assignment-md img")) return;
+    const image = $(".assignment-md img");
+    if ($(".assignment-md strong")?.textContent !== "Соберите" || document.querySelectorAll(".assignment-md img").length !== 1 ||
+        image.alt !== "Топология" || image.getAttribute("src") !== imagePath) return;
+    image.loading = "eager"; await image.decode();
+    if (image.naturalWidth !== 1) return;
     $("[data-open-stand]").click(); await delay();
-    if ($(".sheet .assignment-md h2")?.textContent !== "Шаги" || !$("[data-open-proxmox]")) return;
+    if ($(".sheet .assignment-md h2")?.textContent !== "Шаги" || $(".sheet .assignment-md img")?.getAttribute("src") !== imagePath || !$("[data-open-proxmox]")) return;
     $("#download-assignment").click();
     if (!filename?.endsWith(".md") || blob.type !== "text/markdown;charset=utf-8" || await blob.text() !== md || window.injection) return;
     hidden = true; window.dispatchEvent(new Event("online")); await delay();
@@ -138,7 +143,11 @@ function fixture() {
     if (req.url === "/?teacher") { res.setHeader("Content-Type","text/html; charset=utf-8"); res.end(html(path.dirname(web),teacherFixture)); return; }
     if (req.url.startsWith("/student-demo/?")) { res.setHeader("Content-Type","text/html; charset=utf-8"); res.end(html(web,req.url.includes("?assignment") ? assignmentFixture : req.url.includes("?managed") ? managedFixture : fixture)); return; }
     const asset = req.url.split("?")[0];
-    if (["/styles.css","/app.js"].includes(asset)) {
+    if (asset === "/student-demo/api/assignments/lab-2-276/images/" + "13579bdf".repeat(4)) {
+      res.setHeader("Content-Type","image/png");
+      res.end(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a0m0AAAAASUVORK5CYII=","base64")); return;
+    }
+    if (["/styles.css","/app.js","/assignment-images.js"].includes(asset)) {
       res.setHeader("Content-Type",asset.endsWith(".js") ? "text/javascript" : "text/css"); res.end(fs.readFileSync(path.join(web,"..",asset.slice(1)))); return;
     }
     const name = req.url.slice("/student-demo/".length);

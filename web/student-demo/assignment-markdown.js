@@ -9,10 +9,24 @@
       return url.hostname && !url.username && !url.password ? escape(url.href) : null;
     } catch { return null; }
   }
-  function inline(text, depth = 0) {
+  function imageSource(raw, resolveImage) {
+    const attachment = /^attachment:([a-f0-9]{32})$/.exec(raw);
+    if (!attachment || typeof resolveImage !== "function") return null;
+    const id = attachment[1], src = resolveImage(id);
+    if (typeof src !== "string" || /[\s\\]/.test(src)) return null;
+    // Only trusted callers resolve opaque attachment IDs. Never use the Markdown
+    // string as a URL, even if it happens to point at the same host.
+    const match = /^\/student-demo\/api\/assignments\/lab-[1-9]\d{0,9}-[1-9]\d{0,8}\/images\/([a-f0-9]{32})$/.exec(src);
+    if (match && match[1] === id) return src;
+    const origin = globalThis.location?.origin;
+    if (origin && /^https?:\/\//.test(origin) && src.startsWith("blob:" + origin + "/") &&
+        /^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/i.test(src.slice(origin.length + 6))) return src;
+    return null;
+  }
+  function renderInline(text, resolveImage, depth = 0) {
     if (depth >= 3) return escape(text);
     // Limits on individual tokens keep malformed markers in class-sized documents cheap.
-    const tokens = /\\([\\`*_[\]!|])|`([^`\n]{1,2048})`|(!?)\[([^\]\n]{1,512})\]\(([^()\s]{1,2048})\)|(\*\*|__)(?=\S)([^\n]{1,2048}?)\6|(\*|_)(?=\S)([^\n]{1,2048}?)\8/g;
+    const tokens = /\\([\\`*_[\]!|])|`([^`\n]{1,2048})`|(!?)\[([^\]\n]{0,512})\]\(([^()\s]{1,2048})\)|(\*\*|__)(?=\S)([^\n]{1,2048}?)\6|(\*|_)(?=\S)([^\n]{1,2048}?)\8/g;
     let html = "", end = 0;
     for (const m of text.matchAll(tokens)) {
       html += escape(text.slice(end,m.index));
@@ -20,14 +34,18 @@
       if (m[1]) html += escape(m[1]);
       else if (m[2]) html += `<code>${escape(m[2])}</code>`;
       else if (m[4] !== undefined) {
-        // Image syntax is text-only: loading a classroom page must not contact an image host.
-        const href = !m[3] && destination(m[5]);
-        html += href ? `<a href="${href}" target="_blank" rel="noopener noreferrer">${escape(m[4])}</a>` : escape(m[4]);
+        if (m[3]) {
+          const src = imageSource(m[5], resolveImage);
+          html += src ? `<img class="assignment-image" src="${escape(src)}" alt="${escape(m[4])}" loading="lazy" decoding="async" referrerpolicy="no-referrer">` : escape(m[4]);
+        } else {
+          const href = m[4] && destination(m[5]);
+          html += href ? `<a href="${href}" target="_blank" rel="noopener noreferrer">${escape(m[4])}</a>` : escape(m[4]);
+        }
       } else {
         const tag = m[6] ? "strong" : "em", mark = m[6] || m[8], value = m[7] || m[9];
         const word = c => !!c && /[\p{L}\p{N}]/u.test(c);
         if (/\s$/.test(value) || (mark.startsWith("_") && (word(text[m.index-1]) || word(text[end])))) html += escape(m[0]);
-        else html += `<${tag}>${inline(value,depth+1)}</${tag}>`;
+        else html += `<${tag}>${renderInline(value,resolveImage,depth+1)}</${tag}>`;
       }
     }
     return html + escape(text.slice(end));
@@ -41,8 +59,9 @@
     // A backslash-escaped pipe is part of the cell, not its separator.
     return line.trim().replace(/^\|/,'').replace(/(?<!\\)\|$/,'').split(/(?<!\\)\|/).map(s => s.trim());
   }
-  function render(source) {
+  function render(source, options) {
     if (typeof source !== "string") return "";
+    const inline = text => renderInline(text, options?.imageURL);
     const bounded = source.length <= 32000 ? source : Array.from(source).slice(0,32000).join("");
     const lines = bounded.replace(/\r\n?/g,"\n").split("\n"), blocks = [];
     for (let i = 0; i < lines.length;) {

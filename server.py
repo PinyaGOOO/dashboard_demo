@@ -4,6 +4,7 @@ import argparse
 import json
 import mimetypes
 import os
+import re
 import sys
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -12,6 +13,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from dashboard_backend.consumer_monitor import ConsumerReportUnavailable
+from dashboard_backend.assignment_images import MAX_IMAGE_BYTES
 from dashboard_backend.database import DashboardStore
 from dashboard_backend.proxmox_gateway import create_gateway
 from dashboard_backend.service import ConflictError, DashboardService, NotFoundError, ValidationError
@@ -121,6 +123,41 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             if password:
                 vm["student_login_password"] = password
 
+    def _operator_image(self, method, parts):
+        tokens = self.headers.get_all("X-Admin-Token") or []
+        if not self.admin_token or not self.admin_token.strip() or len(tokens) != 1 or not secrets_compare(tokens[0], self.admin_token):
+            self._json({"error": "Для изображений нужен административный токен."}, HTTPStatus.UNAUTHORIZED)
+            return
+        if method == "POST" and len(parts) == 2:
+            if self.headers.get("Sec-Fetch-Site") not in (None, "same-origin"):
+                self._json({"error": "Загрузите файл из редактора."}, HTTPStatus.FORBIDDEN)
+                return
+            if self.headers.get_all("Content-Type") != ["image/png"]:
+                self._json({"error": "Ожидалось изображение PNG."}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                return
+            sizes = self.headers.get_all("Content-Length") or []
+            if self.headers.get("Transfer-Encoding") or len(sizes) != 1 or not re.fullmatch(r"[0-9]{1,12}", sizes[0]):
+                self._json({"error": "Некорректная длина изображения."}, HTTPStatus.BAD_REQUEST)
+                return
+            n = int(sizes[0])
+            if n > MAX_IMAGE_BYTES:
+                self._json({"error": "PNG должен быть не больше 2 МиБ."}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                return
+            data = self.rfile.read(n)
+            if len(data) != n:
+                raise ValidationError("Не удалось прочитать изображение целиком.")
+            self._json(self.service.upload_assignment_image(data), HTTPStatus.CREATED)
+        elif method == "GET" and len(parts) == 3 and re.fullmatch(r"[0-9a-f]{32}",parts[2]):
+            data = self.service.assignment_image(parts[2])
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+            self.end_headers()
+            self.wfile.write(data)
+        else:
+            self._json({"error": "Изображение не найдено."}, HTTPStatus.NOT_FOUND)
+
     def _handle_api(self, method: str) -> None:
         parsed = urlparse(self.path)
         parts = [part for part in parsed.path.strip("/").split("/") if part]
@@ -138,7 +175,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self._json({"error": "Для редактирования заданий настройте административный токен."}, HTTPStatus.FORBIDDEN)
             return
         try:
-            if parts == ["api", "student-accounts", "batch"] and method == "POST":
+            if parts[:2] == ["api", "assignment-images"]:
+                self._operator_image(method, parts)
+            elif parts == ["api", "student-accounts", "batch"] and method == "POST":
                 # Unlike legacy demo actions this endpoint must never allow a
                 # missing operator credential, even when running on localhost.
                 tokens = self.headers.get_all("X-Admin-Token") or []
@@ -266,6 +305,15 @@ def secrets_compare(left: str, right: str) -> bool:
     return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
 
 
+def student_image_reader(service):
+    def read(assignment_id, image_id):
+        try:
+            return service.published_assignment_image(assignment_id, image_id)
+        except NotFoundError:
+            raise StudentError(404, "Изображение недоступно") from None
+    return read
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="DemoExam Proxmox dashboard")
     parser.add_argument("--host", default=os.environ.get("DASHBOARD_HOST", "127.0.0.1"))
@@ -302,6 +350,7 @@ def main() -> None:
     DashboardHandler.student_mount = StudentMount(
         student_db, admin_db.with_name("student-demo-catalog.json"),
         published_catalog=lambda: published_assignments(admin_db),
+        image_reader=student_image_reader(service),
         secure_cookie=gateway.mode == "live", example_if_missing=gateway.mode == "demo",
         pilot_validator=make_pilot_validator(admin_db) if gateway.mode == "live" else None,
         pilot_grant=grant, set_duration=set_student_duration if grant else None,

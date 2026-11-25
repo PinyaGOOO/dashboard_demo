@@ -123,9 +123,12 @@ def _body(h):
 
 
 def _response(h, method, status, data, headers):
-    body = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    png = isinstance(data, bytes)
+    body = data if png else json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     h.send_response(status)
-    for name, value in (("Content-Type", "application/json; charset=utf-8"),
+    if png:
+        h.send_header("Cross-Origin-Resource-Policy", "same-origin")
+    for name, value in (("Content-Type", "image/png" if png else "application/json; charset=utf-8"),
                         ("Content-Length", str(len(body))), ("Cache-Control", "no-store"),
                         ("X-Content-Type-Options", "nosniff"), *headers):
         h.send_header(name, value)
@@ -146,8 +149,9 @@ def dispatch_student(handler, method, portal, *, secure_cookie=False) -> bool:
     tail = path[len(PREFIX):]
     deploy = re.fullmatch(r"/assignments/(" + RESOURCE_ID + r")/deploy", tail)
     detail = re.fullmatch(r"/stands/(" + RESOURCE_ID + r")", tail)
+    image = re.fullmatch(r"/assignments/(lab-[1-9][0-9]{0,18}-[1-9][0-9]{0,8})/images/([0-9a-f]{32})", tail)
     guest = re.fullmatch(r"/stands/(" + RESOURCE_ID + r")/(credentials|duration)", tail)
-    allowed = "POST" if tail in {"/login", "/logout"} or deploy or guest else "GET" if tail in {"/me", "/login-options"} or detail else None
+    allowed = "POST" if tail in {"/login", "/logout"} or deploy or guest else "GET" if tail in {"/me", "/login-options"} or detail or image else None
     headers = []
     status = 200
     try:
@@ -195,6 +199,8 @@ def dispatch_student(handler, method, portal, *, secure_cookie=False) -> bool:
             raise StudentError(401, "Войдите в учебный кабинет.")
         elif tail == "/me":
             result = portal.get_dashboard(token)
+        elif image:
+            result = portal.assignment_image(token, image[1], image[2])
         elif detail:
             result = portal.get_stand(token, detail[1])
         elif guest:

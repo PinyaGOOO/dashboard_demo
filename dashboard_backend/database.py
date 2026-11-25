@@ -91,6 +91,24 @@ class DashboardStore:
             updated_at TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS assignment_images (
+            id TEXT PRIMARY KEY, png BLOB NOT NULL, unused_since INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS assignment_image_refs (
+            blueprint_id INTEGER NOT NULL REFERENCES blueprints(id) ON DELETE CASCADE,
+            image_id TEXT NOT NULL REFERENCES assignment_images(id),
+            PRIMARY KEY (blueprint_id, image_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_assignment_images_refs ON assignment_image_refs(image_id);
+        CREATE TRIGGER IF NOT EXISTS assignment_image_linked AFTER INSERT ON assignment_image_refs
+        BEGIN
+            UPDATE assignment_images SET unused_since=NULL WHERE id=NEW.image_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS assignment_image_unlinked AFTER DELETE ON assignment_image_refs
+        WHEN NOT EXISTS (SELECT 1 FROM assignment_image_refs WHERE image_id=OLD.image_id)
+        BEGIN
+            UPDATE assignment_images SET unused_since=strftime('%s','now') WHERE id=OLD.image_id;
+        END;
         CREATE TABLE IF NOT EXISTS stands (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
