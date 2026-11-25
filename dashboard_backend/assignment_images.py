@@ -7,6 +7,8 @@ import struct
 import threading
 import zlib
 
+from .assignment_audience import allows_student_group, parse_stored_groups
+
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_PIXELS = 8 * 1024 * 1024
 MAX_EDGE = 8192
@@ -169,16 +171,16 @@ def link(conn, blueprint_id, markdown):
     conn.executemany("INSERT INTO assignment_image_refs(blueprint_id,image_id) VALUES (?,?)",((blueprint_id,i) for i in refs-current))
 
 
-def published(store, assignment_id, image_id):
+def published(store, assignment_id, image_id, student_group=None):
     lab = _LAB.fullmatch(assignment_id) if isinstance(assignment_id,str) else None
     if not lab or not valid_id(image_id):
         return None
     # Resolve the exact current assignment and its link in ONE SQLite read;
     # the owner of the student session is verified by the HTTP adapter.
-    row = store.query_one("""SELECT img.png FROM assignment_images img
+    row = store.query_one("""SELECT img.png,b.student_groups AS audience_json FROM assignment_images img
         JOIN assignment_image_refs ref ON ref.image_id=img.id
         JOIN blueprints b ON b.id=ref.blueprint_id
         WHERE img.id=? AND b.id=? AND b.template_vmid=? AND b.student_visible=1
           AND b.status='active' AND b.assignment_template_name!='' AND b.assignment_markdown!=''""",
                           (image_id,int(lab[1]),int(lab[2])))
-    return row["png"] if row else None
+    return row["png"] if row and allows_student_group(parse_stored_groups(row["audience_json"]), student_group) else None

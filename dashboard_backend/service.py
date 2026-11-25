@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
 from . import assignment_images, deploy_relief
+from .assignment_audience import allows_student_group, parse_stored_groups, validate_student_groups
 from .stand_timer import StandTimer, deadline as stand_deadline, duration as parse_duration
 from .student_pilot_publish import publish_pilot_if_ready
 from .student_network import student_deployment_network
@@ -711,8 +712,8 @@ class DashboardService:
             raise NotFoundError("Изображение задания не найдено")
         return row["png"]
 
-    def published_assignment_image(self, assignment_id: str, image_id: str) -> bytes:
-        png = assignment_images.published(self.store, assignment_id, image_id)
+    def published_assignment_image(self, assignment_id: str, image_id: str, student_group=None) -> bytes:
+        png = assignment_images.published(self.store, assignment_id, image_id, student_group)
         if png is None:
             raise NotFoundError("Изображение задания не найдено")
         return png
@@ -727,7 +728,7 @@ class DashboardService:
     def save_blueprint(self, payload: dict[str, Any], blueprint_id: int | None = None) -> dict[str, Any]:
         fields = {
             "code", "name", "description", "category", "version", "status", "template_vmid",
-            "tags", "deploy_script", "autocheck_script", "checks_count", "assignment_markdown", "student_visible",
+            "tags", "deploy_script", "autocheck_script", "checks_count", "assignment_markdown", "student_visible", "student_groups",
         }
         data = {key: payload[key] for key in fields if key in payload}
         original = self.get_blueprint(blueprint_id) if blueprint_id is not None else {}
@@ -759,11 +760,20 @@ class DashboardService:
             raise ValidationError("Неизвестный статус сценария")
         status = data.get("status", original.get("status", "draft"))
         visible = data.get("student_visible", original.get("student_visible", False))
+        groups = original.get("student_groups")
+        if "student_groups" in data:
+            try:
+                groups = validate_student_groups(data["student_groups"])
+            except ValueError as exc:
+                raise ValidationError(str(exc)) from None
+            data["student_groups"] = json.dumps(groups, ensure_ascii=False) if groups is not None else None
         if status != "active":
             if data.get("student_visible") is True:
                 raise ValidationError("Публиковать задания можно только у активных сценариев")
             visible = False
         if visible:
+            if groups == []:
+                raise ValidationError("Для публикации выберите хотя бы одну группу или разрешите задание всем группам.")
             if not data.get("assignment_markdown", original.get("assignment_markdown", "")).strip():
                 raise ValidationError("Перед публикацией заполните текст задания")
             vmid = data.get("template_vmid", original.get("template_vmid", 0))
@@ -814,6 +824,9 @@ class DashboardService:
         guarded = ("student_visible", "assignment_markdown", "assignment_template_name", "template_vmid", "status")
         predicates = " AND ".join(f"{column}=?" for column in guarded)
         with self.store.transaction() as conn:
+            audience = conn.execute("SELECT student_groups FROM blueprints WHERE id=?", (blueprint_id,)).fetchone()
+            if not audience or parse_stored_groups(audience[0]) != original.get("student_groups"):
+                raise ConflictError("Доступ групп к сценарию изменился. Обновите карточку и повторите сохранение")
             cursor = conn.execute(f"UPDATE blueprints SET {assignments} WHERE id=? AND {predicates}",
                                   (*data.values(), blueprint_id, *(original[k] for k in guarded)))
             if not cursor.rowcount:
@@ -1066,6 +1079,14 @@ class DashboardService:
         self.store.add_activity("import", "Существующий pool добавлен", activity_detail, "success")
         return self.get_stand(stand_id)
 
+    @staticmethod
+    def _assert_student_publication(connection, blueprint_id, vmid, template_name, group):
+        row = connection.execute("""SELECT student_groups FROM blueprints WHERE id=? AND template_vmid=?
+            AND status='active' AND student_visible=1 AND assignment_template_name=?""",
+                                 (blueprint_id, vmid, template_name)).fetchone()
+        if not row or not allows_student_group(parse_stored_groups(row[0]), group):
+            raise ConflictError("Задание или шаблон больше не доступны студенту; обратитесь к преподавателю")
+
     def create_stand(self, payload: dict[str, Any], *, student_receipt=None) -> dict[str, Any]:
         try:
             blueprint_id = int(payload.get("blueprint_id"))
@@ -1144,11 +1165,10 @@ class DashboardService:
             # This optional argument is internal, never read from the admin/student POST body.
             if student_receipt is not None:
                 if (vm_count != 1 or use_existing_pool or self.gateway.mode != "live" or
-                        blueprint["template_vmid"] != student_receipt["template_vmid"] or
-                        not connection.execute("""SELECT 1 FROM blueprints WHERE id=? AND template_vmid=? AND status='active'
-                                               AND student_visible=1 AND assignment_template_name=?""",
-                                               (blueprint_id, student_receipt["template_vmid"], student_receipt["template_name"])).fetchone()):
+                        blueprint["template_vmid"] != student_receipt["template_vmid"]):
                     raise ConflictError("Учебный шаблон изменился; обратитесь к преподавателю")
+                self._assert_student_publication(connection, blueprint_id, student_receipt["template_vmid"],
+                                                 student_receipt["template_name"], student_receipt.get("student_group"))
                 if connection.execute("SELECT 1 FROM student_lab_receipts WHERE card_id=?",
                                       (student_receipt["card_id"],)).fetchone():
                     raise ConflictError("Эта учебная карточка уже зарегистрирована")
@@ -1210,13 +1230,14 @@ class DashboardService:
                     )
                 if student_receipt is not None:
                     connection.execute("""INSERT INTO student_lab_receipts
-                        (card_id,login,assignment_id,template_vmid,blueprint_id,stand_id,vm_row_id,pool_id,vm_name,guest_ip)
-                        VALUES (?,?,?,?,?,?,?,?,?,?)""", (student_receipt["card_id"], owner, student_receipt["assignment_id"],
-                        student_receipt["template_vmid"], blueprint_id, stand_id, int(vm_cursor.lastrowid), pool_id, vm_name, ip))
+                        (card_id,login,assignment_id,template_vmid,blueprint_id,stand_id,vm_row_id,pool_id,vm_name,guest_ip,student_group)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (student_receipt["card_id"], owner, student_receipt["assignment_id"],
+                        student_receipt["template_vmid"], blueprint_id, stand_id, int(vm_cursor.lastrowid), pool_id, vm_name, ip,
+                        student_receipt.get("student_group")))
             deployment = dict(blueprint, vm_count=vm_count, subnet=subnet, start_ip=canonical_start,
                               allocated_ips=allocated_ips, bridge=bridge, clone_type="linked",
                               storage="", use_existing_pool=use_existing_pool)
-            for field in ("assignment_markdown", "student_visible", "assignment_template_name"):
+            for field in ("assignment_markdown", "student_visible", "assignment_template_name", "student_groups"):
                 deployment.pop(field, None)
             if student_receipt is not None:
                 deployment["_student_template_name"] = student_receipt["template_name"]
@@ -1431,6 +1452,20 @@ class DashboardService:
         try:
             stand = self.get_stand(stand_id)
             blueprint = dict(blueprint)
+            pinned_name = blueprint.get("_student_template_name")
+            def check_current_audience(conn):
+                if pinned_name:
+                    receipt = conn.execute("SELECT student_group FROM student_lab_receipts WHERE stand_id=?",
+                                           (stand_id,)).fetchone()
+                    if not receipt:
+                        raise ConflictError("Учебная заявка не найдена")
+                    self._assert_student_publication(conn, stand["blueprint_id"], blueprint["template_vmid"],
+                                                     pinned_name, receipt[0])
+            # Retry may be accompanied by operator-selected VM stops. Check before
+            # those side effects, and again at the clone admission point below.
+            if stop_stand_ids and pinned_name:
+                with self.store.connect() as conn:
+                    check_current_audience(conn)
             if stop_stand_ids:
                 try:
                     deploy_relief.stop_selected(self, stand_id, stop_stand_ids)
@@ -1543,7 +1578,6 @@ class DashboardService:
                         try:
                             # Waits and operator-approved retries can outlive a published
                             # assignment. Never clone a VM that has since reused its ID.
-                            pinned_name = blueprint.get("_student_template_name")
                             if pinned_name and not any(t.get("vmid")==blueprint["template_vmid"] and
                                     t.get("name")==pinned_name for t in self.gateway.list_templates()):
                                 raise ConflictError("Учебный шаблон изменился до запуска клонирования")
@@ -1551,11 +1585,7 @@ class DashboardService:
                             # the process dies before it records the VMID. Check after
                             # the network lookup and commit admission atomically with publication.
                             with self.store.transaction() as conn:
-                                if pinned_name and not conn.execute("""SELECT 1 FROM blueprints WHERE id=?
-                                        AND template_vmid=? AND status='active' AND student_visible=1
-                                        AND assignment_template_name=?""",
-                                        (stand["blueprint_id"], blueprint["template_vmid"], pinned_name)).fetchone():
-                                    raise ConflictError("Задание или шаблон изменились до запуска клонирования")
+                                check_current_audience(conn)
                                 conn.execute("DELETE FROM pending_deployments WHERE stand_id = ?", (stand_id,))
                             vms = self.gateway.deploy(stand, blueprint, progress)
                         finally:

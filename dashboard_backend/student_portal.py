@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import student_accounts
+from .assignment_audience import allows_student_group
 from .student_errors import StudentError
 from .student_network import STUDENT_NETWORK
 
@@ -86,11 +87,12 @@ class StudentPortal:
 
     def __init__(self, db_path: str | Path, catalog: Callable[[], list[dict]], *, clock=time.time,
                  pilot_validator: Callable[[dict], bool] | None = None, pilot_grant=None, set_duration=None,
-                 labs=None, published_catalog=None, image_reader=None):
+                 labs=None, published_catalog=None, image_reader=None, assignment_access=None):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._catalog = catalog
         self._published_catalog = published_catalog
+        self._assignment_access = assignment_access
         self._image_reader = image_reader
         self._clock = clock
         self._pilot_validator = pilot_validator
@@ -249,12 +251,24 @@ class StudentPortal:
         with self._db() as db:
             db.execute("DELETE FROM student_sessions WHERE token_hash=?", (digest,))
 
-    def _assigned(self, login: str) -> dict[str, dict]:
+    @staticmethod
+    def _issued_group(db, login):
+        # The group printed on a sample or private pilot profile is not a teacher-issued membership.
+        if login in _ACCOUNTS:
+            return None
+        row = db.execute("SELECT group_name FROM student_accounts WHERE login=?", (login,)).fetchone()
+        if row is None:
+            raise StudentError(401, "Сессия завершена. Войдите снова")
+        return row[0]
+
+    def _assigned(self, login: str, group) -> dict[str, dict]:
         # The catalogue provider supplies public teaching material only. Do not
         # let additional fields such as scripts/credentials into the student API.
         unique = {}
-        classroom = self._published_catalog is not None and (self._managed(login) or self._private_login(login))
+        classroom = self._published_catalog is not None and (group is not None or self._private_login(login))
         for source in (self._published_catalog() if classroom else self._catalog()):
+            if not allows_student_group(source.get("student_groups"), group if classroom else None):
+                continue
             key = source["id"]
             if not isinstance(key, str) or not key or key in unique:
                 continue
@@ -266,7 +280,7 @@ class StudentPortal:
                     task["images_available"] = True
             unique[key] = task
         keys = list(unique)
-        if classroom or len(keys) < 2 or self._managed(login):
+        if classroom or len(keys) < 2 or group is not None:
             selected = keys
         elif login == "student01":
             selected = keys[:2] + keys[3::2]
@@ -277,14 +291,15 @@ class StudentPortal:
     def assignment_image(self, token, assignment_id, image_id):
         with self._db() as db:
             login, stamp = self._session(db, token)
+            group = self._issued_group(db, login)
             if not (stamp and self._image_reader and self._published_catalog and
-                    (self._managed(login, db) or self._private_login(login))):
+                    (group is not None or self._private_login(login))):
                 raise StudentError(404, "Изображение недоступно")
-        if assignment_id not in self._assigned(login):
+        if assignment_id not in self._assigned(login, group):
             raise StudentError(404, "Изображение недоступно")
         # Reader verifies the active publication AND membership of this exact
         # attachment in the same SQL statement that returns its bytes.
-        return self._image_reader(assignment_id, image_id)
+        return self._image_reader(assignment_id, image_id, group)
 
     @staticmethod
     def _duration(value):
@@ -363,16 +378,17 @@ class StudentPortal:
     def get_dashboard(self, token: str | None) -> dict:
         with self._db() as db:
             login, _ = self._session(db, token)
-            tasks = {key: dict(task, stand=None) for key, task in self._assigned(login).items()}
+            issued_group = self._issued_group(db, login)
+            tasks = {key: dict(task, stand=None) for key, task in self._assigned(login, issued_group).items()}
             rows = db.execute(_STANDS + " WHERE s.login=? ORDER BY s.started, s.id", (login,))
             for row in rows:
                 key = row["assignment_id"]
-                if self._published_catalog is None:
-                    task = json.loads(row["task_json"])  # standalone demo snapshot
+                if self._published_catalog is None and not row["real_request"]:
+                    task = json.loads(row["task_json"])  # standalone simulation snapshot only
                 elif key in tasks:
                     task = tasks[key]
                 else:
-                    task = self._withdrawn_task(row)
+                    task = self._withdrawn_task(row, issued_group)
                     if task is None:
                         continue
                 tasks[key] = dict(task, stand=self._stand(row))
@@ -380,10 +396,7 @@ class StudentPortal:
                 name, group = _ACCOUNTS[login][:2]
                 managed = self._private_login(login)
             else:
-                account = db.execute("SELECT group_name FROM student_accounts WHERE login=?", (login,)).fetchone()
-                if account is None:
-                    raise StudentError(401, "Сессия завершена. Войдите снова")
-                name, group, managed = login, account[0], True
+                name, group, managed = login, issued_group, True
         return {"student": {"login": login, "name": name, "group": group, "managed": managed},
                 "assignments": list(tasks.values())}
 
@@ -400,9 +413,23 @@ class StudentPortal:
             result["access"] = state["access"]
         return result
 
-    def _withdrawn_task(self, row):
+    def _can_access_stored_card(self, row, group):
+        if self._published_catalog is None:
+            # Reopening a live state file through a standalone server must never
+            # turn archived snapshots or real VM credentials into public material.
+            return not row["real_request"] or row["assignment_id"] in self._assigned(row["login"], group)
+        if group is None and not self._private_login(row["login"]):
+            return False  # public persona, not a personal classroom session
+        if self._assignment_access is not None:
+            return self._assignment_access(row["assignment_id"], group)
+        # A custom provider without an unpublished-policy reader cannot verify a missing card.
+        return row["assignment_id"] in self._assigned(row["login"], group)
+
+    def _withdrawn_task(self, row, group):
         # Keep the owner's existing VM usable without revealing a withdrawn
         # assignment or the stale Markdown pinned in its original request.
+        if not self._can_access_stored_card(row, group):
+            return None
         if row["real_request"]:
             if self._real_state(row)["status"] in {"pending", "removed"}:
                 return None
@@ -449,11 +476,14 @@ class StudentPortal:
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             login, _ = self._session(db, token)
-            assigned = self._assigned(login)
+            group = self._issued_group(db, login)
+            assigned = self._assigned(login, group)
             if self._published_catalog is not None and assignment_id not in assigned:
                 raise StudentError(404, "Задание не опубликовано или недоступно")
             row = db.execute(_STANDS + " WHERE s.login=? AND s.assignment_id=?",
                              (login, assignment_id)).fetchone()
+            if row and row["real_request"] and assignment_id not in assigned:
+                raise StudentError(404, "Задание не опубликовано или недоступно")
             personal = self._managed(login, db) or (self._labs is not None and self._private_login(login))
             if personal:
                 if row and not row["real_request"] and (self._owned_binding(row) or self._matches(
@@ -477,7 +507,8 @@ class StudentPortal:
                 row = db.execute(_STANDS + " WHERE s.id=? AND s.login=?", (stand_id, login)).fetchone()
             if not personal:
                 return self._stand(row)
-        snapshot = self._labs.submit(login, json.loads(row["task_json"]), row["id"], row["duration_minutes"])
+        snapshot = self._labs.submit(login, json.loads(row["task_json"]), row["id"], row["duration_minutes"],
+                                     student_group=group)
         return self._real_state(row, snapshot=snapshot)
 
     def _own_row_and_stamp(self, token, stand_id):
@@ -486,28 +517,36 @@ class StudentPortal:
             row = db.execute(_STANDS + " WHERE s.id=? AND s.login=?", (stand_id, login)).fetchone()
             if row is None:
                 raise StudentError(404, "Стенд не найден")
-        return row, stamp
+            group = self._issued_group(db, login)
+        return row, stamp, group
 
     def get_stand(self, token, stand_id):
-        row, _ = self._own_row_and_stamp(token, stand_id)
-        if self._published_catalog is None:
+        row, _, group = self._own_row_and_stamp(token, stand_id)
+        if self._published_catalog is None and not row["real_request"]:
             task = json.loads(row["task_json"])
         else:
-            task = self._assigned(row["login"]).get(row["assignment_id"]) or self._withdrawn_task(row)
+            task = self._assigned(row["login"], group).get(row["assignment_id"]) or self._withdrawn_task(row, group)
             if task is None:
                 raise StudentError(404, "Задание не опубликовано или недоступно")
         stand = self._stand(row, detail=True)
+        if stand.get("access") and not self._can_access_stored_card(row, group):
+            raise StudentError(404, "Стенд не найден")
         assignment = dict(task, stand={k:v for k,v in stand.items() if k not in ("access", "pilot_pending")})
         return {"stand": stand, "assignment": assignment}
 
     def guest_action(self, token, stand_id, action, data):
-        row, stamp = self._own_row_and_stamp(token, stand_id)
+        row, stamp, group = self._own_row_and_stamp(token, stand_id)
+        if not self._can_access_stored_card(row, group):
+            raise StudentError(404, "Стенд не найден")
         if row["real_request"]:
             if not self._labs or not stamp:
                 raise StudentError(403, "Войдите в личный кабинет студента")
             if action != "credentials" or data != {}:
                 raise StudentError(400, "Срок личного стенда задаётся при развёртывании")
-            return self._labs.credentials(row["login"], json.loads(row["task_json"]), row["id"])
+            result = self._labs.credentials(row["login"], json.loads(row["task_json"]), row["id"])
+            if not self._can_access_stored_card(row, group):  # proof may have waited on Proxmox
+                raise StudentError(404, "Стенд не найден")
+            return result
         binding = self._owned_binding(row)
         if not binding or not stamp or self._pilot_grant is None:
             raise StudentError(404, "Доступ к реальному стенду не настроен")

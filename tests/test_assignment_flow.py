@@ -12,7 +12,7 @@ from server import DashboardHandler, student_image_reader
 from tests.test_assignment_images import TINY
 from dashboard_backend.database import DashboardStore
 from dashboard_backend.service import DashboardService
-from dashboard_backend.student_catalog import published_assignments
+from dashboard_backend.student_catalog import assignment_group_access, published_assignments
 from dashboard_backend.student_mount import StudentMount
 from tests.test_classroom_flow import Labs
 
@@ -30,6 +30,7 @@ class AssignmentFlow(TestCase):
         self.labs = Labs()
         students = StudentMount(directory/"students.db",directory/"unused.json",secure_cookie=True,
                                 labs=self.labs,published_catalog=lambda: published_assignments(db),
+                                assignment_access=lambda ident, group: assignment_group_access(db,ident,group),
                                 image_reader=student_image_reader(service))
         class Handler(DashboardHandler):
             admin_token = "test-operator"
@@ -141,3 +142,41 @@ class AssignmentFlow(TestCase):
         self.assertEqual(tasks()[0]["assignment_markdown"],"Hidden newer draft")
         self.assertFalse(tasks()[0].get("withdrawn"))
         self.assertEqual(len(self.labs.receipts),1)
+
+    def test_teacher_group_selection_end_to_end(self):
+        # Two similar group names must not classify a student by prefix or login.
+        other_name = "Fixture 2"
+        s, result, _ = self.req("/api/student-accounts/batch","POST",{"count":1,"group":other_name},operator=True)
+        self.assertEqual(s,201)
+        other, = result["accounts"]
+        second = self.login(other["login"],other["password"])
+        prefix = "/api/blueprints"
+        code, bp, _ = self.req(prefix,"POST",dict(code="GROUP",name="Targeted",template_vmid=237,
+            status="active",student_visible=True,student_groups=["Fixture"],assignment_markdown="# Personal task"),operator=True)
+        self.assertEqual(code,201)
+        path = prefix + "/" + str(bp["id"])
+        ident = f"lab-{bp['id']}-237"
+        url = f"/student-demo/api/assignments/{ident}/deploy"
+        def tasks(cookie):
+            s, data, _ = self.req("/student-demo/api/me",cookie=cookie)
+            self.assertEqual(s,200)
+            return data["assignments"]
+        self.assertEqual(self.req(path+"/assignment",operator=True)[1]["student_groups"],["Fixture"])
+        self.assertEqual(self.req(path+"/assignment",cookie=second)[0],401)
+        self.assertNotIn("student_groups", self.req(path)[1])
+        self.assertNotIn("student_groups", self.req(prefix)[1][0])
+        self.assertEqual(tasks(second),[])
+        self.assertEqual(tasks(self.cookie)[0]["id"],ident)
+        self.assertNotIn("student_groups", tasks(self.cookie)[0])
+        self.assertEqual(self.req(url,"POST",{},cookie=second)[0],404)
+        self.assertFalse(self.labs.receipts)
+        self.assertEqual(self.req(url,"POST",{},cookie=self.cookie)[0],200)
+        self.assertEqual(self.req(path,"PATCH",{"student_groups":[other_name]},cookie=second)[0],401)
+        self.assertEqual(self.req(path,"PATCH",{"student_groups":[other_name]},operator=True)[0],200)
+        self.assertEqual(tasks(self.cookie),[])
+        self.assertEqual(tasks(second)[0]["id"],ident)
+        self.assertEqual(self.req(url,"POST",{},cookie=self.cookie)[0],404)
+        self.assertEqual(len(self.labs.receipts),1)
+        self.assertEqual(self.req(path,"PATCH",{"student_groups":None},operator=True)[0],200)
+        self.assertTrue(tasks(self.cookie))
+        self.assertTrue(tasks(second))

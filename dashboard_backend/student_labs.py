@@ -70,7 +70,7 @@ class StudentLabs:
     def _row(self, key):
         return self.service.store.query_one(_ROW, key)
 
-    def submit(self, login, task, card_id, duration_minutes=None):
+    def submit(self, login, task, card_id, duration_minutes=None, *, student_group=None):
         key = self._key(login, task, card_id)
         if self._row(key) is not None:
             return self.inspect(login, task, card_id)
@@ -88,7 +88,7 @@ class StudentLabs:
                 owner=login, blueprint_id=blueprint_id, vm_count=1, subnet=f"{lo}/16",
                 start_ip=lo, duration_minutes=duration_minutes), student_receipt={
                     "card_id":card_id, "assignment_id":key[2], "template_vmid":key[3],
-                    "template_name":task["template_name"], "ip_end":hi})
+                    "template_name":task["template_name"], "ip_end":hi, "student_group":student_group})
         except StudentError:
             raise
         except Exception as exc:

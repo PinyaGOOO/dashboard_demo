@@ -19,7 +19,7 @@ class Labs:
         self.lock = threading.Lock()
         self.offline = False
 
-    def submit(self, login, task, card_id, duration_minutes):
+    def submit(self, login, task, card_id, duration_minutes, *, student_group=None):
         from dashboard_backend.student_portal import StudentError
         if self.offline:
             raise StudentError(503, "Нет связи")

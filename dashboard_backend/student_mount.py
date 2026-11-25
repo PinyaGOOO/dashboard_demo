@@ -41,7 +41,7 @@ class _LazyPortal:
     """Initialize the portal only for recognized requests that need it."""
 
     def __init__(self, db_path, catalog_path, example_if_missing, pilot_validator, pilot_grant, set_duration, labs,
-                 published_catalog, image_reader):
+                 published_catalog, image_reader, assignment_access):
         self.db_path = Path(db_path)
         self.catalog_path = Path(catalog_path)
         self.example_if_missing = example_if_missing
@@ -50,6 +50,7 @@ class _LazyPortal:
         self.set_duration = set_duration
         self.labs = labs
         self.published_catalog = published_catalog
+        self.assignment_access = assignment_access
         self.image_reader = image_reader
         self.instance = None
         self.lock = Lock()
@@ -69,7 +70,8 @@ class _LazyPortal:
                         lambda: load_catalog(self.catalog_path, example_if_missing=self.example_if_missing))
                     self.instance = StudentPortal(self.db_path, examples,
                         pilot_validator=self.pilot_validator, pilot_grant=self.pilot_grant, set_duration=self.set_duration,
-                        labs=self.labs, published_catalog=self.published_catalog, image_reader=self.image_reader)
+                        labs=self.labs, published_catalog=self.published_catalog, image_reader=self.image_reader,
+                        assignment_access=self.assignment_access)
                 except (OSError, RuntimeError, SQLiteError, ValueError) as exc:
                     raise StudentError(503, "Хранилище демокабинета недоступно.") from exc
             return self.instance
@@ -78,9 +80,10 @@ class _LazyPortal:
 class StudentMount:
     def __init__(self, db_path: Path, catalog_path: Path, *, secure_cookie: bool,
                  example_if_missing: bool = True, pilot_validator: Callable[[dict], bool] | None = None,
-                 pilot_grant=None, set_duration=None, labs=None, published_catalog=None, image_reader=None):
+                 pilot_grant=None, set_duration=None, labs=None, published_catalog=None, image_reader=None,
+                 assignment_access=None):
         self._portal = _LazyPortal(db_path, catalog_path, example_if_missing, pilot_validator, pilot_grant, set_duration,
-                                   labs, published_catalog, image_reader)
+                                   labs, published_catalog, image_reader, assignment_access)
         self._secure_cookie = secure_cookie
 
     def create_accounts(self, payload):

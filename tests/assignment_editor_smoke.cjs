@@ -11,6 +11,9 @@ function fixture() {
   const origRevoke = URL.revokeObjectURL.bind(URL);
   URL.revokeObjectURL = s=>{revoked.add(s); origRevoke(s);};
   const bp = {id:1, code:"TEST", name:"Практика", template_vmid:276, tags:[], status:"active", student_visible:false, deploy_script:"echo ok", category:"Общий", version:"1"};
+  const assignment = {assignment_markdown:draft, student_visible:false, student_groups:null};
+  const classA="ССА <25> & А", classB="ССА-26", classC="ССА-27";
+  let groups=[classA,classB,classC], groupReads=0, groupFailure=false;
   const reply = (obj,status=200) => new Response(JSON.stringify(obj),{status});
   const pause = ms => new Promise(resolve=>setTimeout(resolve,ms));
   window.fetch = async (url,opts={}) => {
@@ -26,13 +29,21 @@ function fixture() {
       const id = url.split("/").pop(); reads.push(id); return new Response(uploads.get(id),{headers:{"Content-Type":"image/png"}});
     }
     if (url === "/api/bootstrap") return reply({blueprints:[bp],templates:[{name:"Nested",vmid:276}],stands:[],integration:{connected:true}, overview:{attention:0}});
+    if (url === "/api/student-accounts?limit=1") {
+      groupReads++;
+      if (opts.headers["X-Admin-Token"] !== secret) return reply({},401);
+      if (groupFailure) return reply({},503);
+      return reply({groups, accounts:[]});
+    }
     if (url === "/api/blueprints/1/assignment") {
       if (challenge && opts.headers["X-Admin-Token"] !== secret) return reply({error:"Нужен токен"},401);
       if (lag) await pause(120);
-      return reply({assignment_markdown:draft,student_visible:false});
+      return reply(assignment);
     }
     if (["/api/blueprints","/api/blueprints/1"].includes(url) && ["POST","PATCH"].includes(opts.method)) {
-      saved.push(JSON.parse(opts.body)); return reply({id:1});
+      const body = JSON.parse(opts.body); saved.push(body);
+      if (opts.method === "PATCH") for (const key of Object.keys(assignment)) if (key in body) assignment[key]=body[key];
+      return reply({id:1});
     }
     return reply({},404);
   };
@@ -47,7 +58,7 @@ function fixture() {
       $("[data-blueprint-edit]").click();
       (await wait("#admin-token-input")).value=secret; $("#admin-token-form").requestSubmit();
       const f=await wait("#blueprint-form"), md=f.elements.assignment_markdown, flag=f.elements.student_visible;
-      assert(md.value===draft&&!flag.checked,"stored draft");
+      assert(md.value===draft&&!flag.checked&&$("[data-assignment-audience]").value==="all"&&!groupReads,"stored all-group draft");
       flag.click(); md.value="  "; input(md); f.requestSubmit();
       assert(!saved.length&&!md.checkValidity(),"published blank");
       md.value="## Практика\n\nПроверьте **узел**. <span>Текст</span>"; input(md);
@@ -59,7 +70,7 @@ function fixture() {
       const newForm=await wait("#blueprint-form"); newForm.elements.name.value="Черновик";
       assert(!newForm.elements.student_visible.checked,"default visible");
       newForm.elements.assignment_markdown.value="Ещё не готово"; newForm.requestSubmit(); await pause(210);
-      assert(saved.length===2&&saved[1].student_visible===false&&saved[1].template_vmid===0,"draft payload");
+      assert(saved.length===2&&saved[1].student_visible===false&&saved[1].template_vmid===0&&saved[1].student_groups.length===0,"private draft payload");
       lag=true; challenge=false;
       $("[data-blueprint-edit]").click(); $(".modal__close").click(); $("[data-blueprint-new]").click();
       const open=await wait("#blueprint-form"); await pause(180);
@@ -90,6 +101,31 @@ function fixture() {
       const prev=src.value; paste(new File(["not an image"],"fake.svg",{type:"image/svg+xml"}));
       await during(()=>!send.disabled); assert(src.value===prev && uploads.size===2,"SVG not uploaded");
       $(".modal__close").click(); assert(previews.every(s=>revoked.has(s)),"preview URL cleanup");
+      lag=false;
+      const edit=async()=>{ $("[data-blueprint-edit]").click(); return await wait("#blueprint-form"); };
+      const mode=()=>$("[data-assignment-audience]");
+      const choose=value=>{mode().value=value;mode().dispatchEvent(new Event("change",{bubbles:true}));};
+      const boxes=()=>[...document.querySelectorAll("[data-group-options] input")];
+      const box=group=>boxes().find(b=>b.value===group);
+      const targeted=await edit(), base=saved.length;
+      assert(targeted.elements.student_visible.checked && mode().value==="all","unchanged publication");
+      choose("selected"); await during(()=>boxes().length===3);
+      targeted.requestSubmit(); assert(saved.length===base && !mode().checkValidity(),"empty audience cannot publish");
+      box(classA).click(); box(classB).click(); targeted.requestSubmit(); await pause(210);
+      assert(JSON.stringify(saved.at(-1).student_groups)===JSON.stringify([classA,classB]),"save exact multi-group audience");
+      groups=[classA,classC]; groupFailure=true;
+      const again=await edit(); assert(mode().value==="selected"&&box(classB).checked,"reopened stored selection");
+      $("[data-group-picker]").open=true; await during(()=>!$("[data-retry-groups]").hidden);
+      assert(box(classA).checked&&box(classB).checked&&mode().value==="selected","directory failure kept restrictions");
+      again.elements.assignment_markdown.value+="!"; again.requestSubmit(); await pause(210);
+      assert(!("student_groups" in saved.at(-1)) && assignment.student_groups.includes(classB),"text-only save cannot replace audience");
+      const refreshed=await edit(); $("[data-group-picker]").open=true; await during(()=>!$("[data-retry-groups]").hidden);
+      groupFailure=false; $("[data-retry-groups]").click(); await during(()=>!!box(classC));
+      assert(box(classB).checked && box(classB).closest("label").textContent.includes("Пока нет учёток"),"retired group preserved");
+      choose("all"); refreshed.requestSubmit(); await pause(210);
+      assert(saved.at(-1).student_groups===null,"explicitly change to all groups");
+      assignment.student_groups={invalid:true}; $("[data-blueprint-edit]").click(); await pause(230);
+      assert(!$("#blueprint-form"),"invalid policy cannot be edited as unrestricted");
       document.body.dataset.qa="pass";
     } catch (e) {document.body.dataset.failure=e.message;}
   });
@@ -107,7 +143,7 @@ function fixture() {
     const chrome=process.env.CHROME_BIN || (process.platform==="win32"?"C:/Program Files/Google/Chrome/Application/chrome.exe":"chromium");
     const {stdout}=await run(chrome,["--headless","--disable-gpu","--no-first-run","--disable-background-networking","--user-data-dir="+profile,"--virtual-time-budget=12000","--dump-dom","http://127.0.0.1:"+server.address().port+"/#blueprints"],{timeout:35000,maxBuffer:1500000});
     if(!stdout.includes('data-qa="pass"'))throw Error("Editor smoke failed: "+(stdout.match(/data-failure="([^"]*)"/)?.[1]||"no result"));
-    console.log("PASS editor: gated draft, Markdown, local JPEG/file and PNG/paste, auth, preview and cleanup");
+    console.log("PASS editor: gated draft, Markdown, images, group selection / reopen / directory failure / publication");
   } finally {
     server.close();
     if(path.dirname(profile)===os.tmpdir() && path.basename(profile).startsWith("assignment-editor-smoke-"))fs.rmSync(profile,{recursive:true,force:true,maxRetries:3,retryDelay:250});

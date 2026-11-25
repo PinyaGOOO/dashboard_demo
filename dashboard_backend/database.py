@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from .assignment_audience import parse_stored_groups
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -272,9 +274,12 @@ class DashboardStore:
                 ("assignment_markdown", "TEXT NOT NULL DEFAULT '' CHECK(length(assignment_markdown)<=32000)"),
                 ("student_visible", "INTEGER NOT NULL DEFAULT 0 CHECK(student_visible IN (0,1))"),
                 ("assignment_template_name", "TEXT NOT NULL DEFAULT ''"),
+                ("student_groups", "TEXT"),
             ):
                 if column not in bp_columns:
                     connection.execute(f"ALTER TABLE blueprints ADD COLUMN {column} {definition}")
+            if "student_group" not in {r[1] for r in connection.execute("PRAGMA table_info(student_lab_receipts)")}:
+                connection.execute("ALTER TABLE student_lab_receipts ADD COLUMN student_group TEXT")
             stand_columns = {row[1] for row in connection.execute("PRAGMA table_info(stands)")}
             if "origin" not in stand_columns:
                 connection.execute("ALTER TABLE stands ADD COLUMN origin TEXT NOT NULL DEFAULT 'deployed'")
@@ -515,6 +520,8 @@ printf '%s\\n' \"${results[@]}\"""",
         item = dict(row)
         if "student_visible" in item:
             item["student_visible"] = bool(item["student_visible"])
+        if "student_groups" in item:
+            item["student_groups"] = parse_stored_groups(item["student_groups"])
         for key in ("tags", "details"):
             if key in item and isinstance(item[key], str):
                 try:

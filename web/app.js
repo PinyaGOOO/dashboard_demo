@@ -1657,7 +1657,7 @@ exit 75`;
   async function openBlueprintEditor(id = null, mayUnlock = true) {
     const original = id ? state.data.blueprints.find(item => item.id === Number(id)) : null;
     if (id && !original) { toast("Этот сценарий уже недоступен", "error"); return; }
-    let assignment = {assignment_markdown:"", student_visible:false};
+    let assignment = {assignment_markdown:"", student_visible:false, student_groups:[]};
     if (original) {
       const route = state.route;
       showModal({title:"Редактировать сценарий", subtitle:original.name, body:'<p role="status">Загружаем задание…</p>'});
@@ -1665,7 +1665,9 @@ exit 75`;
       try {
         const result = await api(`/api/blueprints/${original.id}/assignment`, {promptAdmin:false});
         if (activeModalToken !== loading || state.route !== route) return;
-        if (typeof result.assignment_markdown !== "string" || ![true,false,0,1].includes(result.student_visible))
+        if (typeof result.assignment_markdown !== "string" || ![true,false,0,1].includes(result.student_visible)
+            || !(result.student_groups === null || (Array.isArray(result.student_groups)
+              && result.student_groups.every(value => typeof value === "string" && value.trim() === value && value.length > 0))))
           throw new Error("Не удалось загрузить сохранённое задание.");
         assignment = result;
       } catch (error) {
@@ -1700,6 +1702,14 @@ exit 75`;
         <small class="field-hint" role="status" aria-live="polite" data-image-status></small>
         <details class="assignment-preview"><summary>Предпросмотр задания</summary><article class="assignment-md" data-assignment-preview></article></details>
         <label class="assignment-publish"><input type="checkbox" name="student_visible" ${assignment.student_visible ? "checked" : ""}><span>Показывать задание студентам</span></label>
+        <fieldset class="assignment-audience"><legend>Кому доступно задание</legend>
+          <label class="field"><span class="field-label">Доступ по группам</span><select class="input" data-assignment-audience aria-describedby="assignment-audience-hint"><option value="selected">Только выбранные группы</option><option value="all">Все группы, включая будущие</option></select></label>
+          <small id="assignment-audience-hint" class="field-hint">Эти настройки действуют после публикации. Они не выключают уже выданные VM.</small>
+          <details data-group-picker><summary data-group-summary>Выбрать группы</summary>
+            <div class="assignment-group-options" data-group-options></div>
+            <p role="status" data-groups-status></p><button class="button button--small" type="button" data-retry-groups hidden>Повторить загрузку групп</button>
+          </details>
+        </fieldset>
         <small class="field-hint" data-assignment-visibility></small>
       </section>
       <div class="form-section"><h3>Bootstrap-скрипт</h3><p>Скрипт запускается через QEMU Guest Agent внутри каждой созданной VM.</p><div class="editor-shell editor-shell--compact"><div class="editor-toolbar"><div class="editor-file">${icon("terminal")}deploy.sh</div><div class="editor-actions"><button class="editor-template-button" type="button" data-use-vklvikl-bootstrap>Вставить из vklvikl</button><span class="editor-safety">guest only</span></div></div><textarea class="code-editor" name="deploy_script" spellcheck="false">${escapeHtml(blueprint.deploy_script)}</textarea></div><small class="field-hint">Исходный скрипт рассчитан на Linux с интерфейсом vmbr0 и gateway 10.39.1.1; значения можно изменить через GUEST_INTERFACE и VM_GATEWAY.</small></div></form>`;
@@ -1722,7 +1732,64 @@ exit 75`;
       submit:modalRoot.querySelector('[form="blueprint-form"]'),alive:()=>activeModalToken===editing && form.isConnected,
       token:()=>form.querySelector("[data-blueprint-token]")?.value.trim() || localStorage.getItem("demoops.adminToken"),
       unlock:unlockEditor});
-    disposeModalContent = images.dispose;
+    const audience = form.querySelector("[data-assignment-audience]"), picker = form.querySelector("[data-group-picker]");
+    const summary = form.querySelector("[data-group-summary]"), options = form.querySelector("[data-group-options]");
+    const groupStatus = form.querySelector("[data-groups-status]"), retry = form.querySelector("[data-retry-groups]");
+    const selected = new Set(assignment.student_groups || []), request = new AbortController();
+    let knownGroups = null, loadingGroups = false;
+    audience.value = assignment.student_groups === null ? "all" : "selected";
+    disposeModalContent = () => { request.abort(); images.dispose(); };
+    function validateAudience() {
+      const restricted = audience.value === "selected";
+      picker.hidden = !restricted;
+      if (!restricted) picker.open = false;
+      summary.textContent = selected.size ? `Выбранные группы (${selected.size}): ${[...selected].join(", ")}` : "Выбрать группы";
+      audience.setCustomValidity(visible.checked && restricted && !selected.size
+        ? "Отметьте хотя бы одну группу или выберите «Все группы»." : "");
+    }
+    function paintGroups() {
+      const fragment = document.createDocumentFragment();
+      const active = new Set(knownGroups || []);
+      for (const group of new Set([...(knownGroups || []), ...selected])) {
+        const label = document.createElement("label"), box = document.createElement("input");
+        box.type = "checkbox"; box.value = group; box.checked = selected.has(group);
+        box.addEventListener("change", () => { if (box.checked) selected.add(group); else selected.delete(group); validateAudience(); });
+        label.append(box, document.createTextNode(group));
+        if (knownGroups && !active.has(group)) {
+          const note = document.createElement("small"); note.textContent = "Пока нет учёток"; label.append(note);
+        }
+        fragment.append(label);
+      }
+      options.replaceChildren(fragment);
+    }
+    async function loadGroups() {
+      if (knownGroups || loadingGroups || request.signal.aborted) return;
+      loadingGroups = true; retry.hidden = true; groupStatus.textContent = "Загружаем группы…";
+      try {
+        const token = form.querySelector("[data-blueprint-token]")?.value.trim();
+        const result = await api("/api/student-accounts?limit=1", {promptAdmin:false, signal:request.signal, headers:token ? {"X-Admin-Token":token} : {}});
+        if (request.signal.aborted) return;
+        if (!Array.isArray(result.groups) || !result.groups.every(g => typeof g === "string" && g.trim() === g && g.length)) throw new Error();
+        knownGroups = result.groups; paintGroups();
+        groupStatus.textContent = knownGroups.length ? "" : "Пока нет групп с выданными учётками. Создайте их в разделе «Учётки студентов».";
+      } catch (error) {
+        if (request.signal.aborted) return;
+        groupStatus.textContent = error.status === 401 ? "Для списка групп нужен действующий токен. Введите его и повторите загрузку." :
+          "Не удалось загрузить группы. Выбранные ограничения сохранены.";
+        retry.hidden = false;
+        if (error.status === 401) unlockEditor();
+      } finally { loadingGroups = false; }
+    }
+    audience.addEventListener("change", () => {
+      validateAudience();
+      if (audience.value === "selected") { picker.open = true; loadGroups(); }
+    });
+    visible.addEventListener("change", () => {
+      if (visible.checked && audience.value === "selected" && !selected.size) { picker.open = true; loadGroups(); }
+    });
+    picker.addEventListener("toggle", () => { if (picker.open && !picker.hidden) loadGroups(); });
+    retry.addEventListener("click", loadGroups);
+    paintGroups();
     function updateAssignment() {
       const text = markdown.value.trim();
       const active = form.elements.status.value === "active";
@@ -1731,16 +1798,19 @@ exit 75`;
       // Changing a scenario to a draft/archive also withdraws its publication.
       visible.disabled = !active || !hasTemplate;
       if (visible.disabled) visible.checked = false;
+      validateAudience();
       markdown.required = visible.checked;
       markdown.setCustomValidity(visible.checked && !text ? "Для публикации введите условие задания." : "");
       form.querySelector("[data-assignment-visibility]").textContent = !active || !hasTemplate
         ? "Чтобы показать задание, выберите статус «Опубликован» и шаблон Proxmox. До этого его можно сохранить как черновик."
-        : visible.checked ? "После сохранения задание появится в учебном кабинете."
+        : visible.checked ? (audience.value === "all" ? "После сохранения задание будет доступно всем группам."
+          : "После сохранения задание будет доступно только выбранным группам.")
           : "После сохранения условие будет скрыто. Выданные стенды не выключатся.";
       if (!preview.open) return;
       images.paint();
     }
     [markdown, visible, form.elements.status, form.elements.template_vmid].forEach(field => field.addEventListener("input", updateAssignment));
+    audience.addEventListener("change", updateAssignment);
     preview.addEventListener("toggle",updateAssignment);
     updateAssignment();
     modalRoot.querySelector("[data-use-vklvikl-bootstrap]").addEventListener("click", () => {
@@ -1762,6 +1832,12 @@ exit 75`;
       const values = Object.fromEntries(new FormData(form).entries());
       values.template_vmid = Number(values.template_vmid) || 0;
       values.student_visible = visible.checked;
+      const groups = audience.value === "all" ? null : [...selected];
+      // A text-only PATCH must not overwrite concurrent changes to group access.
+      if (!original || (groups === null) !== (assignment.student_groups === null)
+          || (groups && (groups.length !== assignment.student_groups.length || !assignment.student_groups.every(g => selected.has(g))))) {
+        values.student_groups = groups;
+      }
       values.tags = values.tags.split(",").map(item => item.trim()).filter(Boolean);
       try {
         const tokenField = form.querySelector("[data-blueprint-token]");

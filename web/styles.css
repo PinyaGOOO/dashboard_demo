@@ -646,6 +646,17 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .assignment-publish { display: flex; align-items: center; gap: .55rem; font-size: .95rem; font-weight: 650; cursor: pointer; }
 .assignment-publish input { width: 1.1rem; height: 1.1rem; accent-color: var(--accent); }
 .assignment-publish:has(:disabled) { color: var(--ink-muted); cursor: default; }
+.assignment-audience { display: grid; gap: .6rem; min-width: 0; margin: 0; padding: .8rem 1rem; border: 1px solid var(--line); border-radius: 8px; }
+.assignment-audience legend { padding-inline: .3rem; font-weight: 650; }
+.assignment-audience select { max-width: 28rem; }
+.assignment-audience summary { width: fit-content; padding-block: .25rem; font-weight: 600; cursor: pointer; overflow-wrap: anywhere; }
+.assignment-audience [hidden] { display: none; }
+.assignment-audience [role=status] { margin: .45rem 0; }
+.assignment-audience [role=status]:empty { display: none; }
+.assignment-group-options { display: grid; grid-template-columns: repeat(auto-fit,minmax(min(100%,14rem),1fr)); gap: .35rem .7rem; max-height: 16rem; overflow: auto; }
+.assignment-group-options label { display: flex; align-items: center; gap: .55rem; min-width: 0; padding: .4rem .15rem; cursor: pointer; overflow-wrap: anywhere; }
+.assignment-group-options input { flex: none; width: 1.1rem; height: 1.1rem; accent-color: var(--accent); }
+.assignment-group-options small { color: var(--ink-muted); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }

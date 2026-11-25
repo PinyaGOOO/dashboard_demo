@@ -19,7 +19,7 @@ from dashboard_backend.proxmox_gateway import create_gateway
 from dashboard_backend.service import ConflictError, DashboardService, NotFoundError, ValidationError
 from dashboard_backend.student_mount import StudentMount
 from dashboard_backend.student_http import read_student_json
-from dashboard_backend.student_catalog import published_assignments
+from dashboard_backend.student_catalog import assignment_group_access, published_assignments
 from dashboard_backend.student_credentials import PilotCredentials
 from dashboard_backend.student_labs import StudentLabs
 from dashboard_backend.student_portal import StudentError
@@ -239,7 +239,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self._json(self._blueprint_summary(self.service.get_blueprint(int(parts[2]))))
             elif len(parts) == 4 and parts[:2] == ["api", "blueprints"] and parts[3] == "assignment" and method == "GET":
                 bp = self.service.get_blueprint(int(parts[2]))
-                self._json({"assignment_markdown": bp["assignment_markdown"], "student_visible": bool(bp["student_visible"])})
+                self._json({"assignment_markdown": bp["assignment_markdown"], "student_visible": bool(bp["student_visible"]),
+                            "student_groups": bp["student_groups"]})
             elif len(parts) == 3 and parts[:2] == ["api", "blueprints"] and method == "PATCH":
                 self._json(self.service.save_blueprint(self._body(), int(parts[2])))
             elif len(parts) == 3 and parts[:2] == ["api", "blueprints"] and method == "DELETE":
@@ -317,7 +318,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
     def _blueprint_summary(bp):
         # Draft text belongs only in the protected teacher editor. Public admin
         # bootstrap is also fetched by browsers that have not supplied a token.
-        return {k: v for k, v in bp.items() if k not in ("assignment_markdown", "assignment_template_name")}
+        return {k: v for k, v in bp.items() if k not in ("assignment_markdown", "assignment_template_name", "student_groups")}
 
 
 def secrets_compare(left: str, right: str) -> bool:
@@ -326,9 +327,9 @@ def secrets_compare(left: str, right: str) -> bool:
 
 
 def student_image_reader(service):
-    def read(assignment_id, image_id):
+    def read(assignment_id, image_id, student_group=None):
         try:
-            return service.published_assignment_image(assignment_id, image_id)
+            return service.published_assignment_image(assignment_id, image_id, student_group=student_group)
         except NotFoundError:
             raise StudentError(404, "Изображение недоступно") from None
     return read
@@ -370,6 +371,7 @@ def main() -> None:
     DashboardHandler.student_mount = StudentMount(
         student_db, admin_db.with_name("student-demo-catalog.json"),
         published_catalog=lambda: published_assignments(admin_db),
+        assignment_access=lambda ident, group: assignment_group_access(admin_db, ident, group),
         image_reader=student_image_reader(service),
         secure_cookie=gateway.mode == "live", example_if_missing=gateway.mode == "demo",
         pilot_validator=make_pilot_validator(admin_db) if gateway.mode == "live" else None,

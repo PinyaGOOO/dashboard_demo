@@ -3,10 +3,16 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import tempfile
 from contextlib import closing
 from pathlib import Path
+
+from .assignment_audience import allows_student_group, parse_stored_groups
+
+
+_LAB = re.compile(r"lab-([1-9][0-9]{0,9})-([1-9][0-9]{0,8})")
 
 
 def _published_rows(db_path: Path):
@@ -16,11 +22,24 @@ def _published_rows(db_path: Path):
         columns = {r[1] for r in db.execute("PRAGMA table_info(blueprints)")}
         if not {"assignment_markdown", "student_visible", "assignment_template_name"} <= columns:
             return []
-        rows = db.execute("""SELECT id,name,template_vmid,assignment_template_name,assignment_markdown
+        # An old database without an audience column had explicitly public assignments only.
+        policy = "student_groups" if "student_groups" in columns else "NULL"
+        rows = db.execute(f"""SELECT id,name,template_vmid,assignment_template_name,assignment_markdown,{policy}
             FROM blueprints WHERE status='active' AND student_visible=1 AND template_vmid>0
             AND assignment_template_name!='' ORDER BY id""")
-        return [{"blueprint_id":bp,"scenario":name,"vmid":vmid,"template":template,"assignment_markdown":md}
-                for bp,name,vmid,template,md in rows if md.strip()]
+        return [dict({"blueprint_id":bp,"scenario":name,"vmid":vmid,"template":template,"assignment_markdown":md},
+                     **({"student_groups":parse_stored_groups(raw)} if raw is not None else {}))
+                for bp,name,vmid,template,md,raw in rows if md.strip()]
+
+
+def assignment_group_access(db_path: Path, assignment_id, group) -> bool:
+    """Check the current audience even if an owner's old assignment was unpublished."""
+    lab = _LAB.fullmatch(assignment_id) if isinstance(assignment_id, str) else None
+    if not lab:
+        return False
+    with closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        row = db.execute("SELECT student_groups FROM blueprints WHERE id=?", (int(lab[1]),)).fetchone()
+        return row is not None and allows_student_group(parse_stored_groups(row[0]), group)
 
 
 def published_assignments(db_path: Path) -> list[dict]:
@@ -31,7 +50,8 @@ def published_assignments(db_path: Path) -> list[dict]:
 def public_templates(db_path: Path, templates: list[dict]) -> list[dict]:
     """Export explicitly published material only if its pinned template still matches."""
     verified = {(t["vmid"], t["name"]) for t in templates if t.get("vmid") and t.get("name")}
-    return [r for r in _published_rows(db_path) if (r["vmid"], r["template"]) in verified]
+    return [r for r in _published_rows(db_path) if r.get("student_groups") is None
+            and (r["vmid"], r["template"]) in verified]
 
 
 def _exercise(name: str) -> tuple:
@@ -99,6 +119,7 @@ def make_assignments(rows: list[dict]) -> list[dict]:
                 "id": f"lab-{int(row['blueprint_id'])}-{int(row['vmid'])}",
                 "title": scenario, "description": "", "steps": [], "assignment_markdown":row["assignment_markdown"],
                 "template_name": template, "template_vmid": int(row["vmid"]),
+                **({"student_groups": row["student_groups"]} if "student_groups" in row else {}),
             }))
             continue
         rank, title, description, steps = _exercise((template + " " + scenario).casefold())
@@ -126,7 +147,9 @@ def load_catalog(path: Path, *, example_if_missing: bool = True) -> list[dict]:
         rows = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return demo_assignments() if example_if_missing else []
-    return make_assignments(rows)
+    # A standalone snapshot has no trustworthy classroom identity. Never strip
+    # an audience and treat a restricted row as publicly exported material.
+    return make_assignments([row for row in rows if row.get("student_groups") is None])
 
 
 def refresh_catalog(source_db: Path, catalog_path: Path) -> int:
