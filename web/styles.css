@@ -110,6 +110,26 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .student-batch-form, .student-batch-result { display: grid; gap: 16px; }
 .student-batch-form .form-grid { align-items: start; }
 .student-batch-result textarea { width: 100%; min-height: 12rem; line-height: 1.5; white-space: pre; resize: vertical; }
+.student-admin, .student-admin-section { display: grid; gap: 16px; }
+.student-admin h3, .student-admin p, .student-admin dl, .student-admin dd { margin: 0; }
+.student-admin-section p { line-height: 1.55; color: var(--ink-soft); }
+.student-admin-tools, .student-admin-page, .student-admin-tools form { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; }
+.student-admin-tools form { flex: 1 1 280px; }
+.student-admin-tools .field { flex: 1 1 170px; }
+.student-admin-rows { margin: 0; padding: 0; list-style: none; }
+.student-admin-rows li { padding: 11px 0; display: grid; grid-template-columns: minmax(0,1fr) auto auto; align-items: center; gap: 12px; border-bottom: 1px solid var(--line); }
+.student-admin-rows small, .student-admin-rows strong { display: block; overflow-wrap: anywhere; }
+.student-admin-rows small, .student-account-info dt { color: var(--ink-muted); }
+.student-account-status { color: var(--ink-soft); font-size: .85rem; }
+.student-account-status.is-blocked { font-weight: 700; }
+.student-admin-page { align-items: center; justify-content: end; margin-top: 16px; }
+.student-admin-page span { margin-right: auto; color: var(--ink-muted); }
+.student-account-info { display: grid; grid-template-columns: auto 1fr; gap: 8px 18px; }
+@media (max-width: 530px) {
+  .student-admin-rows li { grid-template-columns: 1fr auto; gap: 4px 8px; }
+  .student-admin-rows li .button { grid-column: 2; grid-row: 1 / span 2; }
+  .student-admin-rows li .student-account-status { grid-column: 1; }
+}
 .nav-link:hover { color: #f1f3f5; background: rgba(255,255,255,.045); }
 .nav-link:active { transform: translateY(1px); }
 .nav-link.is-active { color: #fff; background: linear-gradient(90deg, rgba(205,163,255,.19), rgba(205,163,255,.08)); box-shadow: inset 0 0 0 1px rgba(205,163,255,.1); }

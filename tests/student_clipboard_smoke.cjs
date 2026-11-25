@@ -20,6 +20,7 @@ function teacherFixture() {
   window.addEventListener("load",()=>setTimeout(async () => {
     const $ = s => document.querySelector(s);
     $("[data-student-batch]").click();
+    $("[data-create-student-batch]").click();
     const form = $("#student-batch");
     if (form.elements.count.value !== "20" || form.elements.prefix.value !== "student") return;
     form.elements.group.value = group; form.elements.prefix.value = "class-gr"; form.elements.token.value = token;
@@ -30,6 +31,69 @@ function teacherFixture() {
     if (!correct || submissions !== 1 || copied !== roster.value || JSON.stringify(localStorage).includes("fake-") || JSON.stringify(sessionStorage).includes("fake-")) return;
     $(".modal__close").click();
     if (roster.value === "") document.body.dataset.qa = "pass";
+  },50));
+}
+function accountAdminFixture() {
+  const mode = location.search.slice(1), token = "token-test", secret = "temporary-" + crypto.randomUUID();
+  const acct = {login:"class09",group:"ДЭ-24 <тест>",version:1,created:1700000000,last_login:null,blocked:false};
+  const writes = [], reads = []; let copied, bad = false;
+  const delay = (ms=20) => new Promise(done => setTimeout(done,ms));
+  Object.defineProperty(navigator,"clipboard",{value:{async writeText(text){copied=text;}}});
+  window.fetch = async (url,opts) => {
+    if (!url.startsWith("/api/student-accounts")) return new Response("{}",{status:503});
+    bad ||= opts.headers["X-Admin-Token"] !== token;
+    if (url.startsWith("/api/student-accounts?")) {
+      const q = new URL(url,location).searchParams;
+      bad ||= q.get("limit") !== "50"; reads.push([q.get("search"),Number(q.get("offset"))]);
+      const many = !q.get("search");
+      const accounts = many && q.get("offset") === "0" ? Array.from({length:50},(_,i)=>({...acct,login:"class" + i})) : [acct];
+      return new Response(JSON.stringify({accounts,total:many ? 51 : 1,offset:Number(q.get("offset")),limit:50}));
+    }
+    const action = url.split("/").pop();
+    bad ||= opts.method !== "POST" || url !== "/api/student-accounts/class09/" + action || JSON.parse(opts.body).version !== acct.version;
+    writes.push(action); await delay(30);
+    if (mode === "roster-stale") return new Response("{}",{status:409});
+    if (mode === "roster-denied") return new Response("{}",{status:401});
+    acct.version++; if (action === "block") acct.blocked = true; if (action === "unblock") acct.blocked = false;
+    return new Response(JSON.stringify({account:acct,...(action === "reset-password" ? {password:secret} : {})}));
+  };
+  window.addEventListener("load",()=>setTimeout(async () => {
+    const $ = s => document.querySelector(s), click = sel => $(sel).click();
+    click("[data-student-batch]"); if (reads.length || writes.length) return;
+    const auth = $("[data-roster-unlock]"); auth.elements.token.value = token; auth.requestSubmit(); await delay();
+    if (document.querySelectorAll("[data-manage-student]").length !== 50) return;
+    click("[data-roster-next]"); await delay(); if (reads.at(-1)[1] !== 50) return;
+    click("[data-roster-prev]"); await delay(); if (reads.at(-1)[1] !== 0) return;
+    const filter = $("[data-roster-search]"); filter.elements.search.value="ДЭ-24"; filter.requestSubmit(); await delay();
+    if (reads.at(-1)[0] !== "ДЭ-24" || !$("[data-roster-next]").disabled) return;
+    for (const action of ["reset-password","block","unblock","revoke-sessions"]) {
+      click("[data-manage-student]"); click('[data-account-action="' + action + '"]');
+      if (!$("[data-student-admin] h3").textContent.includes(acct.login)) return;
+      if (action === "reset-password") {
+        click("[data-account-cancel]"); if (writes.length) return;
+        click('[data-account-action="reset-password"]');
+      }
+      click("[data-account-confirm]"); click("[data-account-confirm]");
+      if (mode === "roster-late") {
+        window.dispatchEvent(new Event("pagehide")); await delay(60);
+        if (!bad && writes.length === 1 && !$("[data-reset-secret]") && !$("[data-student-admin]").textContent) document.body.dataset.qa = "pass";
+        return;
+      }
+      await delay(60);
+      if (mode === "roster-stale" || mode === "roster-denied") {
+        if (!bad && writes.length === 1 && !$("[data-reset-secret]") && (mode === "roster-denied" ? !!$("[data-roster-unlock]") : $("[data-student-admin] [role=alert]")?.textContent.includes("изменились"))) document.body.dataset.qa = "pass";
+        return;
+      }
+      if (action === "reset-password") {
+        const field = $("[data-reset-secret]"); if (field?.value !== secret) return;
+        click("[data-copy-reset]"); await delay();
+        if (copied !== secret || localStorage.length || sessionStorage.length) return;
+        click("[data-roster-back]"); await delay(); if (field.value || $("[data-reset-secret]")) return;
+      }
+      if (action === "block" && !$(".student-account-status").textContent.includes("Заблокирована")) return;
+    }
+    window.dispatchEvent(new StorageEvent("storage",{key:"demoops.adminToken"}));
+    if (!bad && writes.join(",") === "reset-password,block,unblock,revoke-sessions" && !$("[data-student-admin]").textContent) document.body.dataset.qa = "pass";
   },50));
 }
 function managedFixture() {
@@ -141,6 +205,7 @@ function fixture() {
   const html = (dir, script) => fs.readFileSync(path.join(dir,"index.html"),"utf8").replace("<head>","<head><script>(" + script.toString() + ")()</script>");
   const server = http.createServer((req,res) => {
     if (req.url === "/?teacher") { res.setHeader("Content-Type","text/html; charset=utf-8"); res.end(html(path.dirname(web),teacherFixture)); return; }
+    if (req.url.startsWith("/?roster")) { res.setHeader("Content-Type","text/html; charset=utf-8"); res.end(html(path.dirname(web),accountAdminFixture)); return; }
     if (req.url.startsWith("/student-demo/?")) { res.setHeader("Content-Type","text/html; charset=utf-8"); res.end(html(web,req.url.includes("?assignment") ? assignmentFixture : req.url.includes("?managed") ? managedFixture : fixture)); return; }
     const asset = req.url.split("?")[0];
     if (asset === "/student-demo/api/assignments/lab-2-276/images/" + "13579bdf".repeat(4)) {
@@ -159,8 +224,8 @@ function fixture() {
   await new Promise(resolve => server.listen(0,"127.0.0.1",resolve));
   const profile = fs.mkdtempSync(path.join(os.tmpdir(),"deployer-smoke-"));
   try {
-    for (const mode of ["item","text","denied","forbidden","login","teacher","managed","assignment"]) {
-      const url = "http://127.0.0.1:" + server.address().port + (mode === "teacher" ? "/?teacher" : "/student-demo/?" + mode + (["managed","assignment"].includes(mode) ? "" : "#stands/fixture"));
+    for (const mode of ["item","text","denied","forbidden","login","teacher","roster","roster-stale","roster-denied","roster-late","managed","assignment"]) {
+      const url = "http://127.0.0.1:" + server.address().port + (mode === "teacher" || mode.startsWith("roster") ? "/?" + mode : "/student-demo/?" + mode + (["managed","assignment"].includes(mode) ? "" : "#stands/fixture"));
       const {stdout} = await run(chrome,["--headless","--disable-gpu","--no-first-run","--disable-background-networking","--user-data-dir=" + profile,"--virtual-time-budget=3000","--dump-dom",url],{timeout:45000,maxBuffer:1_500_000});
       if (!stdout.includes('data-qa="pass"')) throw Error("Failed case: " + mode);
       console.log("PASS", mode);

@@ -18,6 +18,7 @@ from dashboard_backend.database import DashboardStore
 from dashboard_backend.proxmox_gateway import create_gateway
 from dashboard_backend.service import ConflictError, DashboardService, NotFoundError, ValidationError
 from dashboard_backend.student_mount import StudentMount
+from dashboard_backend.student_http import read_student_json
 from dashboard_backend.student_catalog import published_assignments
 from dashboard_backend.student_credentials import PilotCredentials
 from dashboard_backend.student_labs import StudentLabs
@@ -158,6 +159,34 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         else:
             self._json({"error": "Изображение не найдено."}, HTTPStatus.NOT_FOUND)
 
+    def _operator_student_accounts(self, method, parts, query_string):
+        # Issued student identities must never inherit the tokenless demo mode.
+        tokens = self.headers.get_all("X-Admin-Token") or []
+        if not self.admin_token or not self.admin_token.strip() or len(tokens) != 1 or not secrets_compare(tokens[0], self.admin_token):
+            self._json({"error": "Требуется административный токен.", "code": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
+            return
+        if self.student_mount is None:
+            raise StudentError(503, "Учебный кабинет недоступен.")
+        self.student_mount.check_operator_origin(self.headers)
+        if method == "GET" and not parts:
+            try:
+                query = parse_qs(query_string, keep_blank_values=True, strict_parsing=True, max_num_fields=3)
+                if set(query) - {"search", "offset", "limit"} or any(len(v) != 1 for v in query.values()):
+                    raise ValueError
+                offset, limit = query.get("offset", ["0"])[0], query.get("limit", ["50"])[0]
+                if not all(re.fullmatch(r"[0-9]{1,10}", n) for n in (offset, limit)):
+                    raise ValueError
+            except ValueError:
+                raise StudentError(400, "Проверьте параметры поиска.") from None
+            self._json(self.student_mount.list_accounts(query.get("search", [""])[0], int(offset), int(limit)))
+        elif method == "POST" and not query_string and parts == ["batch"]:
+            self._json(self.student_mount.create_accounts(read_student_json(self)), HTTPStatus.CREATED)
+        elif (method == "POST" and not query_string and len(parts) == 2 and re.fullmatch(r"[a-z][a-z0-9-]{1,31}", parts[0])
+              and parts[1] in {"reset-password", "block", "unblock", "revoke-sessions"}):
+            self._json(self.student_mount.manage_account(*parts, read_student_json(self)))
+        else:
+            raise StudentError(404, "Операция с учётной записью не найдена.")
+
     def _handle_api(self, method: str) -> None:
         parsed = urlparse(self.path)
         parts = [part for part in parsed.path.strip("/").split("/") if part]
@@ -177,22 +206,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         try:
             if parts[:2] == ["api", "assignment-images"]:
                 self._operator_image(method, parts)
-            elif parts == ["api", "student-accounts", "batch"] and method == "POST":
-                # Unlike legacy demo actions this endpoint must never allow a
-                # missing operator credential, even when running on localhost.
-                tokens = self.headers.get_all("X-Admin-Token") or []
-                if not self.admin_token or not self.admin_token.strip() or len(tokens) != 1 or not secrets_compare(tokens[0], self.admin_token):
-                    self._json({"error": "Требуется административный токен."}, HTTPStatus.UNAUTHORIZED)
-                    return
-                if self.headers.get("Sec-Fetch-Site") not in (None, "same-origin"):
-                    self._json({"error": "Откройте форму в панели преподавателя."}, HTTPStatus.FORBIDDEN)
-                    return
-                if self.headers.get_content_type() != "application/json":
-                    self._json({"error": "Требуется JSON."}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
-                    return
-                if not self.student_mount:
-                    raise StudentError(503, "Учебный кабинет недоступен.")
-                self._json(self.student_mount.create_accounts(self._body()), HTTPStatus.CREATED)
+            elif parts[:2] == ["api", "student-accounts"]:
+                self._operator_student_accounts(method, parts[2:], parsed.query)
             elif parts == ["api", "health"] and method == "GET":
                 self._json({"status": "ok", "integration": self.service.integration()})
             elif parts == ["api", "bootstrap"] and method == "GET":

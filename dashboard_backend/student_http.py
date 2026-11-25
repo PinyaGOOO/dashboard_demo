@@ -77,7 +77,7 @@ def _cookie(token, secure):
     return f"{COOKIE}={token}" + flags + ("; Secure" if secure else "") + ("" if token else "; Max-Age=0")
 
 
-def _check_origin(headers, secure):
+def check_same_origin(headers, secure):
     origins = _header_values(headers, "Origin")
     fetch_sites = _header_values(headers, "Sec-Fetch-Site")
     if len(origins) > 1 or (fetch_sites and fetch_sites != ["same-origin"]):
@@ -99,7 +99,7 @@ def _check_origin(headers, secure):
         raise StudentError(403, "Запрос должен быть отправлен из этого кабинета.") from None
 
 
-def _body(h):
+def read_student_json(h):
     types = _header_values(h.headers, "Content-Type")
     if len(types) != 1 or types[0].partition(";")[0].strip().lower() != "application/json":
         raise StudentError(415, "Требуется запрос в формате JSON.")
@@ -161,8 +161,8 @@ def dispatch_student(handler, method, portal, *, secure_cookie=False) -> bool:
             headers.append(("Allow", allowed))
             raise StudentError(405, "Этот метод не поддерживается.")
         if method == "POST":
-            _check_origin(handler.headers, secure_cookie)
-            data = _body(handler)
+            check_same_origin(handler.headers, secure_cookie)
+            data = read_student_json(handler)
             if guest and guest[2] == "duration":
                 if set(data) != {"access_code", "duration_minutes"} or not isinstance(data["access_code"], str) or not 1 <= len(data["access_code"]) <= 128:
                     raise StudentError(400, "Нужен персональный код доступа этой VM и корректные параметры")

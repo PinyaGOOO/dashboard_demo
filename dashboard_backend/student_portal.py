@@ -163,6 +163,12 @@ class StudentPortal:
         """Only call through the authenticated teacher endpoint; never a student route."""
         return student_accounts.create_batch(self._db, payload, _ACCOUNTS, self._clock)
 
+    def list_accounts(self, search="", offset=0, limit=50):
+        return student_accounts.list_accounts(self._db, _ACCOUNTS, search, offset, limit)
+
+    def manage_account(self, login, action, payload):
+        return student_accounts.manage_account(self._db, _ACCOUNTS, login, action, payload)
+
     def _managed(self, login, db=None):
         if login in _ACCOUNTS:
             return False
@@ -216,6 +222,14 @@ class StudentPortal:
         digest = self._token_hash(token)
         now = self._clock()
         with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if entry is None:
+                # Recheck after hashing, under the same writer lock used for
+                # administrative changes. A revoked login must not mint a session.
+                current = student_accounts.stamp(student_accounts.lookup(db, login))
+                if not current or not hmac.compare_digest(stamp, current):
+                    raise StudentError(401, "Неверный логин или пароль")
+                db.execute("UPDATE student_accounts SET last_login=? WHERE login=?", (now, login))
             db.execute("DELETE FROM student_sessions WHERE expires<=?", (now,))
             db.execute("INSERT INTO student_sessions VALUES (?,?,?)",
                        (digest, login, now + self.SESSION_TTL))

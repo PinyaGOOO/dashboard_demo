@@ -5,7 +5,7 @@ from sqlite3 import Error as SQLiteError
 from threading import Lock
 
 from .student_catalog import demo_assignments, load_catalog
-from .student_http import dispatch_student
+from .student_http import check_same_origin, dispatch_student
 from .student_portal import StudentError, StudentPortal
 
 
@@ -86,6 +86,15 @@ class StudentMount:
     def create_accounts(self, payload):
         """Called by the separate authenticated operator endpoint; not a student action."""
         return self._portal._initialized().create_accounts(payload)
+
+    def check_operator_origin(self, headers):
+        check_same_origin(headers, self._secure_cookie)
+
+    def list_accounts(self, search, offset, limit):
+        return self._portal._initialized().list_accounts(search=search, offset=offset, limit=limit)
+
+    def manage_account(self, login, action, payload):
+        return self._portal._initialized().manage_account(login, action, payload)
 
     def handle(self, handler, method) -> bool:
         path = handler.path.partition("?")[0]

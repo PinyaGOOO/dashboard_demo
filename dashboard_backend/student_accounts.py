@@ -16,6 +16,8 @@ _BATCHES = threading.BoundedSemaphore(2)
 _AUTH = threading.BoundedSemaphore(4)
 _PREFIX = re.compile(r"[a-z][a-z0-9-]{0,15}\Z")
 _FORMAT = "scrypt-v1"
+_BLOCKED_FORMAT = "blocked:scrypt-v1"  # Older portal versions reject unknown formats too.
+_PUBLIC_COLUMNS = "login, group_name, format, version, created, last_login"
 MAX_BATCH = 100
 
 
@@ -23,6 +25,11 @@ def init_schema(db):
     db.execute("""CREATE TABLE IF NOT EXISTS student_accounts (
         login TEXT PRIMARY KEY, group_name TEXT NOT NULL, salt BLOB NOT NULL,
         verifier BLOB NOT NULL, format TEXT NOT NULL, created REAL NOT NULL)""")
+    columns = {row[1] for row in db.execute("PRAGMA table_info(student_accounts)")}
+    if "version" not in columns:
+        db.execute("ALTER TABLE student_accounts ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
+    if "last_login" not in columns:
+        db.execute("ALTER TABLE student_accounts ADD COLUMN last_login REAL")
     db.execute("""CREATE TABLE IF NOT EXISTS student_account_sequences (
         prefix TEXT PRIMARY KEY, last_number INTEGER NOT NULL CHECK(last_number>0))""")
 
@@ -39,14 +46,17 @@ def _stamp(salt, verifier):
 
 
 def lookup(db, login):
-    return db.execute("SELECT group_name,salt,verifier,format FROM student_accounts WHERE login=?",
+    return db.execute("SELECT group_name,salt,verifier,format,version FROM student_accounts WHERE login=?",
                       (login,)).fetchone()
 
 
 def stamp(row):
     if row is None or row["format"] != _FORMAT:
         return None
-    return _stamp(row["salt"], row["verifier"])
+    base = _stamp(row["salt"], row["verifier"])
+    # Preserve existing sessions on first upgrade. Every later management
+    # action changes the epoch, even if password and enabled state end up unchanged.
+    return base if row["version"] == 1 else f"{base}:{row['version']}"
 
 
 def authenticate(row, password):
@@ -71,6 +81,80 @@ def _prepared(count):
             salt = secrets.token_bytes(16)
             values.append((password, salt, _hash(password, salt)))
     return values
+
+
+def _public_account(row):
+    return {"login": row["login"], "group": row["group_name"], "blocked": row["format"] != _FORMAT,
+            "version": row["version"], "created": row["created"], "last_login": row["last_login"]}
+
+
+def list_accounts(open_db, reserved, search="", offset=0, limit=50):
+    if (not isinstance(search, str) or len(search) > 128 or (search and not search.isprintable())
+            or type(offset) is not int or not 0 <= offset <= 2**31 - 1
+            or type(limit) is not int or not 1 <= limit <= 100):
+        raise StudentError(400, "Проверьте строку поиска и параметры страницы списка.")
+    excluded = ",".join("?" for _ in reserved)
+    where = f"WHERE login NOT IN ({excluded})"
+    params = list(reserved)
+    term = search.strip().casefold()
+    with open_db() as db:
+        if term:
+            db.create_function("casefold", 1, str.casefold)
+            where += " AND (instr(casefold(login), ?) > 0 OR instr(casefold(group_name), ?) > 0)"
+            params.extend((term, term))
+        db.execute("BEGIN")
+        total = db.execute("SELECT count(*) FROM student_accounts " + where, params).fetchone()[0]
+        rows = db.execute(f"SELECT {_PUBLIC_COLUMNS} FROM student_accounts {where} ORDER BY login LIMIT ? OFFSET ?",
+                          (*params, limit, offset))
+        return {"accounts": [_public_account(row) for row in rows], "total": total, "offset": offset, "limit": limit}
+
+
+def manage_account(open_db, reserved, login, action, payload):
+    if not isinstance(login, str) or login in reserved:
+        raise StudentError(404, "Выданная студенту учётная запись не найдена.")
+    if action not in ("reset-password", "block", "unblock", "revoke-sessions"):
+        raise StudentError(400, "Неизвестное действие с учётной записью.")
+    if not isinstance(payload, dict) or set(payload) != {"version"} or type(payload["version"]) is not int or payload["version"] < 1:
+        raise StudentError(400, "Для изменения нужна версия учётной записи из списка.")
+
+    def current(db):
+        row = db.execute(f"SELECT {_PUBLIC_COLUMNS} FROM student_accounts WHERE login=?", (login,)).fetchone()
+        if row is None:
+            raise StudentError(404, "Выданная студенту учётная запись не найдена.")
+        if row["version"] != payload["version"]:
+            raise StudentError(409, "Учётную запись уже изменили. Обновите список и проверьте её состояние.")
+        if row["format"] not in (_FORMAT, _BLOCKED_FORMAT):
+            raise StudentError(409, "Формат учётной записи не поддерживается.")
+        return row
+
+    password = None
+    if action == "reset-password":
+        with open_db() as db:
+            current(db)
+        if not _BATCHES.acquire(blocking=False):
+            raise StudentError(429, "Кабинет занят выдачей паролей. Повторите запрос позже.")
+        try:
+            (password, salt, verifier), = _prepared(1)
+        finally:
+            _BATCHES.release()
+
+    with open_db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = current(db)
+        if action in ("block", "unblock"):
+            new_format = _BLOCKED_FORMAT if action == "block" else _FORMAT
+            if row["format"] == new_format:
+                raise StudentError(409, "Учётка уже заблокирована." if action == "block" else "Учётка уже активна.")
+            db.execute("UPDATE student_accounts SET format=? WHERE login=?", (new_format, login))
+        elif action == "reset-password":
+            db.execute("UPDATE student_accounts SET salt=?, verifier=? WHERE login=?", (salt, verifier, login))
+        db.execute("UPDATE student_accounts SET version=version+1 WHERE login=?", (login,))
+        db.execute("DELETE FROM student_sessions WHERE login=?", (login,))
+        updated = db.execute(f"SELECT {_PUBLIC_COLUMNS} FROM student_accounts WHERE login=?", (login,)).fetchone()
+        result = {"account": _public_account(updated)}
+    if password is not None:
+        result["password"] = password
+    return result
 
 
 def create_batch(open_db, payload, reserved, clock):
