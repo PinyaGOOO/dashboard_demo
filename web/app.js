@@ -1477,7 +1477,7 @@ exit 75`;
   }
 
   function openImportPoolModal() {
-    const pools = workspacePools().filter(pool => !pool.imported);
+    const pools = workspacePools().filter(pool => !pool.imported && !pool.student_pool_namespace);
     if (!pools.length) { toast("Нет свободных Proxmox pools для добавления", "warning"); return; }
     const poolOptions = pools.map(pool => `<option value="${escapeHtml(pool.pool_id)}">${escapeHtml(pool.pool_id)}${pool.vm_count == null ? "" : ` · ${pool.vm_count} VM`}${pool.comment ? ` · ${escapeHtml(pool.comment)}` : ""}</option>`).join("");
     const body = `<form id="pool-import-form"><div class="alert alert--info">${icon("info")} Pool и его VM не создаются заново. Дашборд подключит их к мониторингу в текущей рабочей области.</div><div class="form-grid"><label class="field field--full"><span class="field-label">Существующий Proxmox pool</span><select class="input mono" name="pool_id" id="import-pool-select" required>${poolOptions}</select></label></div><div class="alert alert--warning">${icon("shield")} При удалении подключённого pool из дашборда исходный pool и его VM останутся в Proxmox.</div></form>`;
@@ -1510,7 +1510,8 @@ exit 75`;
   function openDeployWizard(preselectedId = null) {
     if (!state.data) { toast("Данные ещё загружаются. Повторите через несколько секунд", "warning"); return; }
     const available = state.data.blueprints.filter(item => item.status === "active");
-    const existingPools = workspacePools().filter(pool => pool.available_for_deploy == null ? !pool.imported : pool.available_for_deploy);
+    const existingPools = workspacePools().filter(pool => !pool.student_pool_namespace &&
+      (pool.available_for_deploy == null ? !pool.imported : pool.available_for_deploy));
     if (!available.length) { toast("Нет опубликованных сценариев для развёртывания", "warning"); return; }
     const defaultPoolId = `exam-${new Date().toISOString().slice(5, 10).replace("-", "")}-${String(Date.now()).slice(-3)}`;
     const model = {

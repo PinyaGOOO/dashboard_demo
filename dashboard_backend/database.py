@@ -211,6 +211,10 @@ class DashboardStore:
             PRIMARY KEY (stand_id, vmid)
         );
         CREATE INDEX IF NOT EXISTS idx_timer_due ON stand_timer_targets(state, next_try);
+        -- Only organizational PVE pool names; never use these as VM ownership or access grants.
+        CREATE TABLE IF NOT EXISTS student_pool_groups (
+            group_name TEXT PRIMARY KEY NOT NULL, segment TEXT NOT NULL UNIQUE
+        );
         -- Enrollment receipts are never synthesized from a pool name or inventory.
         -- Keep tombstones after a delete/untrack: a later import is NOT the student's VM.
         CREATE TABLE IF NOT EXISTS student_lab_receipts (

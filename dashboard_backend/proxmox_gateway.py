@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from .passwords import generate_password
+from .student_pools import STUDENT_POOL_ROOT, student_pool_parents
 
 
 ProgressCallback = Callable[[int, str], None]
@@ -886,15 +887,80 @@ class LiveProxmoxGateway:
             })
         return sorted(pools, key=lambda item: item["pool_id"].lower())
 
+    def _pool_detail(self, pool_id: str, *, query=False) -> dict[str, Any]:
+        # PVE 8.1+ accepts a full nested pool name as a query parameter, not
+        # as a URL path. Never mistake the unfiltered pool index for membership.
+        if "/" in pool_id or query:
+            rows = self.client.pools.get(poolid=pool_id)
+            if (not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict)
+                    or rows[0].get("poolid") != pool_id or not isinstance(rows[0].get("members"), list)):
+                raise RuntimeError(f"Proxmox не подтвердил точный состав пула {pool_id}")
+            return rows[0]
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", pool_id) or pool_id in (".", ".."):
+            raise RuntimeError("Недопустимое имя пула Proxmox")
+        return self.client.pools(pool_id).get()
+
+    @staticmethod
+    def _guard_pool_target(pool_id: str) -> None:
+        # Parents outlive any individual stand: even a damaged local record
+        # must never turn them into a target for stopping guests or deleting pools.
+        if pool_id == STUDENT_POOL_ROOT or "/" in pool_id:
+            student_pool_parents(pool_id)  # Only a canonical student leaf is mutable here.
+
+    def _delete_leaf_pool(self, pool_id: str) -> None:
+        self._guard_pool_target(pool_id)
+        if "/" in pool_id:
+            self.client.pools.delete(poolid=pool_id)
+        else:
+            self.client.pools(pool_id).delete()
+
+    def _ensure_student_parents(self, leaf: str, known: set[str]) -> None:
+        for parent in student_pool_parents(leaf):
+            marker = f"DEMOEXAM student-labs container={parent}"
+            if parent not in known:
+                try:
+                    self._pool_detail(parent, query=True)
+                except Exception as exc:
+                    # In particular, do not create even a flat root on a PVE
+                    # version that cannot look up a nested pool by its ID.
+                    if f"pool '{parent}' does not exist" not in str(exc):
+                        raise RuntimeError(f"Не удалось проверить поддержку вложенных пулов или права на {parent}") from exc
+                    try:
+                        self.client.pools.post(poolid=parent, comment=marker)
+                    except Exception:
+                        # A concurrent creator or a lost reply is harmless only
+                        # if the subsequent exact read proves ownership.
+                        pass
+            try:
+                pool = self._pool_detail(parent, query=True)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Не удалось подтвердить родительский пул {parent}; проверьте поддержку "
+                    "вложенных пулов Proxmox и права Pool.Audit/Pool.Allocate"
+                ) from exc
+            if pool.get("comment") != marker or pool["members"]:
+                raise RuntimeError(f"Пул {parent} занят или не принадлежит учебному кабинету; создание отменено")
+
+    @staticmethod
+    def _check_personal_pool(pool: dict[str, Any], names: set[str] | None = None) -> None:
+        members = pool["members"]
+        if (len(members) > 1 or any(not isinstance(m, dict) or m.get("type") != "qemu"
+                or int(m.get("template") or 0) or not m.get("vmid") or not m.get("name")
+                or (names is not None and m["name"] not in names) for m in members)):
+            raise RuntimeError("В личном пуле изменился состав или имя VM; операция отменена")
+
     def pool_members(self, pool_id: str) -> list[dict[str, Any]]:
         try:
-            pool = self.client.pools(pool_id).get()
+            pool = self._pool_detail(pool_id)
         except Exception as exc:
             raise RuntimeError(f"Не удалось прочитать состав пула Proxmox {pool_id}") from exc
         if not isinstance(pool, dict) or not isinstance(pool.get("members"), list):
             raise RuntimeError(f"Proxmox вернул неполный состав пула {pool_id}")
         if pool.get("poolid", pool_id) != pool_id:
             raise RuntimeError(f"Proxmox вернул другой пул при чтении {pool_id}")
+        if pool_id.startswith(STUDENT_POOL_ROOT + "/") and pool_id.count("/") == 2:
+            student_pool_parents(pool_id)
+            self._check_personal_pool(pool)
         members: list[dict[str, Any]] = []
         seen: set[int] = set()
         for member in pool["members"]:
@@ -998,7 +1064,9 @@ class LiveProxmoxGateway:
         expected_name: str,
     ) -> bool:
         """Confirm an ambiguous clone response without trusting VMID alone."""
-        pool = self.client.pools(pool_id).get()
+        pool = self._pool_detail(pool_id)
+        if "/" in pool_id:
+            self._check_personal_pool(pool, {expected_name})
         for member in pool.get("members", []):
             if member.get("vmid") is None or int(member["vmid"]) != int(vmid):
                 continue
@@ -1899,6 +1967,9 @@ class LiveProxmoxGateway:
         preserve_pool: bool = False,
         expected_names: dict[int, str] | None = None,
     ) -> tuple[list[tuple[str, int]], list[str]]:
+        self._guard_pool_target(pool_id)
+        if "/" in pool_id and preserve_pool:
+            return [], ["Нельзя убирать ресурсы личного пула как из общего пула"]
         attempt_errors: list[str] = []
         candidate_ids = {int(vmid) for _, vmid in created}
         expected_names = expected_names or {}
@@ -1910,7 +1981,9 @@ class LiveProxmoxGateway:
         pool: dict[str, Any] | None = None
         for attempt in range(11 if candidate_ids else 1):
             try:
-                pool = self.client.pools(pool_id).get()
+                pool = self._pool_detail(pool_id)
+                if "/" in pool_id:
+                    self._check_personal_pool(pool, set(expected_names.values()))
             except Exception as exc:
                 return [], [f"не удалось проверить пул {pool_id}; он сохранён: {exc}"]
             if not preserve_pool and str(pool.get("comment") or "").strip() != expected_marker:
@@ -2028,9 +2101,11 @@ class LiveProxmoxGateway:
             return [], []
 
         try:
-            latest_pool = self.client.pools(pool_id).get()
+            latest_pool = self._pool_detail(pool_id)
             if str(latest_pool.get("comment") or "").strip() != expected_marker:
                 return [], [f"метка владельца пула {pool_id} изменилась перед удалением"]
+            if "/" in pool_id:
+                self._check_personal_pool(latest_pool, set())
             late_members = [
                 member
                 for member in latest_pool.get("members", [])
@@ -2045,7 +2120,7 @@ class LiveProxmoxGateway:
                 return late_resources, [
                     f"перед удалением в пуле {pool_id} появились VMID {ids}; пул сохранён"
                 ]
-            self.client.pools(pool_id).delete()
+            self._delete_leaf_pool(pool_id)
         except Exception as exc:
             return [], [f"не удалён пул {pool_id}: {exc}"]
         return [], []
@@ -2072,15 +2147,27 @@ class LiveProxmoxGateway:
 
     def deploy(self, stand: dict[str, Any], blueprint: dict[str, Any], progress: ProgressCallback) -> list[dict[str, Any]]:
         pool_id = stand["pool_id"]
-        pools = {pool["poolid"] for pool in self.client.pools.get()}
         use_existing_pool = str(stand.get("origin") or "deployed") == "existing"
+        self._guard_pool_target(pool_id)
+        pinned_path = blueprint.get("_student_pool_path")
+        if "/" in pool_id or pinned_path is not None:
+            if (pinned_path != pool_id or "/" not in pool_id or not blueprint.get("_student_template_name")
+                    or stand.get("origin") != "deployed" or stand.get("vm_count") != 1):
+                raise RuntimeError("Личный вложенный пул можно создать только для подтверждённой студенческой заявки")
+        pools = {pool["poolid"] for pool in self.client.pools.get()}
         if use_existing_pool and pool_id not in pools:
             raise RuntimeError(f"Существующий пул Proxmox {pool_id} не найден")
         if not use_existing_pool and pool_id in pools:
             raise RuntimeError(f"Пул Proxmox {pool_id} уже существует")
         expected_marker = f"DEMOEXAM dashboard stand_id={stand['id']}"
         if not use_existing_pool:
+            if pinned_path is not None:
+                self._ensure_student_parents(pool_id, pools)
             self.client.pools.post(poolid=pool_id, comment=expected_marker)
+            if pinned_path is not None:
+                fresh = self._pool_detail(pool_id)
+                if fresh.get("comment") != expected_marker or fresh["members"]:
+                    raise RuntimeError(f"Не удалось подтвердить новый пустой личный пул {pool_id}; клонирование отменено")
         created: list[tuple[str, int]] = []
         expected_names: dict[int, str] = {}
         try:
@@ -2895,9 +2982,12 @@ class LiveProxmoxGateway:
 
     def delete_stand(self, stand: dict[str, Any], vmids: list[int]) -> None:
         pool_id = str(stand["pool_id"])
+        self._guard_pool_target(pool_id)
         preserve_pool = str(stand.get("origin") or "deployed") == "existing"
+        if "/" in pool_id and preserve_pool:
+            raise RuntimeError("Нельзя удалять ресурсы личного пула как из общего пула")
         try:
-            pool = self.client.pools(pool_id).get()
+            pool = self._pool_detail(pool_id)
         except Exception as exc:
             status_code = getattr(exc, "status_code", None)
             response = getattr(exc, "response", None)
@@ -2924,6 +3014,8 @@ class LiveProxmoxGateway:
         expected_marker = f"DEMOEXAM dashboard stand_id={stand['id']}"
         if not preserve_pool and str(pool.get("comment", "")).strip() != expected_marker:
             raise RuntimeError("Пул не имеет метки владельца Deployer; удаление отменено")
+        if "/" in pool_id:
+            self._check_personal_pool(pool, {vm["name"] for vm in stand.get("vms", []) if vm.get("name")})
         pool_members = [
             member
             for member in pool.get("members", [])
@@ -3032,9 +3124,11 @@ class LiveProxmoxGateway:
             return
         # Close the window where an ambiguous clone request could attach a VM
         # after the first pool read but before pool deletion.
-        latest_pool = self.client.pools(pool_id).get()
+        latest_pool = self._pool_detail(pool_id)
         if str(latest_pool.get("comment", "")).strip() != expected_marker:
             raise RuntimeError("Метка владельца пула изменилась; удаление отменено")
+        if "/" in pool_id:
+            self._check_personal_pool(latest_pool, set())
         late_vmids = sorted(
             int(member["vmid"])
             for member in latest_pool.get("members", [])
@@ -3045,7 +3139,7 @@ class LiveProxmoxGateway:
                 "В пуле появились новые VM во время удаления; пул сохранён: "
                 + ", ".join(str(vmid) for vmid in late_vmids)
             )
-        self.client.pools(pool_id).delete()
+        self._delete_leaf_pool(pool_id)
 
     def cluster_metrics(self, tracked_vmids: list[int] | None = None) -> dict[str, Any]:
         tracked_key = frozenset(int(vmid) for vmid in (tracked_vmids or []))

@@ -84,7 +84,7 @@ class StudentLabs:
                        for t in self.service.gateway.list_templates()):
                 raise StudentError(409, "Шаблон задания изменился или недоступен. Обратитесь к преподавателю.")
             blueprint_id = int(key[2].split("-")[1])
-            self.service.create_stand(dict(name=f"{login}-{card_id[:8]}", pool_id=f"lab-{card_id}",
+            self.service.create_stand(dict(name=f"{login}-{card_id[:8]}",
                 owner=login, blueprint_id=blueprint_id, vm_count=1, subnet=f"{lo}/16",
                 start_ip=lo, duration_minutes=duration_minutes), student_receipt={
                     "card_id":card_id, "assignment_id":key[2], "template_vmid":key[3],

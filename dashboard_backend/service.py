@@ -22,6 +22,7 @@ from .database import DashboardStore, utc_now
 from .operation_queue import DeploymentCapacityBlocked, ProxmoxOperationQueue
 from .passwords import PROXMOX_PASSWORD_MAX_LENGTH, generate_password
 from .pool_inventory import PoolInventory
+from .student_pools import allocate_student_pool, is_student_pool_namespace, student_pool_parents
 from .proxmox_gateway import (
     CredentialRestoreError,
     DemoProxmoxGateway,
@@ -557,7 +558,8 @@ class DashboardService:
             # A pool selected explicitly as an external/shared destination may
             # hold multiple independent Deployer stands. Pools wholly imported
             # into one card or created/owned by Deployer remain exclusive.
-            pool["available_for_deploy"] = not (origins & {"imported", "deployed"})
+            pool["student_pool_namespace"] = is_student_pool_namespace(str(pool["pool_id"]))
+            pool["available_for_deploy"] = not (pool["student_pool_namespace"] or origins & {"imported", "deployed"})
         return pools
 
     @staticmethod
@@ -999,6 +1001,8 @@ class DashboardService:
 
     def import_pool(self, payload: dict[str, Any]) -> dict[str, Any]:
         pool_id = str(payload.get("pool_id", "")).strip()
+        if is_student_pool_namespace(pool_id):
+            raise ValidationError("Этот пул зарезервирован для личных учебных стендов.")
         if not pool_id or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", pool_id):
             raise ValidationError("Выберите существующий Proxmox pool")
         if self.store.query_one("SELECT id FROM stands WHERE pool_id = ?", (pool_id,)):
@@ -1109,6 +1113,11 @@ class DashboardService:
         if use_existing_pool and minutes is not None:
             raise ValidationError("Для стенда со сроком требуется новый личный пул")
         raw_pool_id = str(payload.get("pool_id", "")).strip()
+        if student_receipt is not None and use_existing_pool:
+            raise ValidationError("Для учебного стенда нужен отдельный личный пул.")
+        if student_receipt is None and (is_student_pool_namespace(raw_pool_id) or "/" in raw_pool_id
+                or "\\" in raw_pool_id or re.search(r"%2f|%5c", raw_pool_id, re.IGNORECASE)):
+            raise ValidationError("Нельзя назначать вложенные или служебные пулы ручному развёртыванию.")
         if use_existing_pool and not raw_pool_id:
             raise ValidationError("Выберите существующий Proxmox pool")
         if use_existing_pool:
@@ -1126,6 +1135,8 @@ class DashboardService:
                 raise ValidationError(f"Существующий Proxmox pool {pool_id} не найден")
         else:
             pool_id = self._pool_id(raw_pool_id or f"exam-{int(time.time())}")
+            if student_receipt is None and is_student_pool_namespace(pool_id):
+                raise ValidationError("Это имя зарезервировано для учебных пулов.")
         try:
             vm_count = int(payload.get("vm_count", 1))
         except (TypeError, ValueError) as exc:
@@ -1175,6 +1186,8 @@ class DashboardService:
                 if connection.execute("""SELECT 1 FROM student_lab_receipts r JOIN stands s ON s.id=r.stand_id
                                          WHERE r.login=? LIMIT 1""", (owner,)).fetchone():
                     raise ConflictError("У студента уже есть личный стенд")
+                # Never accept the student's or the operator form's choice of managed pool.
+                pool_id = allocate_student_pool(connection, student_receipt.get("student_group"), student_receipt["card_id"])
             tracked_pool_rows = connection.execute(
                 "SELECT id, origin FROM stands WHERE pool_id = ?", (pool_id,),
             ).fetchall()
@@ -1241,6 +1254,7 @@ class DashboardService:
                 deployment.pop(field, None)
             if student_receipt is not None:
                 deployment["_student_template_name"] = student_receipt["template_name"]
+                deployment["_student_pool_path"] = pool_id
             connection.execute(
                 "INSERT INTO pending_deployments (stand_id, plan) VALUES (?, ?)",
                 (stand_id, json.dumps(deployment, ensure_ascii=False)),
@@ -1453,12 +1467,20 @@ class DashboardService:
             stand = self.get_stand(stand_id)
             blueprint = dict(blueprint)
             pinned_name = blueprint.get("_student_template_name")
+            pinned_pool = blueprint.get("_student_pool_path")
+            if pinned_pool is not None or "/" in stand["pool_id"]:
+                if not pinned_name or pinned_pool != stand["pool_id"] or stand.get("origin") != "deployed":
+                    raise ConflictError("Назначение личного учебного пула не подтверждено")
+                student_pool_parents(pinned_pool)
             def check_current_audience(conn):
                 if pinned_name:
-                    receipt = conn.execute("SELECT student_group FROM student_lab_receipts WHERE stand_id=?",
+                    receipt = conn.execute("SELECT student_group,pool_id,card_id,login FROM student_lab_receipts WHERE stand_id=?",
                                            (stand_id,)).fetchone()
                     if not receipt:
                         raise ConflictError("Учебная заявка не найдена")
+                    if pinned_pool is not None and (receipt[1] != pinned_pool or receipt[3] != stand["owner"]
+                                                    or not pinned_pool.endswith("/lab-" + receipt[2])):
+                        raise ConflictError("Личный учебный пул не совпадает с сохранённой заявкой")
                     self._assert_student_publication(conn, stand["blueprint_id"], blueprint["template_vmid"],
                                                      pinned_name, receipt[0])
             # Retry may be accompanied by operator-selected VM stops. Check before
