@@ -261,7 +261,7 @@ exit 75`;
   async function api(path, options = {}) {
     const headers = { Accept: "application/json", ...(options.headers || {}) };
     const token = localStorage.getItem("demoops.adminToken");
-    if (token) headers["X-Admin-Token"] = token;
+    if (token && !headers["X-Admin-Token"]) headers["X-Admin-Token"] = token;
     const request = { method: options.method || "GET", headers, signal: options.signal };
     if (options.body !== undefined) {
       headers["Content-Type"] = "application/json";
@@ -1177,6 +1177,8 @@ exit 75`;
       finish(null);
       return;
     }
+    // Do not leave a one-time roster or an unsaved token visible during the close animation.
+    modalRoot.querySelectorAll("[data-batch-secret]").forEach(field => { field.value = ""; });
     stopStandDetailPolling();
     activeModalToken += 1;
     const closeToken = activeModalToken;
@@ -1224,6 +1226,71 @@ exit 75`;
         finish(null);
         toast("Локальный административный токен удалён", "warning");
       });
+    });
+  }
+
+  function openStudentBatch() {
+    closeSidebar();
+    const saved = Boolean(localStorage.getItem("demoops.adminToken"));
+    showModal({title:"Учётки студентов", subtitle:"Выдача доступов на группу", body:`<form id="student-batch" class="student-batch-form">
+      <p>Каждый студент получит отдельный логин и пароль. Виртуальная машина развернётся только по запросу из личного кабинета.</p>
+      <label class="field"><span class="field-label">Группа</span><input class="input" name="group" required placeholder="Например, ДЭ-24" maxlength="80"></label>
+      <div class="form-grid"><label class="field"><span class="field-label">Количество учёток</span><input class="input" name="count" type="number" min="1" max="100" step="1" value="20" required><small>От 1 до 100 за один раз.</small></label>
+      <label class="field"><span class="field-label">Начало логина</span><input class="input mono" name="prefix" value="student" required maxlength="16" pattern="[a-z]([a-z0-9]|-){0,15}" title="До 16 знаков: строчные латинские буквы, цифры и дефис. Начните с буквы." spellcheck="false" autocapitalize="none"><small>Например, student или mdk. Номер добавится автоматически.</small></label></div>
+      <label class="field" data-batch-token-field ${saved ? "hidden" : ""}><span class="field-label">Токен администратора</span><input class="input mono" name="token" type="password" autocomplete="off" data-batch-secret ${saved ? "" : "required"}><small>Введённый здесь токен не сохраняется.</small></label>
+      <div class="alert alert--info">${icon("info")}Пароли будут показаны один раз. Скопируйте список перед закрытием окна и передайте каждому студенту только его строку.</div>
+      <p data-batch-status role="status" hidden></p></form>`,
+      footer:`<button class="button" type="button" data-close-modal>Закрыть</button><button class="button button--primary" type="submit" form="student-batch">${icon("users")}Создать учётки</button>`});
+    const form = modalRoot.querySelector("#student-batch"), modalId = activeModalToken;
+    const send = modalRoot.querySelector('[form="student-batch"]'), status = form.querySelector("[data-batch-status]");
+    const setStatus = text => { status.hidden = false; status.textContent = text; };
+    form.addEventListener("submit", async event => {
+      event.preventDefault();
+      if (send.disabled || !form.reportValidity()) return;
+      const fields = form.elements;
+      const token = fields.token.value.trim() || localStorage.getItem("demoops.adminToken");
+      if (!token) {
+        form.querySelector("[data-batch-token-field]").hidden = false;
+        fields.token.required = true; fields.token.focus(); return;
+      }
+      send.disabled = true; fields.token.value = "";
+      setStatus("Готовим личные логины и пароли. Не закрывайте окно…");
+      const wanted = Number(fields.count.value);
+      try {
+        const result = await api("/api/student-accounts/batch", {method:"POST", promptAdmin:false,
+          headers:{"X-Admin-Token":token}, body:{count:wanted, group:fields.group.value.trim(), prefix:fields.prefix.value.trim()}});
+        if (activeModalToken !== modalId || !form.isConnected) return;
+        if (!Array.isArray(result.accounts) || result.accounts.length !== wanted ||
+            !result.accounts.every(row => typeof row?.login === "string" && typeof row.password === "string")) throw new Error("Неполный ответ сервера.");
+        showStudentRoster(result.accounts);
+      } catch (error) {
+        if (activeModalToken !== modalId || !form.isConnected) return;
+        if (error.status === 401 || error.status === 403) {
+          form.querySelector("[data-batch-token-field]").hidden = false;
+          fields.token.required = true; fields.token.focus();
+        }
+        // Never replay a batch automatically. The server may have committed before a connection loss.
+        const uncertain = !error.status || error.status >= 500;
+        setStatus(uncertain ? "Не удалось получить список. Учётки могли быть созданы: проверьте результат у администратора перед новым выпуском." : error.message);
+        send.disabled = uncertain;
+      }
+    });
+  }
+
+  function showStudentRoster(rows) {
+    showModal({title:"Учётки готовы", subtitle:`Группа: ${rows[0]?.group || "—"} · Создано: ${rows.length}`,
+      body:`<div class="student-batch-result"><p>Адрес для студентов: <a href="/student-demo/" target="_blank" rel="noopener">учебный кабинет Deployer</a>. При входе студент использует свой логин и пароль из списка.</p>
+      <label class="field"><span class="field-label">Логин и пароль · по одной паре в строке</span><textarea class="input mono" data-batch-secret autocomplete="off" autocapitalize="none" spellcheck="false" wrap="off" readonly></textarea></label>
+      <div class="alert alert--warning">${icon("shield")}Скопируйте список сейчас: после закрытия пароли нельзя посмотреть повторно.</div><p role="status" data-roster-status hidden></p></div>`,
+      footer:`<button class="button" type="button" data-close-modal>Закрыть</button><button class="button button--primary" data-copy-roster type="button">${icon("copy")}Скопировать список</button>`});
+    const roster = modalRoot.querySelector("textarea"), note = modalRoot.querySelector("[data-roster-status]");
+    roster.value = rows.map(row => `${row.login}\t${row.password}`).join("\n");
+    modalRoot.querySelector("[data-copy-roster]").addEventListener("click", async () => {
+      let copied = false;
+      try { await navigator.clipboard.writeText(roster.value); copied = true; } catch {
+        if (roster.isConnected && roster.value) { roster.focus(); roster.select(); try { copied = document.execCommand("copy"); } catch { /* keep the selection for manual copy */ } }
+      }
+      note.hidden = false; note.textContent = copied ? "Логины и пароли скопированы." : "Список выделен. Используйте Ctrl+C или команду «Копировать».";
     });
   }
 
@@ -2454,6 +2521,7 @@ exit 75`;
     else if (target.dataset.consumerSort && Object.hasOwn(consumerMetrics,target.dataset.consumerSort)) { consumerView.metric=target.dataset.consumerSort; consumerView.page=0; paintConsumerRows(); }
     else if (target.hasAttribute("data-consumer-prev") || target.hasAttribute("data-consumer-next")) { consumerView.page+=target.hasAttribute("data-consumer-next") ? 1 : -1; paintConsumerRows(); }
     else if (target.dataset.rollbackAllStands !== undefined) openRollbackAllStandsModal();
+    else if (target.hasAttribute("data-student-batch")) openStudentBatch();
     else if (target.dataset.importPool !== undefined) openImportPoolModal();
     else if (target.matches("[data-open-deploy]")) openDeployWizard(target.dataset.openDeploy || null);
     else if (target.matches("[data-refresh-ipam]")) { state.ipam = null; renderIpam(); await loadIpam({ force: true }); }
@@ -2606,7 +2674,11 @@ exit 75`;
   window.addEventListener("hashchange", () => { const route = getRoute(); if (route !== state.route) navigate(route); });
   window.addEventListener("beforeunload", event => { if (state.editorDirty) { event.preventDefault(); event.returnValue = ""; } });
 
-  window.addEventListener("storage", event => { if (event.key === "demoops.adminToken" || event.key === null) clearConsumerReport(); });
+  function clearStudentBatch() {
+    if (modalRoot.querySelector("#student-batch, .student-batch-result")) closeModal();
+  }
+  window.addEventListener("pagehide", clearStudentBatch);
+  window.addEventListener("storage", event => { if (event.key === "demoops.adminToken" || event.key === null) { clearConsumerReport(); clearStudentBatch(); } });
   if (state.route === "consumers") render();
   loadData();
   window.setInterval(() => { if (!document.hidden) loadData({ silent: true }); }, 30000);

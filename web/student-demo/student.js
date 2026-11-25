@@ -6,6 +6,12 @@
   const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
   let student = null, assignments = [], current = null, page = "", timer = 0, epoch = 0, activeRequest = 0;
   const pending = new Set(), marks = new Map();
+  const labStatuses = {
+    pending:"Заявка не принята в очередь", queued:"В очереди на развёртывание", provisioning:"Развёртывается VM",
+    paused:"Развёртывание приостановлено", awaiting_confirmation:"Ожидает решения преподавателя", error:"Ошибка развёртывания", stopped:"VM выключена", removed:"Стенд удалён",
+    ready:"VM готова", expired:"Время истекло"
+  };
+  const labAttention = state => ["pending","paused","awaiting_confirmation","error","stopped","removed"].includes(state);
   function leaseText(stand) {
     const lease = stand?.actual_lease || stand;
     if (!lease) return "";
@@ -89,20 +95,27 @@
       <p class="template-line">Шаблон: <b>${esc(a.template_name)}</b> · VMID ${esc(a.template_vmid)}</p>
       <details><summary>Условия задания</summary><ol class="steps">${a.steps.map(step => `<li>${esc(step)}</li>`).join("")}</ol></details>
       <div class="actionbox"><div class="progress-wrap" hidden><span data-phase></span><progress max="100" value="0" aria-label="Подготовка стенда"></progress></div>
-      <label class="field lease-field" data-lease-field>Срок демостенда, минут<input data-duration type="number" inputmode="numeric" min="1" max="10080" step="1" placeholder="Без ограничения"><small>От 1 минуты до 7 дней после готовности. Пустое поле — без ограничения.</small></label>
+      <p class="stand-note" data-stand-reason hidden></p>
+      <label class="field lease-field" data-lease-field>Срок ${student.managed ? "работы VM" : "демостенда"}, минут<input data-duration type="number" inputmode="numeric" min="1" max="10080" step="1" placeholder="Без ограничения"><small>От 1 минуты до 7 дней после готовности. Пустое поле — без ограничения.</small></label>
       <p class="lease-meta" data-list-lease hidden></p>
       <button type="button" class="button primary" data-deploy>Развернуть стенд</button>
       <a class="button primary" data-open-stand hidden>Открыть карточку стенда</a></div></article>`;
   }
   function updateStatus(root, stand, readyLabel = "Карточка готова") {
     const status = $("[data-status]",root), progress = $("progress",root), wrap = progress.parentElement;
-    const ready = stand?.status === "ready", working = stand?.status === "provisioning";
-    status.className = `status ${ready ? "ready" : working ? "provisioning" : ""}`;
-    status.textContent = stand?.status === "expired" ? "Время истекло" : ready ? readyLabel : working ? "Идёт подготовка карточки" : "Карточка не создана";
+    const state = stand?.status, ready = state === "ready", working = state === "provisioning" || state === "queued";
+    status.className = `status ${ready ? "ready" : working ? "provisioning" : labAttention(state) ? "attention" : ""}`;
+    status.textContent = stand?.real ? (labStatuses[state] || "Получаем состояние VM") : state === "expired" ? "Время истекло" : state === "stopped" ? "VM выключена" : ready ? readyLabel : working ? "Идёт подготовка карточки" : "Карточка не создана";
+    const reason = $("[data-stand-reason]",root);
+    if (reason) {
+      reason.hidden = !(stand?.real && labAttention(state) && stand.phase && stand.phase !== status.textContent);
+      reason.textContent = reason.hidden ? "" : stand.phase;
+    }
     wrap.hidden = !working;
     if (working) {
-      const percent = Math.max(0,Math.min(100,Number(stand.progress) || 0));
-      progress.value = percent; $("[data-phase]",root).textContent = `${stand.phase || "Подготовка"} · ${percent}%`;
+      const percent = Number.isFinite(stand.progress) ? Math.max(0,Math.min(100,stand.progress)) : null;
+      if (percent !== null) progress.value = percent; else progress.removeAttribute("value");
+      $("[data-phase]",root).textContent = (stand.phase || status.textContent) + (percent === null ? "" : ` · ${percent}%`);
     }
   }
   function dashboard(force = false) {
@@ -110,7 +123,7 @@
     if (first || force) {
       page = "assignments"; current = null; document.title = "Мои задания · Deployer";
       view.innerHTML = `<section class="hero"><p class="eyebrow">Кабинет студента / ${esc(student.group)}</p><h1>Мои <span class="accent">задания.</span></h1>
-        <p class="lead">${esc(student.name)}, выберите практическую работу. Стенд будет закреплён за вашим профилем и этим заданием.</p>
+        <p class="lead">${esc(student.name)}, выберите практическую работу. ${student.managed ? "После запуска Deployer поставит вашу личную VM в очередь Proxmox. Одновременно можно работать на одном стенде." : "Стенд будет закреплён за вашим профилем и этим заданием."}</p>
         <div class="hero-stats"><span>Назначено заданий: <strong>${assignments.length}</strong></span><span>Карточки готовы: <strong id="ready-count">0</strong></span></div></section>
         <div class="section-head"><h2>Практические работы</h2></div>
         ${assignments.length ? `<section class="assignment-grid" aria-label="Список заданий">${assignments.map(card).join("")}</section>` : `<div class="empty">Пока у вас нет назначенных работ.</div>`}`;
@@ -121,13 +134,13 @@
       const root = cards[i]; if (!root) return;
       const button = $("[data-deploy]",root), link = $("[data-open-stand]",root), s = a.stand;
       updateStatus(root,s);
-      const expired = s?.status === "expired" && !s.actual_lease;
-      button.hidden = !!s && !expired; button.disabled = pending.has(a.id); button.textContent = button.disabled ? "Отправляем запрос…" : expired ? "Развернуть заново" : "Развернуть стенд";
-      $("[data-lease-field]",root).hidden = button.hidden;
+      const restart = (s?.status === "expired" && !s.real && !s.actual_lease) || (s?.real && s.status === "removed"), retry = s?.real && s.status === "pending";
+      button.hidden = !!s && !restart && !retry; button.disabled = pending.has(a.id); button.textContent = button.disabled ? "Отправляем запрос…" : retry ? "Повторить заявку" : restart ? "Развернуть заново" : "Развернуть стенд";
+      $("[data-lease-field]",root).hidden = button.hidden || retry;
       const lease = $("[data-list-lease]",root);
       lease.hidden = !s?.duration_minutes && !s?.actual_lease?.duration_minutes;
       lease.textContent = lease.hidden ? "" : leaseText(s);
-      link.hidden = s?.status !== "ready" && s?.status !== "expired";
+      link.hidden = !s?.real && !["ready","expired","stopped"].includes(s?.status);
       if (!link.hidden) link.href = `#stands/${encodeURIComponent(s.id)}`;
     });
   }
@@ -145,11 +158,11 @@
   function standPage(result) {
     const a = result.assignment, s = result.stand;
     const actualExpired = s.actual_lease && (s.actual_lease.status === "expired" || s.status === "expired" || Date.parse(s.actual_lease.expires_at) <= Date.now());
-    const access = s.status !== "expired" && !actualExpired ? proxmoxAccess(s.access) : null;
+    const access = s.status === "ready" && !actualExpired ? proxmoxAccess(s.access) : null;
     const pendingPilot = !actualExpired && !access && s.pilot_pending === true;
-    const real = !!(s.actual_lease || access || pendingPilot);
+    const real = !!(s.real || s.actual_lease || access || pendingPilot);
     const timingFixed = Number(s.actual_lease?.duration_minutes) > 0;
-    const key = `stand:${s.id}:${access?.url || (pendingPilot ? "pending" : actualExpired ? "expired" : "demo")}:${access?.vmid || ""}:${timingFixed}`;
+    const key = `stand:${s.id}:${access?.url || (pendingPilot ? "pending" : actualExpired ? "expired" : s.real ? s.status : "demo")}:${access?.vmid || ""}:${timingFixed}`;
     if (page !== key) {
       page = key; document.title = `${s.name} · Практикум`;
       const marked = marks.get(String(s.id)) || new Set();
@@ -161,16 +174,16 @@
         <h3>Порядок работы</h3><div class="checklist">${a.steps.map((step,i) => `<label><input type="checkbox" data-step="${i}" ${marked.has(i) ? "checked" : ""}><span>${esc(step)}</span></label>`).join("")}</div>
         <p class="check-hint">Это личные заметки: отметки сохраняются в этой вкладке до обновления страницы или выхода.</p>
         <button type="button" id="download-assignment" class="button secondary">Скачать задание (.txt)</button></article>
-        <aside class="stand-panel"><p class="eyebrow">Среда</p><h2>${real ? "Вход в Proxmox" : "Учебный симулятор"}</h2><dl>
+        <aside class="stand-panel"><p class="eyebrow">Среда</p><h2>${real ? "Персональная VM" : "Учебный симулятор"}</h2><dl>
         <div><dt>Статус</dt><dd data-status></dd></div>
         <div><dt>${real ? "Срок работы VM" : "Срок демостенда"}</dt><dd data-lease></dd></div>
         ${access ? `<div><dt>IP вашей VM</dt><dd class="mono">${esc(access.ip)}</dd></div><div><dt>Логин Proxmox</dt><dd class="mono">${esc(access.login)}</dd></div>
         <div><dt>VMID вашей VM</dt><dd>${esc(access.vmid)}</dd></div>` : ""}
         <div><dt>Шаблон</dt><dd>${esc(a.template_name)}</dd></div>
         <div><dt>VMID шаблона</dt><dd>${esc(a.template_vmid)}</dd></div><div><dt>Владелец</dt><dd>${esc(student.login)}</dd></div></dl>
-        <div class="stand-progress" hidden><span data-phase></span><progress max="100" value="0" aria-label="Подготовка стенда"></progress></div>
+        <div class="stand-progress" hidden><span data-phase></span><progress max="100" value="0" aria-label="Подготовка стенда"></progress></div><p class="stand-note" data-stand-reason hidden></p>
         ${access ? `<div class="guest-copy"><button type="button" class="button secondary small" data-copy-login>Скопировать логин</button><button type="button" class="button secondary small" data-copy-password>Скопировать пароль</button></div>
-        ${timingFixed ? '<p class="stand-note">Время работы зафиксировано. Изменить или отменить назначенный срок из кабинета нельзя.</p>' : `<details class="duration-settings"><summary>Назначить время работы</summary><form data-real-duration-form>
+        ${s.real ? "" : timingFixed ? '<p class="stand-note">Время работы зафиксировано. Изменить или отменить назначенный срок из кабинета нельзя.</p>' : `<details class="duration-settings"><summary>Назначить время работы</summary><form data-real-duration-form>
           <label class="field">Время с момента подтверждения, минут<input name="duration_minutes" type="number" min="1" max="10080" step="1" inputmode="numeric" required placeholder="Например, 90"></label>
           <p>Без таймера стенд работает бессрочно. Срок назначается один раз: по его окончании VM получит команду мягкого выключения. Диски и задание сохранятся.</p>
           <button class="button secondary small" type="submit">Назначить срок</button></form></details>`}
@@ -179,11 +192,17 @@
         <p class="stand-note">${access ? "Скопируйте логин и пароль по отдельности и вставьте их на странице входа в Proxmox."
           : actualExpired ? "Срок работы этой VM закончился. Задание сохранено. Для продления обратитесь к преподавателю."
           : pendingPilot ? "Реальный стенд заказан. Ссылка появится здесь после готовности VM и проверки доступа. Обновлять страницу не нужно."
+          : s.real && s.status === "pending" ? "Вернитесь к заданиям и повторите эту заявку, когда её причина устранена. Второй стенд при повторе не создаётся."
+          : s.real && ["queued","provisioning"].includes(s.status) ? "Ссылка на ваш Proxmox появится здесь после готовности VM. Страница обновляется автоматически."
+          : s.real && ["paused","awaiting_confirmation"].includes(s.status) ? "Заявка сохранена. Продолжить развёртывание может преподаватель через Deployer."
+          : s.real && s.status === "removed" ? "Эта VM удалена. Для нового запуска вернитесь в список заданий."
+          : s.real && s.status === "expired" ? "Срок работы закончился. Для повторного доступа обратитесь к преподавателю."
+          : s.real ? "Доступ к VM сейчас недоступен. Передайте преподавателю название этого стенда."
           : "Работайте с заданием в этой карточке. Сейчас в ней нет доступа к реальной VM. Если для практики нужен Proxmox, обратитесь к преподавателю."}</p></aside></div>`;
     }
     current = result;
     const panel = $(".stand-panel");
-    $("[data-lease]",panel).textContent = pendingPilot && !s.actual_lease ? "Уточняется" : real && !s.actual_lease ? "Не указан" : leaseText(s);
+    $("[data-lease]",panel).textContent = pendingPilot && !s.actual_lease ? "Уточняется" : !s.real && real && !s.actual_lease ? "Не указан" : leaseText(s);
     if (actualExpired) {
       const status = $("[data-status]",panel); status.className = "status"; status.textContent = "Срок работы истёк";
       $(".stand-progress",panel).hidden = true;
@@ -201,15 +220,18 @@
   function schedule() {
     clearTimeout(timer);
     if (document.hidden || !student) return;
+    const stands = page.startsWith("stand:") ? [current?.stand] : assignments.map(a => a.stand);
+    let delay = Infinity;
     if (page.startsWith("stand:") && current?.stand.pilot_pending === true && !proxmoxAccess(current.stand.access)) {
-      timer = setTimeout(() => refresh(), 10000);
-    } else if (page.startsWith("stand:") ? current?.stand.status === "provisioning" : page === "assignments" && assignments.some(a => a.stand?.status === "provisioning")) {
-      timer = setTimeout(() => refresh(), 1250);
-    } else {
-      const stands = page.startsWith("stand:") ? [current?.stand] : assignments.map(a => a.stand);
-      const deadlines = stands.filter(s => s && s.status !== "expired").map(s => Date.parse((s.actual_lease || s).expires_at)).filter(t => t > Date.now());
-      if (deadlines.length) timer = setTimeout(() => refresh(), Math.min(...deadlines) - Date.now() + 100);
+      delay = 10000;
     }
+    for (const s of stands.filter(Boolean)) {
+      if (s.real) delay = Math.min(delay,["queued","provisioning"].includes(s.status) ? 4500 : ["paused","awaiting_confirmation"].includes(s.status) ? 12000 : 30000);
+      else if (s.status === "provisioning") delay = Math.min(delay,1250);
+      const until = Date.parse((s.actual_lease || s).expires_at) - Date.now();
+      if (s.status !== "expired" && until > 0) delay = Math.min(delay,until+100);
+    }
+    if (Number.isFinite(delay)) timer = setTimeout(() => refresh(),delay);
   }
   async function refresh(userAction = false) {
     const generation = epoch, request = ++activeRequest, id = routeId();
@@ -352,7 +374,8 @@
     if (deploy && student) {
       const root = deploy.closest("[data-assignment-id]"), id = root.dataset.assignmentId;
       let minutes;
-      try { minutes = checkedMinutes($("[data-duration]",root)); } catch (error) { warn(error.message); return; }
+      const prior = assignments.find(a => a.id === id)?.stand;
+      try { minutes = prior?.real && prior.status === "pending" ? prior.duration_minutes : checkedMinutes($("[data-duration]",root)); } catch (error) { warn(error.message); return; }
       if (pending.has(id)) return;
       const generation = epoch; pending.add(id); deploy.disabled = true; deploy.textContent = "Отправляем запрос…"; warn("");
       try {

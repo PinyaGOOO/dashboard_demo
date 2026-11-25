@@ -39,19 +39,23 @@ def _reply(h, method, status, body=b"", mime="text/plain", headers=()):
 class _LazyPortal:
     """Initialize the portal only for recognized requests that need it."""
 
-    def __init__(self, db_path, catalog_path, example_if_missing, pilot_validator, pilot_grant, set_duration):
+    def __init__(self, db_path, catalog_path, example_if_missing, pilot_validator, pilot_grant, set_duration, labs):
         self.db_path = Path(db_path)
         self.catalog_path = Path(catalog_path)
         self.example_if_missing = example_if_missing
         self.pilot_validator = pilot_validator
         self.pilot_grant = pilot_grant
         self.set_duration = set_duration
+        self.labs = labs
         self.instance = None
         self.lock = Lock()
 
     def __getattr__(self, name):
         if name not in {"login", "logout", "get_dashboard", "deploy", "get_stand", "guest_action", "demo_profiles"}:
             raise AttributeError(name)
+        return getattr(self._initialized(), name)
+
+    def _initialized(self):
         with self.lock:
             if self.instance is None:
                 try:
@@ -59,18 +63,23 @@ class _LazyPortal:
                         raise ValueError("Demo database and catalog must be different")
                     self.instance = StudentPortal(self.db_path, lambda: load_catalog(
                         self.catalog_path, example_if_missing=self.example_if_missing),
-                        pilot_validator=self.pilot_validator, pilot_grant=self.pilot_grant, set_duration=self.set_duration)
+                        pilot_validator=self.pilot_validator, pilot_grant=self.pilot_grant, set_duration=self.set_duration,
+                        labs=self.labs)
                 except (OSError, RuntimeError, SQLiteError, ValueError) as exc:
                     raise StudentError(503, "Хранилище демокабинета недоступно.") from exc
-            return getattr(self.instance, name)
+            return self.instance
 
 
 class StudentMount:
     def __init__(self, db_path: Path, catalog_path: Path, *, secure_cookie: bool,
                  example_if_missing: bool = True, pilot_validator: Callable[[dict], bool] | None = None,
-                 pilot_grant=None, set_duration=None):
-        self._portal = _LazyPortal(db_path, catalog_path, example_if_missing, pilot_validator, pilot_grant, set_duration)
+                 pilot_grant=None, set_duration=None, labs=None):
+        self._portal = _LazyPortal(db_path, catalog_path, example_if_missing, pilot_validator, pilot_grant, set_duration, labs)
         self._secure_cookie = secure_cookie
+
+    def create_accounts(self, payload):
+        """Called by the separate authenticated operator endpoint; not a student action."""
+        return self._portal._initialized().create_accounts(payload)
 
     def handle(self, handler, method) -> bool:
         path = handler.path.partition("?")[0]

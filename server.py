@@ -17,6 +17,7 @@ from dashboard_backend.proxmox_gateway import create_gateway
 from dashboard_backend.service import ConflictError, DashboardService, NotFoundError, ValidationError
 from dashboard_backend.student_mount import StudentMount
 from dashboard_backend.student_credentials import PilotCredentials
+from dashboard_backend.student_labs import StudentLabs
 from dashboard_backend.student_portal import StudentError
 from dashboard_backend.student_pilot_validation import make_pilot_validator
 
@@ -131,7 +132,23 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self._json({"error": "Неверный административный токен", "code": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
             return
         try:
-            if parts == ["api", "health"] and method == "GET":
+            if parts == ["api", "student-accounts", "batch"] and method == "POST":
+                # Unlike legacy demo actions this endpoint must never allow a
+                # missing operator credential, even when running on localhost.
+                tokens = self.headers.get_all("X-Admin-Token") or []
+                if not self.admin_token or not self.admin_token.strip() or len(tokens) != 1 or not secrets_compare(tokens[0], self.admin_token):
+                    self._json({"error": "Требуется административный токен."}, HTTPStatus.UNAUTHORIZED)
+                    return
+                if self.headers.get("Sec-Fetch-Site") not in (None, "same-origin"):
+                    self._json({"error": "Откройте форму в панели преподавателя."}, HTTPStatus.FORBIDDEN)
+                    return
+                if self.headers.get_content_type() != "application/json":
+                    self._json({"error": "Требуется JSON."}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                    return
+                if not self.student_mount:
+                    raise StudentError(503, "Учебный кабинет недоступен.")
+                self._json(self.student_mount.create_accounts(self._body()), HTTPStatus.CREATED)
+            elif parts == ["api", "health"] and method == "GET":
                 self._json({"status": "ok", "integration": self.service.integration()})
             elif parts == ["api", "bootstrap"] and method == "GET":
                 self._json(self.service.bootstrap())
@@ -213,6 +230,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 body = self._body(); self._json(self.service.start_check(int(body.get("stand_id"))), HTTPStatus.ACCEPTED)
             else:
                 self._json({"error": "Маршрут API не найден", "code": "not_found"}, HTTPStatus.NOT_FOUND)
+        except StudentError as exc:
+            self._json({"error": str(exc), "code": "student_error"}, exc.status)
         except ConsumerReportUnavailable as exc:
             self._json({"error": str(exc), "code": "telemetry_unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
         except NotFoundError as exc:
@@ -268,6 +287,8 @@ def main() -> None:
         secure_cookie=gateway.mode == "live", example_if_missing=gateway.mode == "demo",
         pilot_validator=make_pilot_validator(admin_db) if gateway.mode == "live" else None,
         pilot_grant=grant, set_duration=set_student_duration if grant else None,
+        labs=StudentLabs(service, os.environ.get("STUDENT_LAB_IP_START"), os.environ.get("STUDENT_LAB_IP_END"))
+             if grant else None,
     )
     mimetypes.add_type("application/javascript", ".js")
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)

@@ -990,7 +990,7 @@ class DashboardService:
         self.store.add_activity("import", "Существующий pool добавлен", activity_detail, "success")
         return self.get_stand(stand_id)
 
-    def create_stand(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def create_stand(self, payload: dict[str, Any], *, student_receipt=None) -> dict[str, Any]:
         try:
             blueprint_id = int(payload.get("blueprint_id"))
         except (TypeError, ValueError) as exc:
@@ -1065,6 +1065,16 @@ class DashboardService:
         # The stand, placeholder VM rows and addresses are committed together.
         # Concurrent requests therefore cannot reserve the same address.
         with self.store.transaction() as connection:
+            # This optional argument is internal, never read from the admin/student POST body.
+            if student_receipt is not None:
+                if (vm_count != 1 or use_existing_pool or self.gateway.mode != "live" or
+                        blueprint["template_vmid"] != student_receipt["template_vmid"] or
+                        not connection.execute("SELECT 1 FROM blueprints WHERE id=? AND template_vmid=? AND status='active'",
+                                               (blueprint_id, student_receipt["template_vmid"])).fetchone()):
+                    raise ConflictError("Учебный шаблон изменился; обратитесь к преподавателю")
+                if connection.execute("SELECT 1 FROM student_lab_receipts WHERE card_id=?",
+                                      (student_receipt["card_id"],)).fetchone():
+                    raise ConflictError("Эта учебная карточка уже зарегистрирована")
             tracked_pool_rows = connection.execute(
                 "SELECT id, origin FROM stands WHERE pool_id = ?", (pool_id,),
             ).fetchall()
@@ -1078,6 +1088,9 @@ class DashboardService:
             canonical_start, prefix_length, allocated_ips = self._ipam_plan(
                 connection, subnet, start_ip, vm_count,
             )
+            if student_receipt is not None and (len(allocated_ips) != 1 or prefix_length != 16 or
+                    int(ipaddress.IPv4Address(allocated_ips[0])) > int(ipaddress.IPv4Address(student_receipt["ip_end"]))):
+                raise ConflictError("В выделенном диапазоне учебных VM больше нет адресов")
             cursor = connection.execute(
                 """INSERT INTO stands
                 (name, blueprint_id, status, progress, node, pool_id, workspace, owner,
@@ -1115,9 +1128,16 @@ class DashboardService:
                         (stand_id, int(vm_cursor.lastrowid), ip, subnet,
                          prefix_length, index, now, now),
                     )
+                if student_receipt is not None:
+                    connection.execute("""INSERT INTO student_lab_receipts
+                        (card_id,login,assignment_id,template_vmid,blueprint_id,stand_id,vm_row_id,pool_id,vm_name,guest_ip)
+                        VALUES (?,?,?,?,?,?,?,?,?,?)""", (student_receipt["card_id"], owner, student_receipt["assignment_id"],
+                        student_receipt["template_vmid"], blueprint_id, stand_id, int(vm_cursor.lastrowid), pool_id, vm_name, ip))
             deployment = dict(blueprint, vm_count=vm_count, subnet=subnet, start_ip=canonical_start,
                               allocated_ips=allocated_ips, bridge=bridge, clone_type="linked",
                               storage="", use_existing_pool=use_existing_pool)
+            if student_receipt is not None:
+                deployment["_student_template_name"] = student_receipt["template_name"]
             connection.execute(
                 "INSERT INTO pending_deployments (stand_id, plan) VALUES (?, ?)",
                 (stand_id, json.dumps(deployment, ensure_ascii=False)),
@@ -1439,6 +1459,16 @@ class DashboardService:
                     else:
                         heartbeat_thread.start()
                         try:
+                            # Waits and operator-approved retries can outlive a published
+                            # assignment. Never clone a VM that has since reused its ID.
+                            if "_student_template_name" in blueprint:
+                                if (not self.store.query_one("""SELECT id FROM blueprints
+                                        WHERE id=? AND template_vmid=? AND status='active'""",
+                                        (stand["blueprint_id"], blueprint["template_vmid"])) or
+                                        not any(t.get("vmid")==blueprint["template_vmid"] and
+                                                t.get("name")==blueprint["_student_template_name"]
+                                                for t in self.gateway.list_templates())):
+                                    raise ConflictError("Учебный шаблон изменился до запуска клонирования")
                             # From this point a Proxmox task may exist even if
                             # the process dies before it records the VMID.
                             self.store.execute("DELETE FROM pending_deployments WHERE stand_id = ?", (stand_id,))
@@ -1518,7 +1548,8 @@ class DashboardService:
             vms = normalized_vms
             minutes = stand.get("duration_minutes")
             tokens = {}
-            if minutes is not None:
+            student_receipt = self.store.query_one("SELECT card_id FROM student_lab_receipts WHERE stand_id=?", (stand_id,))
+            if minutes is not None or student_receipt is not None:
                 for vm in vms:
                     try:
                         tokens[vm["vmid"]] = self.stand_timer.identity(vm)
@@ -1575,6 +1606,11 @@ class DashboardService:
                             (stand_id,) + values,
                         )
                         stand_vm_id = int(cursor.lastrowid)
+                    if student_receipt is not None:
+                        # Pin the original clone identity here, never from a later inventory sync.
+                        connection.execute("""UPDATE student_lab_receipts SET vmid=?, guest_uuid=?
+                            WHERE stand_id=? AND vm_row_id=? AND vmid IS NULL AND vm_name=? AND guest_ip=?""",
+                            (vm["vmid"], tokens[vm["vmid"]], stand_id, stand_vm_id, vm["name"], assigned_ip))
                     if reservation:
                         connection.execute(
                             """UPDATE ipam_reservations SET stand_vm_id = ?, status = 'assigned',

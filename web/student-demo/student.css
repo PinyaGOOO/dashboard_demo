@@ -23,6 +23,7 @@ h1,h2,h3,p,ol,dl{margin:0}h1,h2,h3{font-weight:750;line-height:1.12;letter-spaci
 @media(max-width:500px){.mast-inner{min-height:62px;gap:.55rem}.mast-label,.mast-divider{display:none}.account{gap:.5rem}.foot{flex-direction:column;align-items:flex-start;gap:.2rem}.actionbox .button{width:100%}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important}}
 #main:focus{outline:none}
+.status.attention{color:#f4cd88}
 .assignment-grid{align-items:stretch}.assignment{display:flex;flex-direction:column}.assignment .actionbox{margin-top:auto}
 .guest-launch{display:flex;flex-wrap:wrap;align-items:center;gap:.6rem 1rem;margin-top:1.35rem}.guest-launch span{font-size:.9rem;color:var(--muted)}
 .lease-field small,.lease-meta,.duration-settings p{color:var(--muted);font-size:.9rem;line-height:1.5}.lease-field input,.grant-form input,.duration-settings input{min-width:0;width:100%}.guest-copy{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:1rem}.grant-form,.duration-settings form{display:grid;gap:.65rem;margin-top:.8rem}.grant-form .button,.duration-settings .button{justify-self:start}.stand-panel [data-copy-status]:not(:empty){margin-top:.7rem;color:var(--ink);font-size:.94rem}

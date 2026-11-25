@@ -191,6 +191,15 @@ class DashboardStore:
             PRIMARY KEY (stand_id, vmid)
         );
         CREATE INDEX IF NOT EXISTS idx_timer_due ON stand_timer_targets(state, next_try);
+        -- Enrollment receipts are never synthesized from a pool name or inventory.
+        -- Keep tombstones after a delete/untrack: a later import is NOT the student's VM.
+        CREATE TABLE IF NOT EXISTS student_lab_receipts (
+            card_id TEXT PRIMARY KEY, login TEXT NOT NULL, assignment_id TEXT NOT NULL,
+            template_vmid INTEGER NOT NULL, blueprint_id INTEGER NOT NULL,
+            stand_id INTEGER NOT NULL UNIQUE, vm_row_id INTEGER NOT NULL UNIQUE,
+            pool_id TEXT NOT NULL, vm_name TEXT NOT NULL, guest_ip TEXT NOT NULL,
+            vmid INTEGER, guest_uuid TEXT
+        );
         CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             stand_id INTEGER NOT NULL,

@@ -20,6 +20,9 @@ class StudentNetworkTests(unittest.TestCase):
     def test_real_provisioning_plan_preserves_host_and_rejects_wrong_network(self):
         with tempfile.TemporaryDirectory() as temp:
             store = DashboardStore(Path(temp)/"db")
+            # This test exercises IPAM planning only. Don't resume the seeded
+            # demo progress card in a thread still using the temp DB at cleanup.
+            store.execute("UPDATE stands SET status='stopped' WHERE status='provisioning'")
             service = DashboardService(store, Mock(mode="demo"))
             try:
                 bp = next(b for b in service.list_blueprints() if b["status"] == "active")
