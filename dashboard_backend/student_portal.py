@@ -163,8 +163,8 @@ class StudentPortal:
         """Only call through the authenticated teacher endpoint; never a student route."""
         return student_accounts.create_batch(self._db, payload, _ACCOUNTS, self._clock)
 
-    def list_accounts(self, search="", offset=0, limit=50, sort="login"):
-        return student_accounts.list_accounts(self._db, _ACCOUNTS, search, offset, limit, sort)
+    def list_accounts(self, search="", offset=0, limit=50, sort="login", group=""):
+        return student_accounts.list_accounts(self._db, _ACCOUNTS, search, offset, limit, sort, group)
 
     def account_login_history(self, login):
         return student_accounts.account_login_history(self._db, _ACCOUNTS, login)

@@ -1250,6 +1250,7 @@ exit 75`;
       <div class="card"><div class="card__body student-admin" data-student-admin></div></div></section>`;
     const panel = app.querySelector("[data-student-admin]");
     let token = localStorage.getItem("demoops.adminToken") || "", search = "", sort = "group", offset = 0, seq = 0, rows = [];
+    let group = "", groups = [];
     let closed = false, read = null;
     const limit = 50, $ = selector => panel.querySelector(selector);
     const el = (name, callback) => $(name)?.addEventListener("click", callback);
@@ -1263,37 +1264,64 @@ exit 75`;
     const vmNotice = "Эти действия не останавливают VM, не меняют её пароль и не завершают отдельный вход в Proxmox.";
     function wipe() { panel.querySelectorAll("[data-batch-secret]").forEach(field => { field.value = ""; }); }
     studentDirectory = {
-      dispose() { closed = true; ++seq; read?.abort(); token = ""; rows = []; wipe(); panel.closest(".student-directory")?.remove(); },
+      dispose() { closed = true; ++seq; read?.abort(); token = ""; rows = []; groups = []; wipe(); panel.closest(".student-directory")?.remove(); },
       refresh() { if ($("[data-roster-results]")) list(); else if ($("[data-login-history]")) $("[data-history-refresh]")?.click(); }
     };
     function template(html) { ++seq; read?.abort(); read = null; wipe(); panel.innerHTML = html; }
     const banner = msg => msg ? `<p class="alert alert--info" role="status">${escapeHtml(msg)}</p>` : "";
     const batchButton = '<button type="button" class="button button--primary" data-create-student-batch>Создать учётки группы</button>';
     function unlock(message = "") {
-      token = ""; rows = [];
+      token = ""; rows = []; group = ""; groups = []; search = ""; offset = 0;
       template(`<form class="student-admin-section" data-roster-unlock><label class="field"><span class="field-label">Токен администратора</span><input class="input mono" type="password" name="token" required autocomplete="off" data-batch-secret><small>Введите токен для просмотра списка. Он не сохранится в браузере.</small></label>
         ${banner(message)}<div class="student-admin-tools"><button class="button" type="submit">Открыть список</button>${batchButton}</div></form>`);
       el("[data-create-student-batch]", () => { token = $("[data-roster-unlock]").elements.token.value.trim(); openStudentBatch(); });
       $("[data-roster-unlock]").onsubmit = event => { event.preventDefault(); token = event.target.elements.token.value.trim(); if (token) list(); };
     }
     const timestamp = value => value ? new Date(value * 1000).toLocaleString("ru-RU",{dateStyle:"short",timeStyle:"short"}) : "—";
+    const directoryId = row => Number.isSafeInteger(row.id) && row.id >= 0 ? row.id : "—";
+    function populateGroups(picker) {
+      const options = document.createDocumentFragment();
+      options.append(new Option("Все группы", ""));
+      for (const name of groups) options.append(new Option(name === "Все группы" ? "Группа «Все группы»" : name, name));
+      picker.replaceChildren(options);
+      picker.value = group;
+    }
     function list(message = "") {
       rows = [];
       template(`<div class="student-admin-tools"><form data-roster-search role="search"><label class="field"><span class="field-label">Найти студента</span><input name="search" class="input" type="search" maxlength="80" placeholder="Логин или группа" value="${escapeHtml(search)}"></label><button class="button" type="submit">Найти</button></form>
+        <label class="field student-directory-group"><span class="field-label">Группа</span><select class="input" data-roster-group></select></label>
         <label class="field student-directory-sort"><span class="field-label">Сортировка</span><select class="input" data-roster-sort><option value="group">Группа: А–Я</option><option value="group-desc">Группа: Я–А</option><option value="login">Логин: А–Я</option></select></label>${batchButton}</div>
         ${banner(message)}<div data-roster-results aria-live="polite">Загружаем список…</div>`);
       const id = seq; read = new AbortController();
       const order = $("[data-roster-sort]"); order.value = sort;
-      order.onchange = () => { sort = order.value; search = $("[data-roster-search]").elements.search.value.trim(); offset = 0; list(); };
+      const picker = $("[data-roster-group]"); populateGroups(picker);
+      function applyFilters(focusSelector) {
+        search = $("[data-roster-search]").elements.search.value.trim();
+        group = picker.value; sort = order.value; offset = 0;
+        list();
+        $(focusSelector)?.focus({preventScroll:true});
+      }
+      picker.onchange = () => applyFilters("[data-roster-group]");
+      order.onchange = () => applyFilters("[data-roster-sort]");
       el("[data-create-student-batch]", openStudentBatch);
-      $("[data-roster-search]").onsubmit = event => { event.preventDefault(); search = event.target.elements.search.value.trim(); offset = 0; list(); };
+      $("[data-roster-search]").onsubmit = event => { event.preventDefault(); applyFilters("[data-roster-search] input"); };
       const params = new URLSearchParams({search, sort, offset:String(offset), limit:String(limit)});
+      if (group) params.set("group", group);
       api("/api/student-accounts?" + params,{promptAdmin:false,headers:{"X-Admin-Token":token},signal:read.signal}).then(data => {
         if (closed || id !== seq) return;
+        if (Array.isArray(data.groups)) {
+          const changed = groups.length !== data.groups.length || groups.some((name, i) => name !== data.groups[i]);
+          groups = data.groups;
+          if (group && !groups.includes(group)) {
+            group = ""; offset = 0;
+            return list([message, "В выбранной группе больше нет учёток. Фильтр сброшен на «Все группы»."].filter(Boolean).join(" "));
+          }
+          if (changed) populateGroups(picker);
+        }
         rows = data.accounts;
         if (!rows.length && offset && offset >= data.total) { offset = Math.max(0, Math.floor((data.total-1)/limit)*limit); return list(message); }
         const result = $("[data-roster-results]");
-        result.innerHTML = `${rows.length ? `<div class="directory-columns" aria-hidden="true"><span>Логин</span><span>Группа</span><span>Статус</span><span></span></div><ul class="student-admin-rows">${rows.map((r,i) => `<li><strong class="mono">${escapeHtml(r.login)}</strong><span class="directory-group">${escapeHtml(r.group || "Без группы")}</span><span class="student-account-status ${r.blocked ? "is-blocked" : ""}">${r.blocked ? "Заблокирована" : "Активна"}</span><button class="button" data-manage-student="${i}" type="button" aria-label="Управлять: ${escapeHtml(r.login)}">Управлять</button></li>`).join("")}</ul>` : '<p>Учётные записи не найдены.</p>'}
+        result.innerHTML = `${rows.length ? `<div class="directory-columns" aria-hidden="true"><span>ID</span><span>Логин</span><span>Группа</span><span>Статус</span><span></span></div><ul class="student-admin-rows">${rows.map((r,i) => `<li><span class="directory-id mono" data-account-id><span class="directory-id-label">ID </span>${directoryId(r)}</span><strong class="mono">${escapeHtml(r.login)}</strong><span class="directory-group">${escapeHtml(r.group || "Без группы")}</span><span class="student-account-status ${r.blocked ? "is-blocked" : ""}">${r.blocked ? "Заблокирована" : "Активна"}</span><button class="button" data-manage-student="${i}" type="button" aria-label="Управлять: ${escapeHtml(r.login)}">Управлять</button></li>`).join("")}</ul>` : '<p>Учётные записи не найдены.</p>'}
           <div class="student-admin-page"><span>${rows.length ? `${offset+1}–${offset+rows.length} из ` : 'Всего: '}${Number(data.total)}</span>
           <button type="button" class="button" data-roster-prev ${offset ? "" : "disabled"}>Назад</button><button type="button" class="button" data-roster-next ${offset+rows.length < data.total ? "" : "disabled"}>Далее</button></div>`;
         result.querySelectorAll("[data-manage-student]").forEach(btn => btn.onclick = () => details(rows[Number(btn.dataset.manageStudent)]));
@@ -1309,7 +1337,7 @@ exit 75`;
     function details(account) {
       const actions = ["reset-password", account.blocked ? "unblock" : "block", "revoke-sessions", "delete"];
       template(`<div>${back}</div><div class="student-admin-section"><h3 class="mono">${escapeHtml(account.login)}</h3>
-        <dl class="student-account-info"><dt>Группа</dt><dd>${escapeHtml(account.group || "Без группы")}</dd><dt>Учётная запись</dt><dd>${account.blocked ? "Заблокирована" : "Активна"}</dd>
+        <dl class="student-account-info"><dt>ID</dt><dd class="mono">${directoryId(account)}</dd><dt>Группа</dt><dd>${escapeHtml(account.group || "Без группы")}</dd><dt>Учётная запись</dt><dd>${account.blocked ? "Заблокирована" : "Активна"}</dd>
         <dt>Создана</dt><dd>${timestamp(account.created)}</dd><dt>Последний вход</dt><dd>${timestamp(account.last_login)}</dd></dl>
         <div class="student-admin-tools"><button type="button" class="button" data-account-history>История входов</button>${actions.map(key => `<button type="button" class="button ${key === "delete" ? "button--danger" : ""}" data-account-action="${key}">${instructions[key][0]}</button>`).join("")}</div><p>${vmNotice}</p></div>`);
       el("[data-roster-back]", () => list());

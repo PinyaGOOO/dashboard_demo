@@ -117,15 +117,19 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .student-admin-tools form { flex: 1 1 280px; }
 .student-admin-tools .field { flex: 1 1 170px; }
 .student-admin-rows { margin: 0; padding: 0; list-style: none; }
-.directory-columns, .student-admin-rows li { display: grid; grid-template-columns: minmax(0,1.2fr) minmax(0,1fr) minmax(110px,.6fr) auto; align-items: center; gap: 12px; }
+.directory-columns, .student-admin-rows li { display: grid; grid-template-columns: minmax(3.5rem,.35fr) minmax(0,1.2fr) minmax(0,1fr) minmax(110px,.6fr) auto; align-items: center; gap: 12px; }
 .directory-columns { padding: 9px 0; border-bottom: 1px solid var(--line-strong); color: var(--ink-muted); font-size: .875rem; }
 .directory-columns span:last-child { width: 110px; }
 .student-admin-rows li { padding: 11px 0; border-bottom: 1px solid var(--line); }
 .student-admin-rows li .button { width: 110px; }
 .directory-group, .student-account-info dd { overflow-wrap: anywhere; }
+.directory-id { color: var(--ink-muted); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.directory-id-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
 .student-directory .student-admin { padding: clamp(16px, 3vw, 32px); font-size: 1rem; }
 .student-directory .student-admin :is(.button,.field-label,.input) { font-size: .9rem; }
 .student-directory .student-admin .student-directory-sort { flex: 0 1 185px; }
+.student-directory .student-directory-group { flex: 1 1 190px; min-width: 0; max-width: 100%; }
+.student-directory-group select { min-width: 0; max-width: 100%; text-overflow: ellipsis; }
 .student-directory :is(.student-batch-form,.student-batch-result,.student-admin-section) { width: min(100%, 780px); }
 .student-history-list { list-style: none; padding: 0; margin: 0; }
 .student-history-list li { display: flex; flex-wrap: wrap; gap: .4rem 1.5rem; padding: .65rem 0; border-bottom: 1px solid var(--line); }
@@ -140,8 +144,9 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 @media (max-width: 680px) {
   .directory-columns { display: none; }
   .student-admin-rows li { grid-template-columns: minmax(0,1fr) auto; gap: 4px 8px; }
-  .student-admin-rows li .button { grid-column: 2; grid-row: 1 / span 3; width: auto; }
-  .student-admin-rows li :is(.directory-group,.student-account-status) { grid-column: 1; }
+  .student-admin-rows li .button { grid-column: 2; grid-row: 1 / span 4; width: auto; }
+  .student-admin-rows li :is(.directory-id,strong,.directory-group,.student-account-status) { grid-column: 1; }
+  .directory-id-label { position: static; width: auto; height: auto; overflow: visible; clip-path: none; }
   .student-directory .student-admin-tools > form { flex-basis: 100%; }
 }
 .nav-link:hover { color: #f1f3f5; background: rgba(255,255,255,.045); }

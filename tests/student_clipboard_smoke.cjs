@@ -36,7 +36,7 @@ function teacherFixture() {
 }
 function accountAdminFixture() {
   const mode = location.search.slice(1), token = "token-test", secret = "temporary-" + crypto.randomUUID();
-  const acct = {login:"class09",group:"ДЭ-24 <тест>",version:1,created:1700000000,last_login:null,blocked:false};
+  const acct = {id:0,login:"class09",group:"ДЭ-24 <тест>",version:1,created:1700000000,last_login:null,blocked:false};
   const writes = [], reads = []; let copied, historyReads = 0, deleted = false, bad = false;
   const delay = (ms=20) => new Promise(done => setTimeout(done,ms));
   Object.defineProperty(navigator,"clipboard",{value:{async writeText(text){copied=text;}}});
@@ -49,8 +49,8 @@ function accountAdminFixture() {
       bad ||= q.get("limit") !== "50" || !["login","group","group-desc"].includes(sort);
       reads.push([q.get("search"),Number(q.get("offset")),sort]);
       const many = !q.get("search");
-      const accounts = deleted ? [] : many && q.get("offset") === "0" ? Array.from({length:50},(_,i)=>({...acct,login:"class" + i})) : [acct];
-      return new Response(JSON.stringify({accounts,total:deleted ? 0 : many ? 51 : 1,offset:Number(q.get("offset")),limit:50}));
+      const accounts = deleted ? [] : many && q.get("offset") === "0" ? Array.from({length:50},(_,i)=>({...acct,id:i+1,login:"class" + i})) : [acct];
+      return new Response(JSON.stringify({accounts,groups:deleted ? [] : [acct.group],total:deleted ? 0 : many ? 51 : 1,offset:Number(q.get("offset")),limit:50}));
     }
     if (url === "/api/student-accounts/class09/history") {
       historyReads++; bad ||= (opts.method || "GET") !== "GET";
@@ -144,6 +144,61 @@ function accountAdminFixture() {
     if (!deleted || $("[data-manage-student]")) return;
     window.dispatchEvent(new StorageEvent("storage",{key:"demoops.adminToken"}));
     if (!bad && writes.join(",") === "reset-password,block,unblock,revoke-sessions,delete" && !$("[data-reset-secret]") && !$("[data-manage-student]") && !$("[data-roster-search]")) document.body.dataset.qa = "pass";
+  },50));
+}
+// Exercise an operator using a directory larger than one page. Groups are real
+// backend options (not derived from returned rows). ID 0 is on the *last* row
+// of its group, so using the rendered row index instead cannot pass.
+function groupDirectoryFixture() {
+  const target = "ССА-25 <А & Б>", sibling = target+"-вечер", first = "А-01", token="directory-fixture";
+  const make = (login,id,group) => ({login,id,group,version:1,created:1700000000,last_login:null,blocked:false});
+  const records = [...Array.from({length:50},(_,i)=>make("a"+String(i).padStart(2,"0"),100+i,first)),
+    ...Array.from({length:50},(_,i)=>make("c"+String(i).padStart(2,"0"),10+i,target)),
+    make("zzz-last",0,target),make("evening",900,sibling)];
+  let retired = false, bad = false;
+  const reads=[];
+  window.fetch = async (url,opts) => {
+    if (!url.startsWith("/api/student-accounts?")) return new Response("{}",{status:503});
+    const q = new URL(url,location).searchParams, group=q.get("group"), offset=Number(q.get("offset")), sort=q.get("sort"), search=q.get("search");
+    bad ||= opts.headers["X-Admin-Token"]!==token || group==="" || (opts.method || "GET")!=="GET";
+    reads.push({group,offset,sort,search});
+    const all=records.filter(row=>!retired || row.group!==sibling);
+    const rows=all.filter(row=>(group===null || row.group===group) && (!search || row.login.includes(search) || row.group.includes(search)))
+      .sort((a,b)=> (sort==="login" ? 0 : (sort==="group-desc"? -1 : 1)*a.group.localeCompare(b.group,"ru")) || a.login.localeCompare(b.login));
+    return new Response(JSON.stringify({groups:retired ? [first,target] : [first,target,sibling],accounts:rows.slice(offset,offset+50),total:rows.length,offset,limit:50}));
+  };
+  window.addEventListener("load",()=>setTimeout(async () => {
+    const $=s=>document.querySelector(s), delay=()=>new Promise(r=>setTimeout(r,30));
+    const groups=()=> $("[data-roster-group]"), latest=()=>reads.at(-1);
+    const change=async(sel,value)=>{const field=$(sel); field.value=value; field.dispatchEvent(new Event("change",{bubbles:true})); await delay();};
+    const pick=value=>change("[data-roster-group]",value), rows=()=>[...document.querySelectorAll(".student-admin-rows li")];
+    const idOf=el=>el?.firstElementChild?.textContent.trim().replace(/^ID\s*/,""), go=async(sel)=>{$(sel).click(); await delay();};
+    const search=async(term)=>{const form=$("[data-roster-search]");form.elements.search.value=term;form.requestSubmit();await delay();};
+    $("a[data-route=student-accounts]").click();
+    const auth=$("[data-roster-unlock]");auth.elements.token.value=token;auth.requestSubmit();await delay();
+    document.body.dataset.qaStep="global options and first ID column";
+    if (latest().group!==null || $(".directory-columns")?.firstElementChild.textContent.trim()!=="ID" || rows().length!==50 ||
+        idOf(rows()[0])!=="100" || !groups() || [...groups().options].map(o=>o.value).join("|")!==["",first,target,sibling].join("|") ||
+        groups().options[0].textContent.trim()!=="Все группы") return;
+    document.body.dataset.qaStep="filtered paging";
+    await pick(target);
+    if (latest().group!==target || latest().offset!==0 || rows().length!==50 || rows().some(r=>r.querySelector(".directory-group").textContent!==target)) return;
+    await go("[data-roster-next]");
+    if (latest().group!==target || latest().offset!==50 || rows().length!==1 || !rows()[0].textContent.includes("zzz-last") || idOf(rows()[0])!=="0") return;
+    document.body.dataset.qaStep="exact filter, sorting and zero ID through search";
+    await change("[data-roster-sort]","group-desc");
+    if (latest().group!==target || latest().offset!==0 || rows().length!==50) return;
+    await search("zzz-last");
+    if (groups().value!==target || latest().search!=="zzz-last" || latest().sort!=="group-desc" || rows().length!==1 || idOf(rows()[0])!=="0") return;
+    await go("[data-manage-student]"); await go("[data-roster-back]");
+    if (groups().value!==target || latest().group!==target || idOf(rows()[0])!=="0") return;
+    await pick("");
+    if (latest().group!==null || latest().search!=="zzz-last" || idOf(rows()[0])!=="0") return;
+    document.body.dataset.qaStep="disappearing group";
+    await search(""); await pick(sibling);
+    if (rows().length!==1 || idOf(rows()[0])!=="900") return;
+    retired=true; await change("[data-roster-sort]","login");
+    if (!bad && groups().value==="" && latest().group===null && rows().length===50 && ![...groups().options].some(o=>o.value===sibling)) document.body.dataset.qa="pass";
   },50));
 }
 function managedFixture() {
@@ -255,7 +310,7 @@ function fixture() {
   const html = (dir, script) => fs.readFileSync(path.join(dir,"index.html"),"utf8").replace("<head>","<head><script>(" + script.toString() + ")()</script>");
   const server = http.createServer((req,res) => {
     if (req.url === "/?teacher") { res.setHeader("Content-Type","text/html; charset=utf-8"); res.end(html(path.dirname(web),teacherFixture)); return; }
-    if (req.url.startsWith("/?roster")) { res.setHeader("Content-Type","text/html; charset=utf-8"); res.end(html(path.dirname(web),accountAdminFixture)); return; }
+    if (req.url.startsWith("/?roster")) { res.setHeader("Content-Type","text/html; charset=utf-8"); res.end(html(path.dirname(web),req.url === "/?roster-groups" ? groupDirectoryFixture : accountAdminFixture)); return; }
     if (req.url.startsWith("/student-demo/?")) { res.setHeader("Content-Type","text/html; charset=utf-8"); res.end(html(web,req.url.includes("?assignment") ? assignmentFixture : req.url.includes("?managed") ? managedFixture : fixture)); return; }
     const asset = req.url.split("?")[0];
     if (asset === "/student-demo/api/assignments/lab-2-276/images/" + "13579bdf".repeat(4)) {
@@ -274,7 +329,7 @@ function fixture() {
   await new Promise(resolve => server.listen(0,"127.0.0.1",resolve));
   const profile = fs.mkdtempSync(path.join(os.tmpdir(),"deployer-smoke-"));
   try {
-    for (const mode of ["item","text","denied","forbidden","login","teacher","roster","roster-stale","roster-denied","roster-late","roster-history-nav","roster-history-late","roster-delete-stale","managed","assignment"]) {
+    for (const mode of ["item","text","denied","forbidden","login","teacher","roster","roster-stale","roster-denied","roster-late","roster-history-nav","roster-history-late","roster-delete-stale","roster-groups","managed","assignment"]) {
       const url = "http://127.0.0.1:" + server.address().port + (mode === "teacher" || mode.startsWith("roster") ? "/?" + mode + (mode === "roster-history-nav" ? "#student-accounts" : "") : "/student-demo/?" + mode + (["managed","assignment"].includes(mode) ? "" : "#stands/fixture"));
       const {stdout} = await run(chrome,["--headless","--disable-gpu","--no-first-run","--disable-background-networking","--user-data-dir=" + profile,"--virtual-time-budget=3000","--dump-dom",url],{timeout:45000,maxBuffer:1_500_000});
       if (!stdout.includes('data-qa="pass"')) throw Error("Failed case: " + mode + (stdout.match(/data-qa-step="([^"]*)"/)?.[1] ? " at " + stdout.match(/data-qa-step="([^"]*)"/)[1] : ""));

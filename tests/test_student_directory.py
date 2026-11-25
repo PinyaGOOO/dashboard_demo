@@ -1,3 +1,4 @@
+import concurrent.futures
 import hashlib
 import sqlite3
 import tempfile
@@ -41,6 +42,73 @@ class StudentDirectoryTests(unittest.TestCase):
         self.assertEqual(self.portal.list_accounts(search="ал",sort="group",offset=1)["accounts"][0]["login"],c)
         for invalid in (None, [], "descending", "login limit 2"):
             self.assert_status(400, self.portal.list_accounts, sort=invalid)
+
+    def test_exact_group_filter_shares_snapshot_with_global_selector(self):
+        self.assertEqual(self.portal.list_accounts()["groups"], [])
+        group = "ДЭ_%"
+        first = self.issue(group, "a")["login"]
+        second = self.issue(group, "b")["login"]
+        for i, other in enumerate(("ДЭ_%1", "дэ_%", "ДЭXY", "Альфа")):
+            self.issue(other, f"c{i}")
+        self.portal.manage_account(second, "block", {"version":1})
+        names = sorted((group, "ДЭ_%1", "дэ_%", "ДЭXY", "Альфа"), key=lambda s: (s.casefold(), s))
+        page = self.portal.list_accounts(group=group, offset=1, limit=1)
+        self.assertEqual((page["groups"], page["total"]), (names, 2))
+        row, = page["accounts"]
+        self.assertEqual((row["login"], row["blocked"]), (second, True))
+        self.assertEqual(self.portal.list_accounts(group=group, search=first.upper())["total"], 1)
+        for filters in ({"group":"ДЭ"}, {"group":group,"search":"Альфа"}, {"group":group,"offset":10}):
+            page = self.portal.list_accounts(**filters)
+            self.assertEqual(page["accounts"], [])
+            self.assertEqual(page["groups"], names)
+        self.assertEqual(self.portal.list_accounts(group="")["total"], 6)
+        for bad in (" г", " ", "\t", "x"*81, 1, None):
+            self.assert_status(400, self.portal.list_accounts, group=bad)
+
+    def test_group_options_follow_account_lifecycle_and_exclude_reserved_logins(self):
+        login = self.issue("Учебная", "s")["login"]
+        # Simulate an old inconsistent row behind a built-in profile. It must
+        # not reveal a group in the selector that isn't part of the directory.
+        with self.portal._db() as db:
+            db.execute("""INSERT INTO student_accounts(login,group_name,salt,verifier,format,created)
+                          SELECT 'student01','Системная',salt,verifier,format,created
+                          FROM student_accounts WHERE login=?""",(login,))
+        self.portal.manage_account(login, "block", {"version":1})
+        self.assertEqual(self.portal.list_accounts()["groups"], ["Учебная"])
+        self.portal.manage_account(login, "delete", {"version":2,"confirm_login":login})
+        self.assertEqual(self.portal.list_accounts(group="Учебная")["groups"], [])
+
+    def test_account_ids_start_at_zero_survive_mutations_and_are_never_recycled(self):
+        a, b = self.issue("Я", "z"), self.issue("А", "a")
+        self.assertEqual((a["id"], b["id"]), (0, 1))
+        self.assertEqual(self.portal.list_accounts(group="Я", sort="group-desc")["accounts"][0]["id"], 0)
+        changed = self.portal.manage_account(a["login"], "block", {"version":1})["account"]
+        self.assertEqual(changed["id"], 0)
+        for login, version in ((b["login"], 1), (a["login"], 2)):
+            self.portal.manage_account(login, "delete", {"version":version,"confirm_login":login})
+        self.portal = StudentPortal(self.path, list)
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            one, two = pool.map(lambda p: self.issue("Б", p), ("i", "j"))
+        self.assertEqual({one["id"], two["id"]}, {2, 3})
+        self.assertEqual({r["id"] for r in self.portal.list_accounts()["accounts"]}, {2, 3})
+
+    def test_account_ids_migrate_in_creation_order_then_rowid_and_support_old_writer(self):
+        self.now = 1002
+        z = self.issue("same", "x")["login"]
+        self.now = 1001
+        a = self.issue("same", "z")["login"]
+        b = self.issue("same", "a")["login"]
+        with self.portal._db() as db:
+            db.execute("DROP TRIGGER student_assign_number")
+            db.execute("DROP TABLE student_account_numbers")
+        expected = {a:0, b:1, z:2}
+        for _ in range(2):
+            self.portal = StudentPortal(self.path, list)
+            self.assertEqual({r["login"]:r["id"] for r in self.portal.list_accounts()["accounts"]}, expected)
+        with self.portal._db() as db:
+            db.execute("""INSERT INTO student_accounts(login,group_name,salt,verifier,format,created)
+                          SELECT 'other03',group_name,salt,verifier,format,created FROM student_accounts WHERE login=?""",(a,))
+        self.assertEqual(self.portal.list_accounts(search="other03")["accounts"][0]["id"], 3)
 
     def test_history_is_success_only_private_and_bounded_across_restarts(self):
         a, b = self.issue("group","a"), self.issue("group","b")

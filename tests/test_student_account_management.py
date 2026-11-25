@@ -49,7 +49,7 @@ class AccountManagementTests(unittest.TestCase):
         for _ in range(2):
             migrated = StudentPortal(path, list, clock=lambda: 5000)
             self.assertEqual(migrated.get_dashboard(token)["student"]["login"], "old03")
-            self.assertEqual(migrated.list_accounts()["accounts"], [{"login":"old03","group":"Учебная","blocked":False,
+            self.assertEqual(migrated.list_accounts()["accounts"], [{"id":0,"login":"old03","group":"Учебная","blocked":False,
                              "version":1,"created":1234,"last_login":None}])
         migrated.login("old03", "old password")
         migrated.manage_account("old03", "revoke-sessions", {"version":1})
@@ -66,7 +66,7 @@ class AccountManagementTests(unittest.TestCase):
         self.assertEqual(self.portal.list_accounts(last["login"].upper())["accounts"][0]["login"], last["login"])
         self.assertEqual(self.portal.list_accounts("", 50)["accounts"], [])
         for p in self.portal.list_accounts()["accounts"]:
-            self.assertEqual(set(p), {"login","group","version","blocked","last_login","created"})
+            self.assertEqual(set(p), {"id","login","group","version","blocked","last_login","created"})
             self.assertEqual((p["version"],p["blocked"],p["last_login"],p["created"]),(1,False,None,5000))
         for args in (([],),("x\n",),("x"*129,),("",False),("",-1),("",0,101),("",0,True)):
             self.assert_status(400, self.portal.list_accounts, *args)

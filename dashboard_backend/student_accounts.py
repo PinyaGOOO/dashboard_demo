@@ -17,7 +17,8 @@ _AUTH = threading.BoundedSemaphore(4)
 _PREFIX = re.compile(r"[a-z][a-z0-9-]{0,15}\Z")
 _FORMAT = "scrypt-v1"
 _BLOCKED_FORMAT = "blocked:scrypt-v1"  # Older portal versions reject unknown formats too.
-_PUBLIC_COLUMNS = "login, group_name, format, version, created, last_login"
+_DIRECTORY = "student_accounts JOIN student_account_numbers USING(login)"
+_PUBLIC_COLUMNS = "serial - 1 AS id, login, group_name, format, version, created, last_login"
 _SORT = {"login": "login", "group": "casefold(group_name), login", "group-desc": "casefold(group_name) DESC, login"}
 HISTORY_LIMIT = 50
 MAX_BATCH = 100
@@ -34,6 +35,17 @@ def init_schema(db):
         db.execute("ALTER TABLE student_accounts ADD COLUMN last_login REAL")
     db.execute("""CREATE TABLE IF NOT EXISTS student_account_sequences (
         prefix TEXT PRIMARY KEY, last_number INTEGER NOT NULL CHECK(last_number>0))""")
+    # Independent of the editable login prefix, SQLite rowid reuse and page order.
+    # The first internal serial is 1 and the public ID is serial - 1.
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='student_account_numbers'").fetchone() is None:
+        db.execute("""CREATE TABLE student_account_numbers(
+                      serial INTEGER PRIMARY KEY AUTOINCREMENT, login TEXT NOT NULL UNIQUE)""")
+        db.execute("""INSERT INTO student_account_numbers(login)
+                      SELECT login FROM student_accounts ORDER BY created, rowid""")
+    # A previous application release can still issue accounts after rollback;
+    # even those rows receive their ID within the account creation transaction.
+    db.execute("""CREATE TRIGGER IF NOT EXISTS student_assign_number AFTER INSERT ON student_accounts
+                  BEGIN INSERT INTO student_account_numbers(login) VALUES (NEW.login); END""")
     # Old lab receipts and guest ownership are keyed by login. Keep only a
     # reservation, not the account or its secrets, even if prefixes can overlap.
     db.execute("CREATE TABLE IF NOT EXISTS student_retired_logins (login TEXT PRIMARY KEY NOT NULL)")
@@ -110,30 +122,39 @@ def _prepared(count):
 
 
 def _public_account(row):
-    return {"login": row["login"], "group": row["group_name"], "blocked": row["format"] != _FORMAT,
+    return {"id": row["id"], "login": row["login"], "group": row["group_name"], "blocked": row["format"] != _FORMAT,
             "version": row["version"], "created": row["created"], "last_login": row["last_login"]}
 
 
-def list_accounts(open_db, reserved, search="", offset=0, limit=50, sort="login"):
+def list_accounts(open_db, reserved, search="", offset=0, limit=50, sort="login", group=""):
     if (not isinstance(search, str) or len(search) > 128 or (search and not search.isprintable())
             or type(offset) is not int or not 0 <= offset <= 2**31 - 1
             or type(limit) is not int or not 1 <= limit <= 100 or not isinstance(sort, str) or sort not in _SORT):
         raise StudentError(400, "Проверьте строку поиска и параметры страницы списка.")
+    if not isinstance(group, str) or len(group) > 80 or (group and (not group.isprintable() or group != group.strip())):
+        raise StudentError(400, "Выберите группу из списка.")
     excluded = ",".join("?" for _ in reserved)
     where = f"WHERE login NOT IN ({excluded})"
     params = list(reserved)
     term = search.strip().casefold()
     with open_db() as db:
-        if term or sort != "login":
-            db.create_function("casefold", 1, str.casefold)
+        db.create_function("casefold", 1, str.casefold)
+        db.execute("BEGIN")
+        # Build the selector from every issued account, not the filtered page.
+        groups = [row[0] for row in db.execute(
+            f"SELECT DISTINCT group_name FROM student_accounts {where} ORDER BY casefold(group_name), group_name",
+            params)]
+        if group:
+            where += " AND group_name = ?"
+            params.append(group)
         if term:
             where += " AND (instr(casefold(login), ?) > 0 OR instr(casefold(group_name), ?) > 0)"
             params.extend((term, term))
-        db.execute("BEGIN")
         total = db.execute("SELECT count(*) FROM student_accounts " + where, params).fetchone()[0]
-        rows = db.execute(f"SELECT {_PUBLIC_COLUMNS} FROM student_accounts {where} ORDER BY {_SORT[sort]} LIMIT ? OFFSET ?",
+        rows = db.execute(f"SELECT {_PUBLIC_COLUMNS} FROM {_DIRECTORY} {where} ORDER BY {_SORT[sort]} LIMIT ? OFFSET ?",
                           (*params, limit, offset))
-        return {"accounts": [_public_account(row) for row in rows], "total": total, "offset": offset, "limit": limit}
+        return {"accounts": [_public_account(row) for row in rows], "groups": groups,
+                "total": total, "offset": offset, "limit": limit}
 
 
 def account_login_history(open_db, reserved, login):
@@ -160,7 +181,7 @@ def manage_account(open_db, reserved, login, action, payload):
         raise StudentError(400, "Для изменения нужна версия учётной записи из списка.")
 
     def current(db):
-        row = db.execute(f"SELECT {_PUBLIC_COLUMNS} FROM student_accounts WHERE login=?", (login,)).fetchone()
+        row = db.execute(f"SELECT {_PUBLIC_COLUMNS} FROM {_DIRECTORY} WHERE login=?", (login,)).fetchone()
         if row is None:
             raise StudentError(404, "Выданная студенту учётная запись не найдена.")
         if row["version"] != payload["version"]:
@@ -197,7 +218,7 @@ def manage_account(open_db, reserved, login, action, payload):
             db.execute("UPDATE student_accounts SET salt=?, verifier=? WHERE login=?", (salt, verifier, login))
         db.execute("UPDATE student_accounts SET version=version+1 WHERE login=?", (login,))
         db.execute("DELETE FROM student_sessions WHERE login=?", (login,))
-        updated = db.execute(f"SELECT {_PUBLIC_COLUMNS} FROM student_accounts WHERE login=?", (login,)).fetchone()
+        updated = db.execute(f"SELECT {_PUBLIC_COLUMNS} FROM {_DIRECTORY} WHERE login=?", (login,)).fetchone()
         result = {"account": _public_account(updated)}
     if password is not None:
         result["password"] = password
@@ -235,7 +256,8 @@ def create_batch(open_db, payload, reserved, clock):
                         break
                 db.execute("""INSERT INTO student_accounts(login,group_name,salt,verifier,format,created)
                               VALUES (?,?,?,?,?,?)""", (login,group,salt,verifier,_FORMAT,created))
-                accounts.append({"login":login, "name":login, "group":group, "password":password})
+                account_id = db.execute("SELECT serial - 1 FROM student_account_numbers WHERE login=?", (login,)).fetchone()[0]
+                accounts.append({"id":account_id, "login":login, "name":login, "group":group, "password":password})
             db.execute("""INSERT INTO student_account_sequences(prefix,last_number) VALUES (?,?)
                           ON CONFLICT(prefix) DO UPDATE SET last_number=excluded.last_number""", (prefix,number))
         return {"count":len(accounts), "accounts":accounts}

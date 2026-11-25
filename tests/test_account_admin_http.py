@@ -135,7 +135,7 @@ class AccountAdminHTTP(unittest.TestCase):
         for p in (first, second, third):
             self.assertNotIn(p["password"], json.dumps(full))
         for u in full["accounts"]:
-            self.assertEqual(set(u), {"login", "group", "blocked", "version", "created", "last_login"})
+            self.assertEqual(set(u), {"id", "login", "group", "blocked", "version", "created", "last_login"})
             self.assertIs(u["blocked"], False)
         pages = [self.listed(search="группа а", limit=1, offset=o) for o in range(3)]
         self.assertTrue(all(p["total"] == 2 for p in pages))
@@ -214,6 +214,25 @@ class AccountAdminHTTP(unittest.TestCase):
         self.assertEqual(self.listed(search="АЛГЕБ", sort="group")["total"], 2)
         for query in ("sort=unknown", "sort=group&sort=login"):
             self.assertEqual(self.req(ACCOUNTS + "?" + query, headers=[TOKEN])[0], 400)
+
+    def test_group_picker_returns_exact_group_and_stable_zero_based_ids(self):
+        name = "ССА-25 & 04"
+        first, second = self.issue(2, name)
+        other, = self.issue(1, name + "а")
+        expected_groups = [name, name + "а"]
+        for offset, person in enumerate((first, second)):
+            page = self.listed(group=name, search="student", sort="group-desc", limit=1, offset=offset)
+            self.assertEqual(page["groups"], expected_groups)
+            self.assertEqual(page["total"], 2)
+            row, = page["accounts"]
+            self.assertEqual((row["id"], row["login"], row["group"]), (offset, person["login"], name))
+        page = self.listed(group=name+"а")
+        self.assertEqual([(r["id"], r["login"]) for r in page["accounts"]], [(2, other["login"])])
+        self.assertEqual(self.listed(group=name, search=other["login"])["accounts"], [])
+        self.assertEqual(self.listed(group="")["total"], 3)
+        self.assertEqual(self.listed(group="нет такой группы")["groups"], expected_groups)
+        self.assertEqual(self.req(ACCOUNTS + "?group=x&group=y", headers=[TOKEN])[0], 400)
+        self.assertEqual(self.req(ACCOUNTS + "?group=x")[0], 401)
 
     def test_history_and_confirmed_delete_are_private_and_scoped(self):
         person, other = self.issue(2)
