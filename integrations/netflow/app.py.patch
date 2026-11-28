@@ -1,0 +1,37 @@
+--- a/app.py
++++ b/app.py
+@@ -146,6 +146,8 @@
+  if r and r['until']>now and r['count']>=maximum:raise APIError('Слишком много попыток. Подождите и повторите.',429)
+  count=r['count']+1 if r and r['until']>now else 1;until=r['until'] if r and r['until']>now else now+seconds
+  c.execute('INSERT OR REPLACE INTO limits VALUES(?,?,?)',(key,count,until))
++import stand_routes
++
+ def endpoint(c,e,path,data,headers):
+  now=int(time.time());c.execute('DELETE FROM sessions WHERE expires<? OR last_seen<?',(now,now-1800));c.execute('DELETE FROM rounds WHERE expires<?',(now,));c.execute('DELETE FROM limits WHERE until<?',(now,))
+  method=e.get('REQUEST_METHOD','GET')
+@@ -195,6 +197,8 @@
+   c.execute('UPDATE users SET password=?,must_change=0 WHERE id=?',(password_hash(new),u['id']))
+   c.execute('DELETE FROM sessions WHERE user_id=?',(u['id'],));headers.append(('Set-Cookie',cookie('',True)));return {'ok':True,'loginRequired':True}
+  if u['must_change']:raise APIError('Сначала смените временный пароль.',403)
++ if path in stand_routes.STUDENT_PATHS:
++  return stand_routes.student(DB,c,u['id'],e,path,data)
+  if path==sysadmin_save.PATH:
+   if method=='GET':return sysadmin_save.get(c,u['id'],sess['csrf'])
+   if method=='POST':
+@@ -501,9 +505,15 @@
+   if n<0 or n>limit:raise APIError('Запрос слишком большой.',413)
+   data=json.loads(e['wsgi.input'].read(n)) if n else {}
+   if not isinstance(data,dict):raise APIError('Ожидается объект JSON.')
+-  with connect() as c: result=endpoint(c,e,e.get('PATH_INFO',''),data,headers)
++  path=e.get('PATH_INFO','')
++  if path in stand_routes.WORKER_PATHS:
++   result=stand_routes.worker(DB,e,path,data)
++  else:
++   if path in stand_routes.STUDENT_PATHS:stand_routes.prepare(DB)
++   with connect() as c: result=endpoint(c,e,path,data,headers)
+   status=200
+  except APIError as ex:status=ex.status;result={'error':ex.msg}
++ except (stand_routes.RouteError,stand_routes.QueueError) as ex:status=ex.status;result={'error':str(ex)}
+  except (ValueError,TypeError,KeyError,RecursionError):status=400;result={'error':'Некорректный запрос.'}
+  except Exception:
+   import traceback;traceback.print_exc();status=500;result={'error':'Ошибка сервера. Повторите позже.'}

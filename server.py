@@ -22,6 +22,7 @@ from dashboard_backend.student_http import read_student_json
 from dashboard_backend.student_catalog import assignment_group_access, published_assignments
 from dashboard_backend.student_credentials import PilotCredentials
 from dashboard_backend.student_labs import StudentLabs
+from dashboard_backend.netflow_worker import start_netflow_worker
 from dashboard_backend.student_portal import StudentError
 from dashboard_backend.student_pilot_validation import make_pilot_validator
 
@@ -368,6 +369,8 @@ def main() -> None:
         except (ConflictError, ValidationError, NotFoundError):
             raise StudentError(409, "Не удалось назначить срок: проверьте состояние стенда и наличие активного таймера") from None
 
+    student_labs = (StudentLabs(service, os.environ.get("STUDENT_LAB_IP_START"), os.environ.get("STUDENT_LAB_IP_END"))
+                    if grant else None)
     DashboardHandler.student_mount = StudentMount(
         student_db, admin_db.with_name("student-demo-catalog.json"),
         published_catalog=lambda: published_assignments(admin_db),
@@ -376,8 +379,7 @@ def main() -> None:
         secure_cookie=gateway.mode == "live", example_if_missing=gateway.mode == "demo",
         pilot_validator=make_pilot_validator(admin_db) if gateway.mode == "live" else None,
         pilot_grant=grant, set_duration=set_student_duration if grant else None,
-        labs=StudentLabs(service, os.environ.get("STUDENT_LAB_IP_START"), os.environ.get("STUDENT_LAB_IP_END"))
-             if grant else None,
+        labs=student_labs,
     )
     mimetypes.add_type("application/javascript", ".js")
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
@@ -385,11 +387,15 @@ def main() -> None:
     print(f"Режим Proxmox: {gateway.mode}")
     if not DashboardHandler.admin_token:
         print("Внимание: DASHBOARD_ADMIN_TOKEN не задан; оставляйте сервер только на localhost.")
+    netflow = None
     try:
+        netflow = start_netflow_worker(service, student_labs)
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nОстановка сервера…")
     finally:
+        if netflow is not None:
+            netflow.stop()
         service.stop_monitors()
         server.server_close()
 
